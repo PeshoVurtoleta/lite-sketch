@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>lite-sketch - hyperloglog</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet">
+    <style>
+        /* Reset + tokens ---------------------------------------------------- */
+        *, *::before, *::after { box-sizing: border-box; }
+
+        :root {
+            --bg-0: #07090d;
+            --bg-1: #0d1117;
+            --bg-2: #131922;
+            --bg-3: #1a2230;
+            --line: rgba(255, 255, 255, 0.06);
+            --line-strong: rgba(255, 255, 255, 0.14);
+            --text: #d8d6d2;
+            --text-dim: #8b8d94;
+            --text-faint: #555960;
+            /* lite-sketch accent: witness teal (the ONLY swap from the lite-o1 / LiteSignal chassis) */
+            --accent: #2dd4bf;
+            --accent-oklch: oklch(0.78 0.13 180);
+            --accent-dim: #1a7d70;
+            --cyan: #7dd3fc;
+            --amber: #f5b942;
+            --magenta: #e879a8;
+            --red: #f87171;
+            --green: #5fe39f;
+            --glow-accent: 0 0 12px rgba(45, 212, 191, 0.55), 0 0 30px rgba(45, 212, 191, 0.20);
+            --glow-red: 0 0 12px rgba(248, 113, 113, 0.6);
+        }
+
+        html, body { height: 100%; margin: 0; }
+
+        body {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            color: var(--text);
+            background: var(--bg-0);
+            overflow: hidden;
+            font-feature-settings: "ss01", "ss02", "cv02", "cv11", "tnum";
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image: radial-gradient(circle at 20% 0%, rgba(45, 212, 191, 0.045) 0%, transparent 40%),
+            radial-gradient(circle at 80% 100%, rgba(125, 211, 252, 0.03) 0%, transparent 50%);
+            z-index: 0;
+        }
+
+        body::after {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background: repeating-linear-gradient(0deg, transparent 0, transparent 2px,
+                    rgba(255, 255, 255, 0.012) 2px, rgba(255, 255, 255, 0.012) 3px);
+            z-index: 1;
+        }
+
+        #app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; }
+
+        /* Header ------------------------------------------------------------ */
+        header.top {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            padding: 14px 24px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(to bottom, var(--bg-1), var(--bg-0));
+        }
+
+        .brand { display: flex; align-items: baseline; gap: 12px; font-family: 'Space Mono', 'JetBrains Mono', monospace; }
+        .brand .mark { color: var(--accent); font-weight: 700; font-size: 16px; letter-spacing: -0.02em; text-shadow: var(--glow-accent); }
+        .brand .pkg { color: var(--text); font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+        .brand .ver { color: var(--text-faint); font-size: 11px; }
+
+        .tagline { color: var(--text-dim); font-size: 11px; margin-left: auto; letter-spacing: 0.04em; text-transform: uppercase; }
+        .tagline .dot {
+            display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+            background: var(--accent); box-shadow: var(--glow-accent); margin-right: 6px;
+            animation: pulse 2s infinite ease-in-out; vertical-align: 1px;
+        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+        /* Tab nav ----------------------------------------------------------- */
+        nav.tabs { display: flex; background: var(--bg-1); border-bottom: 1px solid var(--line); padding: 0 18px; }
+        nav.tabs button {
+            background: none; border: 0; color: var(--text-dim); font-family: inherit; font-size: 12px;
+            padding: 12px 18px; cursor: pointer; letter-spacing: 0.02em; position: relative; transition: color .15s;
+        }
+        @media (hover: hover) { nav.tabs button:hover { color: var(--text); } }
+        nav.tabs button[aria-current="true"] { color: var(--accent); }
+        nav.tabs button[aria-current="true"]::after {
+            content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px;
+            background: var(--accent); box-shadow: var(--glow-accent);
+        }
+        nav.tabs .scene-num { color: var(--text-faint); margin-right: 8px; font-weight: 300; }
+
+        /* Scene container --------------------------------------------------- */
+        main { flex: 1; min-height: 0; display: flex; position: relative; }
+        .scene { flex: 1; display: none; min-height: 0; }
+        .scene[data-active] { display: flex; }
+        .stage { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+        .stage canvas { display: block; width: 100%; height: 100%; }
+
+        .panel {
+            width: 350px; border-left: 1px solid var(--line); background: var(--bg-1);
+            display: flex; flex-direction: column; overflow-y: auto;
+        }
+        .panel .panel-head {
+            padding: 16px 20px 8px; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
+            color: var(--text-faint); border-bottom: 1px solid var(--line);
+        }
+        .panel section { padding: 16px 20px; border-bottom: 1px solid var(--line); }
+        .panel section h3 {
+            margin: 0 0 12px; font-size: 10px; font-weight: 700; letter-spacing: 0.16em;
+            text-transform: uppercase; color: var(--cyan);
+        }
+
+        /* Inputs & buttons -------------------------------------------------- */
+        button.btn {
+            font-family: inherit; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;
+            background: var(--bg-3); color: var(--text); border: 1px solid var(--line-strong);
+            padding: 8px 14px; cursor: pointer; transition: all .12s;
+        }
+        @media (hover: hover) {
+            button.btn:hover { background: var(--bg-2); border-color: var(--accent-dim); color: var(--accent); }
+            button.btn.danger:hover { border-color: var(--red); color: var(--red); }
+            button.btn.primary:hover { background: var(--accent); color: var(--bg-0); }
+        }
+        button.btn.primary { background: var(--accent-dim); color: var(--text); border-color: var(--accent); font-weight: 700; }
+        button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+        .field { margin-bottom: 12px; }
+        .field label {
+            display: block; font-size: 10px; letter-spacing: 0.08em; color: var(--text-faint);
+            text-transform: uppercase; margin-bottom: 4px;
+        }
+        .field input[type="range"] { width: 100%; accent-color: var(--accent); }
+        .field-value { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        .help-line { color: var(--text-dim); font-size: 11px; line-height: 1.55; margin: 10px 0 0; }
+        .help-line code { color: var(--accent); background: rgba(45, 212, 191, 0.08); padding: 0 4px; border-radius: 3px; }
+
+        /* Toggle ------------------------------------------------------------ */
+        .toggle-row { display: flex; align-items: center; gap: 10px; }
+        .toggle {
+            position: relative; width: 46px; height: 24px; border-radius: 12px;
+            background: var(--bg-3); border: 1px solid var(--line-strong); cursor: pointer; transition: all .15s;
+        }
+        .toggle::after {
+            content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+            background: var(--accent); transition: transform .15s, background .15s;
+        }
+        .toggle[data-on="true"] { border-color: var(--magenta); background: rgba(232, 121, 168, 0.15); }
+        .toggle[data-on="true"]::after { transform: translateX(22px); background: var(--magenta); }
+        .toggle-label { font-size: 11px; letter-spacing: 0.04em; }
+        .toggle-label b { color: var(--accent); }
+        .toggle[data-on="true"] ~ .toggle-label b { color: var(--magenta); }
+
+        /* Truth panel ------------------------------------------------------- */
+        .truth { display: flex; flex-direction: column; gap: 12px; }
+        .truth .primary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); }
+        .truth .secondary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); }
+        .truth canvas { width: 100%; display: block; background: var(--bg-0); border: 1px solid var(--line); }
+        #hll-jank-canvas { height: 46px; }
+        #hll-witness-canvas { height: 62px; }
+        #hll-space-canvas { height: 52px; }
+        .jank-caption { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
+        .alloc-pair { display: flex; gap: 18px; }
+        .alloc-cell { flex: 1; }
+        .alloc-big { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+        .alloc-big.zero { color: var(--accent); text-shadow: var(--glow-accent); }
+        .alloc-big.climbing { color: var(--magenta); }
+        .alloc-sub { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
+        .stat-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+        .stat-row .k { color: var(--text-faint); }
+        .stat-row .v { color: var(--text); font-variant-numeric: tabular-nums; }
+        .stat-row .v.accent { color: var(--accent); font-weight: 700; }
+        .stat-row .v.inband { color: var(--green); font-weight: 700; }
+        .stat-row .v.outband { color: var(--red); font-weight: 700; }
+        .caveat { font-size: 10px; color: var(--text-faint); line-height: 1.5; }
+
+        /* Stage overlays ---------------------------------------------------- */
+        .stage-overlay { position: absolute; padding: 8px 12px; font-size: 10px; pointer-events: none; z-index: 3; }
+        .stage-overlay.tl { top: 12px; left: 16px; }
+        .stage-overlay.tr { top: 12px; right: 16px; text-align: right; }
+        .stage-overlay .label { color: var(--text-faint); letter-spacing: 0.1em; text-transform: uppercase; }
+        .stage-overlay .big { color: var(--accent); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        .banner {
+            position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 5;
+            padding: 8px 16px; border-radius: 4px; font-size: 12px; border: 1px solid var(--accent);
+            color: var(--accent); background: rgba(45, 212, 191, 0.1); box-shadow: var(--glow-accent);
+            opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 74%;
+        }
+        .banner[data-show="true"] { opacity: 1; }
+        .banner.err { border-color: var(--red); color: var(--red); background: rgba(248, 113, 113, 0.1); box-shadow: var(--glow-red); }
+
+        /* Placeholder scenes ------------------------------------------------ */
+        .placeholder {
+            flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            gap: 14px; color: var(--text-dim); text-align: center; padding: 40px;
+        }
+        .placeholder .ph-badge {
+            font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--accent);
+            border: 1px solid var(--accent-dim); border-radius: 999px; padding: 5px 14px;
+        }
+        .placeholder h2 { margin: 0; font-size: 20px; color: var(--text); font-weight: 700; }
+        .placeholder .ph-members { font-size: 12px; color: var(--text-faint); max-width: 520px; line-height: 1.7; }
+
+        /* Footer ------------------------------------------------------------ */
+        footer.bottom {
+            display: flex; gap: 18px; align-items: center; padding: 8px 24px;
+            border-top: 1px solid var(--line); background: var(--bg-1); font-size: 10px; color: var(--text-faint);
+        }
+        footer.bottom .sep { color: var(--line-strong); }
+        footer.bottom kbd {
+            background: var(--bg-3); border: 1px solid var(--line-strong); border-radius: 3px;
+            padding: 1px 5px; color: var(--text-dim); font-family: inherit;
+        }
+    </style>
+</head>
+<body>
+<div id="app">
+
+    <!-- HEADER -->
+    <header class="top">
+        <div class="brand">
+            <span class="mark">[sk]</span>
+            <span class="pkg">@zakkster/lite-sketch</span>
+            <span class="ver" id="brand-version">v-.-.-</span>
+        </div>
+        <div class="tagline"><span class="dot"></span>approximate summaries - accuracy witnessed, proven zero-GC</div>
+    </header>
+
+    <!-- TAB NAV -->
+    <nav class="tabs" id="tabs">
+        <button data-tab="hll" aria-current="true"><span class="scene-num">01</span>HyperLogLog</button>
+        <button data-tab="cms"><span class="scene-num">02</span>CountMinSketch</button>
+        <button data-tab="dd"><span class="scene-num">03</span>DDSketch</button>
+        <button data-tab="ss"><span class="scene-num">04</span>SpaceSaving</button>
+    </nav>
+
+    <main>
+        <!-- SCENE 01: HYPERLOGLOG -->
+        <section class="scene" data-scene="hll" data-active>
+            <div class="stage" id="hll-stage">
+                <canvas id="hll-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">HyperLogLog register bank (live library instance)</span>
+                </div>
+                <div class="stage-overlay tr">
+                    <span class="label">est distinct</span><br>
+                    <span class="big" id="hll-est-big">0</span>
+                </div>
+                <div class="banner" id="hll-banner" data-show="false"></div>
+            </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 01 - hyperloglog (how many distinct?)</div>
+
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="hll-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact Set: <b id="hll-mode-label">running (allocates)</b></span>
+                    </div>
+                    <p class="help-line">
+                        The <code>sketch</code> path streams keys into the REAL
+                        <code>HyperLogLog</code> and allocates NOTHING per frame. The exact
+                        <code>Set</code> oracle is the witness AND the contrast -- it grows one entry
+                        per distinct key, so its allocation counter climbs while the sketch counter
+                        stays pinned at 0. Toggle it off to watch the sketch run alone: counter
+                        frozen, jank green.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="hll-pause">pause</button>
+                        <button class="btn primary" id="hll-merge">merge two shards</button>
+                        <button class="btn danger" id="hll-merge-bad">merge different seed</button>
+                    </div>
+                    <p class="help-line">
+                        <code>merge two shards</code> splits the key set into two
+                        <code>HyperLogLog</code>s, unions them by register-wise <code>merge()</code>,
+                        and shows the union count matches the single-sketch count.
+                        <code>merge different seed</code> attempts a mismatched-seed merge and flashes
+                        the 1.0.0 fail-closed throw.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>precision p (m = 2^p registers) <span class="field-value" id="hll-p-v">11</span></label>
+                        <input type="range" id="hll-p" min="8" max="14" step="1" value="11">
+                    </div>
+                    <div class="field">
+                        <label>stream cardinality (distinct keys) <span class="field-value" id="hll-card-v">20000</span></label>
+                        <input type="range" id="hll-card" min="500" max="50000" step="500" value="20000">
+                    </div>
+                    <p class="help-line">
+                        A topology change rebuilds the sketch + refills the stream OFF the frame loop
+                        -- the only place buffers reallocate. Sketch memory is a FIXED
+                        <span class="field-value" id="hll-mem">2 KB</span> no matter the cardinality.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="hll-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = a frame blew past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell">
+                                    <div class="alloc-big zero" id="hll-alloc-sketch">0</div>
+                                    <div class="alloc-sub">sketch path</div>
+                                </div>
+                                <div class="alloc-cell">
+                                    <div class="alloc-big climbing" id="hll-alloc-oracle">0</div>
+                                    <div class="alloc-sub">exact Set path</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - accuracy vs +/- 1.04/sqrt(m) band</div>
+                            <canvas id="hll-witness-canvas"></canvas>
+                            <div class="jank-caption">cursor = measured relerr as a multiple of the std err; green band = within 1 std err, red = past ~3.5 sigma</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - space: sketch fixed vs Set O(distinct)</div>
+                            <canvas id="hll-space-canvas"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">estimate (count)</span><span class="v accent" id="hll-est">0</span></div>
+                            <div class="stat-row"><span class="k">true distinct (Set)</span><span class="v" id="hll-true">0</span></div>
+                            <div class="stat-row"><span class="k">measured rel error</span><span class="v" id="hll-relerr">0.00%</span></div>
+                            <div class="stat-row"><span class="k">std err 1.04/sqrt(m)</span><span class="v" id="hll-stderr">0.00%</span></div>
+                            <div class="stat-row"><span class="k">error / std err</span><span class="v inband" id="hll-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">sketch bytes (fixed)</span><span class="v accent" id="hll-sketch-kb">2.0 KB</span></div>
+                            <div class="stat-row"><span class="k">Set bytes (climbing)</span><span class="v" id="hll-set-kb">0.0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="hll-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="hll-heap">n/a</span></div>
+                            <div class="caveat">Reported only when <code>performance.memory</code> exists (Chromium, and only under crossOriginIsolated). Quantized and lazily updated -- a secondary signal, never the headline.</div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 02: COUNTMINSKETCH (stub) -->
+        <section class="scene" data-scene="cms">
+            <div class="placeholder">
+                <span class="ph-badge">scene 02 - coming next</span>
+                <h2>CountMinSketch - how many times key x?</h2>
+                <p class="ph-members">
+                    A Zipfian key stream feeds a d x w Uint32 counter matrix (heat grid) beside an
+                    exact <code>Map</code> oracle; the one-sided over-estimate gap stays under
+                    eps*N, and conservative update tightens it. Built in a follow-up on this same
+                    zero-GC chassis.
+                </p>
+            </div>
+        </section>
+
+        <!-- SCENE 03: DDSKETCH (stub) -->
+        <section class="scene" data-scene="dd">
+            <div class="placeholder">
+                <span class="ph-badge">scene 03 - coming next</span>
+                <h2>DDSketch - p50 / p90 / p99?</h2>
+                <p class="ph-members">
+                    A latency stream fills log-scale bins (a live histogram); p50 / p90 / p99 markers
+                    track an exact sorted-array oracle within the HARD alpha bound, and the
+                    collapsing-lowest event animates when the bins fill. Built in a follow-up.
+                </p>
+            </div>
+        </section>
+
+        <!-- SCENE 04: SPACESAVING (stub) -->
+        <section class="scene" data-scene="ss">
+            <div class="placeholder">
+                <span class="ph-badge">scene 04 - coming next</span>
+                <h2>SpaceSaving - which few keys dominate?</h2>
+                <p class="ph-members">
+                    A Zipfian stream drives k monitored counters as a live top-k leaderboard; every
+                    true hitter above N/k stays monitored (100% recall) and its true count lands in
+                    the [count-error, count] bracket. Built in a follow-up.
+                </p>
+            </div>
+        </section>
+    </main>
+
+    <footer class="bottom">
+        <span>how to read this: hotter registers = higher rho; the sketch allocation counter stays pinned at 0 after warmup (that IS the zero-GC claim), and the measured error stays inside the +/- 1.04/sqrt(m) band (that IS the accuracy claim).</span>
+        <span class="sep">|</span>
+        <span>retained heap is a coarse Chromium-only secondary signal</span>
+        <span class="sep">|</span>
+        <span><kbd>1</kbd>-<kbd>4</kbd> switch scene</span>
+        <span class="sep">|</span>
+        <span><kbd>space</kbd> pause</span>
+    </footer>
+</div>
+
+<script type="module">
+    // The demo drives the REAL shipped HyperLogLog + the repo's Scene-01 kernels. VERSION is read
+    // from the shipped module -- NEVER hardcoded (Demo.test.mjs version-trinity gate).
+    import {
+        VERSION,
+        createHllWorld, createAllocState,
+        stepSketch, stepOracle, renderPrep,
+        mergeShards, mergeMismatch,
+        HLL_DEFAULT_P, HLL_DEFAULT_CARD,
+        F_EST, F_TRUE, F_RELERR, F_STDERR, F_SKETCH_BYTES, F_SET_BYTES,
+        F_M, F_RELERR_FRAC, F_MAXREG, F_SKETCH_ALLOC, F_ORACLE_ALLOC,
+    } from './kernels.mjs';
+
+    const $ = (id) => document.getElementById(id);
+
+    // Brand version straight from the shipped VERSION const.
+    $('brand-version').textContent = 'v' + VERSION;
+
+    // ---- high-DPI canvas sizing (reallocates ONLY here / on resize) --------------------
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    function sizeCanvas(c) {
+        const r = c.getBoundingClientRect();
+        c.width = Math.max(1, Math.floor(r.width * dpr));
+        c.height = Math.max(1, Math.floor(r.height * dpr));
+        const ctx = c.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return { ctx, w: r.width, h: r.height };
+    }
+
+    // ---- built-once rgba cache (styling allocates only during warmup, never per frame) --
+    const _rgba = Object.create(null);
+    function rgbaq(rgb, a) {
+        let row = _rgba[rgb];
+        if (row === undefined) row = _rgba[rgb] = [];
+        const q = a <= 0 ? 0 : a >= 1 ? 20 : (a * 20 + 0.5) | 0;
+        let s = row[q];
+        if (s === undefined) s = row[q] = 'rgba(' + rgb + ',' + (q / 20) + ')';
+        return s;
+    }
+
+    function mem() { return (performance.memory && performance.memory.usedJSHeapSize) || 0; }
+
+    // ---- palette (pre-built RGB triplets so rgbaq never concatenates in the hot path) ---
+    const ACCENT_RGB = '45,212,191';
+    const STALE_RGB = '120,125,140';
+    const MAGENTA_RGB = '232,121,168';
+    const RED_RGB = '248,113,113';
+    const GREEN_RGB = '95,227,159';
+    const AMBER_RGB = '245,185,66';
+    const COL_FAINT = '#555960';
+    const COL_DIM = '#8b8d94';
+    const LABEL_FONT = '11px "JetBrains Mono", monospace';
+
+    // Pre-built static canvas labels (no per-frame string construction).
+    const HLL_TITLE = 'HyperLogLog  -  dense register bank   (heat = rho; dim = untouched register)';
+
+    // ---- world (allocated ONCE, at warmup; rebuilt only on a topology change) -----------
+    let P = HLL_DEFAULT_P;
+    let CARD = HLL_DEFAULT_CARD;
+    let hllWorld = createHllWorld(P, CARD, 0x51ed270b);
+    const allocState = createAllocState(); // owned allocation counters -- sketch pins at 0
+    let oracleOn = true;                    // "vs exact" default ON so the witness is live
+
+    // ---- geometry (recomputed ONLY on resize / topology change) -------------------------
+    const stageCanvas = $('hll-canvas');
+    let stageCtx = null, STAGE_W = 0, STAGE_H = 0;
+    const PAD = 24;
+    let hllCols = 64, hllRows = 32, hllX = 0, hllY = 0, HLL_CW = 10, HLL_CH = 10, HLL_GAP = 1;
+
+    function computeHllLayout() {
+        const s = sizeCanvas(stageCanvas);
+        stageCtx = s.ctx; STAGE_W = s.w; STAGE_H = s.h;
+        const m = hllWorld.hll.m;
+        const gridW = STAGE_W - PAD * 2;
+        const gridH = STAGE_H - PAD * 2 - 24;
+        // Choose a column count that fits an m-cell grid to the stage aspect ratio.
+        const aspect = gridW / Math.max(1, gridH);
+        let cols = Math.round(Math.sqrt(m * aspect));
+        if (cols < 1) cols = 1;
+        if (cols > m) cols = m;
+        const rows = Math.ceil(m / cols);
+        const cw = (gridW - (cols - 1) * HLL_GAP) / cols;
+        const ch = (gridH - (rows - 1) * HLL_GAP) / rows;
+        const cell = Math.max(1, Math.min(cw, ch));
+        hllCols = cols; hllRows = rows;
+        HLL_CW = cell; HLL_CH = cell; HLL_GAP = 1;
+        hllX = PAD; hllY = PAD + 24;
+    }
+
+    window.addEventListener('resize', () => { if (activeScene === 'hll') { computeHllLayout(); sizeHllPanels(); } });
+
+    // ---- Truth-Panel canvases (each sized on load / resize / tab activate) --------------
+    const jankCanvas = $('hll-jank-canvas');
+    let jankCtx = null, JW = 0, JH = 0;
+    const witnessCanvas = $('hll-witness-canvas');
+    let witCtx = null, WITW = 0, WITH = 0;
+    const spaceCanvas = $('hll-space-canvas');
+    let spCtx = null, SPW = 0, SPH = 0;
+    function sizeHllPanels() {
+        let s = sizeCanvas(jankCanvas); jankCtx = s.ctx; JW = s.w; JH = s.h;
+        s = sizeCanvas(witnessCanvas); witCtx = s.ctx; WITW = s.w; WITH = s.h;
+        s = sizeCanvas(spaceCanvas); spCtx = s.ctx; SPW = s.w; SPH = s.h;
+    }
+
+    // ---- controls / state --------------------------------------------------------------
+    let paused = false;
+
+    // dt ring for the jank strip (power-of-two, bitmask index -- no per-frame alloc)
+    const DT = new Float64Array(128);
+    const DT_MASK = 127;
+    let dtPtr = 0;
+    let lastTs = performance.now();
+    let frameN = 0;
+
+    // fps sampling
+    let fpsLast = performance.now(), fpsFrames = 0, fpsValue = 60;
+
+    // telemetry DOM (cached once)
+    const dom = {
+        estBig: $('hll-est-big'),
+        allocSketch: $('hll-alloc-sketch'), allocOracle: $('hll-alloc-oracle'),
+        est: $('hll-est'), trueN: $('hll-true'), relerr: $('hll-relerr'),
+        stderr: $('hll-stderr'), frac: $('hll-frac'),
+        sketchKb: $('hll-sketch-kb'), setKb: $('hll-set-kb'),
+        fps: $('hll-fps'), heap: $('hll-heap'), mem: $('hll-mem'),
+    };
+    let lastHeapTenths = -1;
+
+    // ---- simulation step ---------------------------------------------------------------
+    function stepHll() {
+        stepSketch(hllWorld);                       // SKETCH path: 0 alloc, always runs
+        if (oracleOn) stepOracle(hllWorld, allocState); // exact Set: the allowed-to-allocate contrast
+    }
+
+    // ---- draw: register heat bank ------------------------------------------------------
+    function drawHll() {
+        const g = stageCtx;
+        g.clearRect(0, 0, STAGE_W, STAGE_H);
+        g.font = LABEL_FONT;
+        g.fillStyle = COL_DIM; g.fillText(HLL_TITLE, hllX, hllY - 8);
+
+        const reg = hllWorld.hll._reg, m = hllWorld.hll.m;
+        const flat = hllWorld.flat;
+        let norm = flat[F_MAXREG];
+        if (norm < 1) norm = 1;
+        const cols = hllCols, cw = HLL_CW, ch = HLL_CH, gap = HLL_GAP;
+        for (let i = 0; i < m; i++) {
+            const col = i % cols, row = (i / cols) | 0;
+            const x = hllX + col * (cw + gap);
+            const y = hllY + row * (ch + gap);
+            const v = reg[i];
+            if (v === 0) g.fillStyle = rgbaq(STALE_RGB, 0.12);
+            else g.fillStyle = rgbaq(ACCENT_RGB, 0.18 + 0.80 * (v / norm));
+            g.fillRect(x, y, cw, ch);
+        }
+    }
+
+    // ---- draw: jank strip --------------------------------------------------------------
+    const JANK_MS = 18;
+    function drawJank(g, jw, jh) {
+        if (!g) return;
+        g.clearRect(0, 0, jw, jh);
+        const bw = jw / 128;
+        for (let i = 0; i < 128; i++) {
+            const idx = (dtPtr + i) & DT_MASK;
+            const dt = DT[idx];
+            if (dt <= 0) continue;
+            const over = dt > JANK_MS;
+            const h = Math.min(jh, (dt / 33) * jh); // full height ~ 33ms (two dropped frames)
+            g.fillStyle = over ? rgbaq(RED_RGB, 0.95) : rgbaq(ACCENT_RGB, 0.55);
+            g.fillRect(i * bw, jh - h, bw - 0.5, h);
+        }
+    }
+
+    // ---- draw: accuracy witness band ---------------------------------------------------
+    // Cursor = measured relerr as a multiple of the std err. Green band = within 1 std err;
+    // amber to ~3.5 sigma; red past it. All values read from the flat buffer -- 0 alloc.
+    const WIT_FULL = 3.5;   // full half-width of the axis, in units of std err (the ~3.5 sigma tail)
+    function drawWitness(g, w, h) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const flat = hllWorld.flat;
+        const frac = flat[F_RELERR_FRAC];
+        const cy = h * 0.5;
+        const cx = w * 0.5;
+        const halfW = w * 0.5 - 8;
+        // green (within 1 std err) band
+        const oneW = halfW / WIT_FULL;
+        g.fillStyle = rgbaq(GREEN_RGB, 0.16);
+        g.fillRect(cx - oneW, cy - 12, oneW * 2, 24);
+        // amber (1 .. 3.5 sigma) band
+        g.fillStyle = rgbaq(AMBER_RGB, 0.10);
+        g.fillRect(cx - halfW, cy - 12, halfW - oneW, 24);
+        g.fillRect(cx + oneW, cy - 12, halfW - oneW, 24);
+        // center (true) axis
+        g.fillStyle = rgbaq(STALE_RGB, 0.5);
+        g.fillRect(cx - 0.5, cy - 16, 1, 32);
+        // 1-sigma edge ticks
+        g.fillStyle = rgbaq(GREEN_RGB, 0.5);
+        g.fillRect(cx - oneW, cy - 16, 1, 32);
+        g.fillRect(cx + oneW - 1, cy - 16, 1, 32);
+        // cursor: magnitude only (two-sided std err shown as distance from center)
+        let px = frac / WIT_FULL;
+        if (px > 1) px = 1;
+        const cxp = cx + px * halfW;
+        const inband = frac <= 1;
+        g.fillStyle = inband ? rgbaq(GREEN_RGB, 0.95) : (frac <= WIT_FULL ? rgbaq(AMBER_RGB, 0.95) : rgbaq(RED_RGB, 0.95));
+        g.fillRect(cxp - 2, cy - 18, 4, 36);
+    }
+
+    // ---- draw: space bars (sketch fixed vs Set climbing) -------------------------------
+    function drawSpace(g, w, h) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const flat = hllWorld.flat;
+        const sketchB = flat[F_SKETCH_BYTES];
+        const setB = flat[F_SET_BYTES];
+        let scale = Math.max(sketchB, setB, 1);
+        const barX = 6, barW = w - 12, barH = 14;
+        const y0 = h * 0.5 - barH - 4;
+        const y1 = h * 0.5 + 4;
+        // sketch bar (fixed, teal)
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y0, barW, barH);
+        g.fillStyle = rgbaq(ACCENT_RGB, 0.9); g.fillRect(barX, y0, barW * (sketchB / scale), barH);
+        // Set bar (climbing, magenta)
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y1, barW, barH);
+        g.fillStyle = rgbaq(MAGENTA_RGB, 0.9); g.fillRect(barX, y1, barW * (setB / scale), barH);
+    }
+
+    // ---- render-prep + telemetry (~10Hz, off a frame-counter mask) ----------------------
+    function tick10() {
+        renderPrep(hllWorld, allocState);   // re-derive every displayed number into the flat buffer
+        const flat = hllWorld.flat;
+        const est = flat[F_EST] | 0;
+        const trueN = flat[F_TRUE] | 0;
+        dom.estBig.textContent = String(est);
+        dom.est.textContent = String(est);
+        dom.trueN.textContent = String(trueN);
+        dom.relerr.textContent = (flat[F_RELERR] * 100).toFixed(2) + '%';
+        dom.stderr.textContent = (flat[F_STDERR] * 100).toFixed(2) + '%';
+        const frac = flat[F_RELERR_FRAC];
+        dom.frac.textContent = frac.toFixed(2) + 'x';
+        dom.frac.className = frac <= 1 ? 'v inband' : (frac <= WIT_FULL ? 'v' : 'v outband');
+        dom.sketchKb.textContent = (flat[F_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        dom.setKb.textContent = (flat[F_SET_BYTES] / 1024).toFixed(1) + ' KB';
+        dom.allocSketch.textContent = String(flat[F_SKETCH_ALLOC] | 0);
+        dom.allocOracle.textContent = String(flat[F_ORACLE_ALLOC]);
+        dom.fps.textContent = String(fpsValue);
+        const mb = mem();
+        if (mb) {
+            const tenths = Math.floor(mb / 104857.6);
+            if (tenths !== lastHeapTenths) {
+                lastHeapTenths = tenths;
+                dom.heap.textContent = Math.floor(tenths / 10) + '.' + (tenths % 10) + ' MB';
+            }
+        }
+    }
+
+    // ---- mode toggle (vs exact) --------------------------------------------------------
+    const modeToggle = $('hll-mode-toggle'), modeLabel = $('hll-mode-label');
+    function setOracle(on) {
+        oracleOn = on;
+        modeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        modeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        modeLabel.textContent = on ? 'running (allocates)' : 'paused (sketch only)';
+    }
+    modeToggle.addEventListener('click', () => setOracle(!oracleOn));
+    modeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setOracle(!oracleOn); } });
+
+    // ---- action buttons ----------------------------------------------------------------
+    const btnPause = $('hll-pause');
+    function setPaused(p) { paused = p; btnPause.textContent = p ? 'resume' : 'pause'; }
+    btnPause.addEventListener('click', () => setPaused(!paused));
+
+    const banner = $('hll-banner');
+    let bannerTimer = 0;
+    function flashBanner(msg, err) {
+        banner.textContent = msg;
+        banner.className = err ? 'banner err' : 'banner';
+        banner.setAttribute('data-show', 'true');
+        if (bannerTimer) clearTimeout(bannerTimer);
+        bannerTimer = setTimeout(() => banner.setAttribute('data-show', 'false'), 3200);
+    }
+
+    $('hll-merge').addEventListener('click', () => {
+        const r = mergeShards(hllWorld);            // REAL two-shard union via HyperLogLog.merge()
+        const match = r.single === r.merged;
+        flashBanner('merge(shardA, shardB) = ' + r.merged + '  vs  single = ' + r.single +
+            (match ? '  (union matches -- register-wise max is exact)' : '  (mismatch)'), !match);
+    });
+
+    $('hll-merge-bad').addEventListener('click', () => {
+        const r = mergeMismatch(hllWorld);          // attempt a different-seed merge (must throw)
+        if (r.threw) flashBanner('fail-closed: ' + r.message, true);
+        else flashBanner('merge did NOT throw (unexpected)', true);
+    });
+
+    // ---- sliders (the ONLY place buffers reallocate -- off the frame loop) --------------
+    const pSlider = $('hll-p'), pV = $('hll-p-v');
+    const cardSlider = $('hll-card'), cardV = $('hll-card-v');
+    function rebuildWorld() {
+        hllWorld = createHllWorld(P, CARD, 0x51ed270b);
+        allocState.sketchCount = 0; allocState.oracleCount = 0;
+        dom.mem.textContent = (hllWorld.hll.m / 1024).toFixed(1) + ' KB';
+        computeHllLayout();
+    }
+    pSlider.addEventListener('input', () => {
+        P = +pSlider.value; pV.textContent = String(P);
+        rebuildWorld();
+    });
+    cardSlider.addEventListener('input', () => {
+        CARD = +cardSlider.value; cardV.textContent = String(CARD);
+        rebuildWorld();
+    });
+
+    // ---- main loop ---------------------------------------------------------------------
+    function loop(now) {
+        const dt = now - lastTs; lastTs = now;
+        DT[dtPtr] = dt; dtPtr = (dtPtr + 1) & DT_MASK;
+
+        fpsFrames++;
+        if (now - fpsLast >= 500) {
+            fpsValue = Math.round(fpsFrames * 1000 / (now - fpsLast));
+            fpsLast = now; fpsFrames = 0;
+        }
+
+        if (activeScene === 'hll') {
+            if (!paused) stepHll();
+            drawHll();
+            drawJank(jankCtx, JW, JH);
+            drawWitness(witCtx, WITW, WITH);
+            drawSpace(spCtx, SPW, SPH);
+        }
+
+        frameN++;
+        if ((frameN & 7) === 0 && activeScene === 'hll') tick10();
+        requestAnimationFrame(loop);
+    }
+
+    // ---- tabs --------------------------------------------------------------------------
+    let activeScene = 'hll';
+    const scenes = document.querySelectorAll('.scene');
+    const tabButtons = document.querySelectorAll('#tabs button');
+    function activate(tab) {
+        for (let i = 0; i < scenes.length; i++) {
+            const on = scenes[i].getAttribute('data-scene') === tab;
+            if (on) scenes[i].setAttribute('data-active', '');
+            else scenes[i].removeAttribute('data-active');
+        }
+        for (let i = 0; i < tabButtons.length; i++) {
+            tabButtons[i].setAttribute('aria-current', tabButtons[i].getAttribute('data-tab') === tab ? 'true' : 'false');
+        }
+        activeScene = tab;
+        if (tab === 'hll') { computeHllLayout(); sizeHllPanels(); }
+    }
+    for (let i = 0; i < tabButtons.length; i++) {
+        tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
+    }
+
+    // ---- keyboard ----------------------------------------------------------------------
+    window.addEventListener('keydown', (e) => {
+        if (e.key === '1') activate('hll');
+        else if (e.key === '2') activate('cms');
+        else if (e.key === '3') activate('dd');
+        else if (e.key === '4') activate('ss');
+        else if (e.key === ' ' && e.target === document.body) { e.preventDefault(); setPaused(!paused); }
+    });
+
+    // ---- boot --------------------------------------------------------------------------
+    setOracle(true);
+    dom.mem.textContent = (hllWorld.hll.m / 1024).toFixed(1) + ' KB';
+    computeHllLayout();
+    sizeHllPanels();
+    requestAnimationFrame(loop);
+</script>
+</body>
+</html>
