@@ -8,6 +8,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.3.0] - 2026-09-23
+
+The quantile member, pure-appended -- the family's first hard per-query bound.
+
+### Added
+
+- **`DDSketch` -- the quantile member: zero-GC relative-error quantiles over an unbounded stream in
+  fixed space.** Log-scale bucketing (`gamma = (1+alpha)/(1-alpha)`; a value `x > 0` -> bucket
+  `ceil(ln(x)/ln(gamma))`) over a dense `Float64Array` of bins. `add(value, count = 1)` is worst-case
+  O(1), 0 B/op; `quantile(q)` is a cold O(bins) cumulative walk returning a value within a HARD
+  per-query relative-error bound `|v - v_true| <= alpha * v_true` (the family's sharpest guarantee --
+  not statistical like HyperLogLog, not additive like CountMinSketch). `merge(other)` is
+  same-alpha-or-throw; `clear()` reuses the allocation. `alpha` is the accuracy knob directly (no
+  `withAccuracy` needed). Getters: `alpha` / `count` / `sum` / `min` / `max` / `zeroCount` /
+  `maxBins` / `numBins` / `collapsed`; `min` and `max` are EXACT (not bucketed) while `quantile` is
+  alpha-approximate. Bin counts are `Float64Array` (exact to 2^53 -- no saturation, since a quantile
+  needs an exact cumulative count). Does NOT use the two-lane hash (it bins raw values). See
+  [`decisions/0004`](./decisions/0004-ddsketch.md).
+- **Collapsing-lowest (default) + strict fixed-range (opt-in).** By default a bounded `maxBins`
+  (2048) dense store collapses the SMALLEST-value buckets into the floor when the value range exceeds
+  the budget -- unbounded value range, bounded memory, the relative-error guarantee PRESERVED for the
+  upper quantiles (p50/p90/p99) and degraded only for the smallest values (`collapsed` reports it).
+  The bin array is allocated once and NEVER re-grown: extend and collapse both shift counts within the
+  fixed array (a `copyWithin`), so `add` stays 0 B/op even after collapse. A `{ range: [min, max] }`
+  option is strict fixed-range fail-closed: a value outside the range throws instead of collapsing.
+- **Fail closed:** the domain is positive + zero -- a negative value throws `[lite-sketch]`, and a
+  value outside the representable double range (so a bucket representative can never overflow to
+  `Infinity` or underflow to `0`) throws; the ctor throws typeof-first on a bad `alpha` / `maxBins` /
+  `range` (incl. an un-indexable range end) BEFORE any allocation; every rejected `add` / `merge` is a
+  byte-identical no-op; `quantile` / getters never throw (empty or a bad `q` -> `NaN`).
+- **Chassis extended:** the accuracy witness now gates DDSketch's measured relative error at
+  {p50, p90, p99, p999} against `alpha` on uniform / lognormal / pareto streams vs an exact
+  sorted-array oracle; the torture gate proves `add` at 0 B/op; the perf gate adds the DDSketch
+  add-stream scenario.
+
+### Changed
+
+- `VERSION` -> `'0.3.0'` (three-site synced with `package.json` and `llms.txt`). `HyperLogLog`,
+  `CountMinSketch`, and the shared hash are byte-identical -- DDSketch is a pure append.
+
 ## [0.2.0] - 2026-09-23
 
 The frequency member, pure-appended on the shipped hash + chassis.

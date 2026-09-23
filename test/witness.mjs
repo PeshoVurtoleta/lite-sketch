@@ -17,7 +17,7 @@
 // The max |relerr| <= ~3.5 sigma (the ~3-sigma tail with a small-trial allowance). The
 // absolute error-halving ratio is REPORTED for the eye but not gated (sampling noise).
 
-import { HyperLogLog, CountMinSketch } from '../Sketch.js';
+import { HyperLogLog, CountMinSketch, DDSketch } from '../Sketch.js';
 
 const PS = [10, 12, 14];
 const NS = [1000, 10000, 100000];
@@ -280,7 +280,99 @@ console.log('  space co-headline @ N=' + fmtInt(CMS_N) + ', distinct=' + fmtInt(
 console.log('');
 console.log('WITNESS CountMinSketch ' + (cmsOk ? 'ok' : 'FAIL'));
 
-const ok2 = hllOk && cmsOk;
+// ===========================================================================
+// DDSketch -- relative-error quantiles vs the exact sorted-array oracle
+// ===========================================================================
+//
+// The oracle is an exact sorted Float64Array of the SAME stream fed to the sketch;
+// the theoretical bound (Masson/Rim/Lee) is a HARD per-query bound, not a statistical
+// one: `|quantile(q) - sorted[floor(q*(N-1))]| <= alpha * sorted[floor(q*(N-1))]`, with
+// no failure probability to average over. We measure the exact relative error at each
+// q and gate it directly against alpha (a tiny numerical slack accounts for ULP-level
+// Math.log/Math.pow rounding at the analytic boundary -- NOT a hidden weakening of the
+// bound; see SLACK below). We print MEASURED relerr vs the alpha bound side by side,
+// and the space co-headline (a fixed maxBins*8 bytes vs the exact sorted array's 8*N
+// bytes, which grows with the stream).
+
+function ddRng(seed) {
+    let s = seed >>> 0;
+    return function rng() {
+        s = (s + 0x6d2b79f5) | 0;
+        let t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function ddGaussian(rng) {
+    let spare = null;
+    return function gaussian() {
+        if (spare !== null) { const v = spare; spare = null; return v; }
+        let u1 = rng(); if (u1 < 1e-12) u1 = 1e-12;
+        const u2 = rng();
+        const r = Math.sqrt(-2 * Math.log(u1));
+        const theta = 2 * Math.PI * u2;
+        spare = r * Math.sin(theta);
+        return r * Math.cos(theta);
+    };
+}
+
+const ddDistributions = [
+    { name: 'uniform', make: (rng) => (() => 1 + rng() * 999999) },
+    { name: 'lognormal', make: (rng) => { const g = ddGaussian(rng); return () => Math.exp(5 + 1.5 * g()); } },
+    { name: 'pareto', make: (rng) => (() => { let u = rng(); if (u > 1 - 1e-15) u = 1 - 1e-15; return 1 / Math.pow(1 - u, 1 / 2.5); }) },
+];
+
+const DD_QS = [0.5, 0.9, 0.99, 0.999];
+const DD_N = 100000;
+const DD_ALPHA = 0.01;
+// Float64 rounding slack for the analytic alpha bound (ULP-level Math.log/Math.pow
+// noise at the boundary of a HARD per-query guarantee) -- not a statistical fudge.
+const DD_SLACK = 1e-9;
+
+console.log('');
+console.log('ACCURACY Witness -- DDSketch relative-error quantiles vs the exact sorted-array oracle ' +
+    '(N=' + fmtInt(DD_N) + ', alpha=' + DD_ALPHA + '; theoretical: a HARD per-query bound, not statistical)');
+console.log('');
+console.log('  distribution   q       measured  alpha bound  true value       measured value   status');
+console.log('  -------------  ------  --------  -----------  ---------------  ---------------  ------');
+
+let ddOk = true;
+for (const dist of ddDistributions) {
+    const rng = ddRng(0xD5D5D5D5 ^ (dist.name.length << 8));
+    const sample = dist.make(rng);
+    const sketch = new DDSketch(DD_ALPHA);
+    const values = new Float64Array(DD_N);
+    for (let i = 0; i < DD_N; i++) { const v = sample(); values[i] = v; sketch.add(v); }
+    const sorted = Array.from(values).sort((a, b) => a - b);
+    for (const q of DD_QS) {
+        const trueVal = sorted[Math.floor(q * (DD_N - 1))];
+        const measured = sketch.quantile(q);
+        const relErr = Math.abs(measured - trueVal) / Math.abs(trueVal);
+        const bound = DD_ALPHA * (1 + DD_SLACK);
+        const cellOk = relErr <= bound;
+        if (!cellOk) ddOk = false;
+        console.log('  ' + dist.name.padEnd(13) + '  ' + String(q).padEnd(6) + '  ' +
+            pct(relErr).padStart(8) + '  ' + pct(bound).padStart(11) + '  ' +
+            trueVal.toExponential(6).padStart(15) + '  ' + measured.toExponential(6).padStart(15) +
+            '  ' + (cellOk ? 'ok' : 'FAIL'));
+    }
+}
+
+// Space co-headline: the sketch is a fixed maxBins*8 bytes; the exact sorted array grows 8*N.
+console.log('');
+const ddSpaceSketch = new DDSketch(DD_ALPHA);
+const ddSpaceBytes = ddSpaceSketch.maxBins * 8;
+const ddArrayBytes = DD_N * 8;
+console.log('  space co-headline @ N=' + fmtInt(DD_N) + ':  DDSketch maxBins=' + ddSpaceSketch.maxBins +
+    ' = ' + (ddSpaceBytes / 1024).toFixed(1) + ' KB (fixed)  vs  exact sorted Float64Array = ' +
+    (ddArrayBytes / 1024).toFixed(1) + ' KB (grows O(N))');
+
+console.log('');
+console.log('WITNESS DDSketch ' + (ddOk ? 'ok' : 'FAIL'));
+
+const ok2 = hllOk && cmsOk && ddOk;
 console.log('');
 console.log('WITNESS lite-sketch (all members) ' + (ok2 ? 'ok' : 'FAIL'));
 if (!ok2) process.exitCode = 1;

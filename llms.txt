@@ -1,6 +1,6 @@
 # @zakkster/lite-sketch
 
-Version: 0.2.0
+Version: 0.3.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,11 +14,12 @@ It is the approximate-aggregate corner of the suite -- @zakkster/lite-filter is
 approximate MEMBERSHIP, @zakkster/lite-o1 is EXACT O(1), and lite-sketch is
 APPROXIMATE aggregates (count / frequency / quantile / top-k).
 
-v0.2.0 ships two members -- HyperLogLog (distinct-count / cardinality) and
-CountMinSketch (point-query frequency) -- over a shipped, avalanche-tested two-lane
-64-bit hash. DDSketch (quantiles) and SpaceSaving (heavy hitters) follow one per
-release to a stable 1.0.0. Members share no mutable module state, so a bundler that
-imports one drops the others (tree-shakeable).
+v0.3.0 ships three members -- HyperLogLog (distinct-count / cardinality) and
+CountMinSketch (point-query frequency) over the shipped, avalanche-tested two-lane
+64-bit hash, plus DDSketch (relative-error quantiles), which bins raw values on a
+log scale and does NOT use the hash. SpaceSaving (heavy hitters) follows to a stable
+1.0.0. Members share no mutable module state, so a bundler that imports one drops the
+others (tree-shakeable).
 
 ## Exports (from the single main file Sketch.js)
 
@@ -43,10 +44,22 @@ imports one drops the others (tree-shakeable).
   the paper's bound. `merge(other)` is element-wise saturating add (equal-d/w/seed-or-throw);
   `clear()` reuses the allocation. Counters saturate at 2^32-1. Fail closed on a bad ctor arg /
   key / lane / count (throws typeof-first BEFORE allocation); `estimate` never throws.
-- `VERSION` -- string, '0.2.0'.
+- `DDSketch` -- class. A zero-GC relative-error QUANTILE sketch over a dense
+  `Float64Array` of log-scale bins (`gamma = (1+alpha)/(1-alpha)`; a value x>0 lands in
+  bucket `ceil(ln(x)/ln(gamma))`). `add(value, count = 1)` is worst-case O(1), 0 B/op;
+  `quantile(q)` is a cold O(bins) cumulative walk returning a value within a HARD relative
+  error `|v - v_true| <= alpha * v_true` (the family's sharpest guarantee -- per-query, not
+  statistical). Collapsing-lowest by default (bounded memory, tail-accurate p50/p90/p99);
+  a `{ range: [min, max] }` option is strict fixed-range fail-closed. Positive + zero domain
+  (a negative value throws). `merge(other)` is same-alpha-or-throw; `min`/`max` are EXACT
+  (not bucketed). Fail closed on a bad alpha / value / out-of-indexable-range / count (throws
+  typeof-first BEFORE allocation); `quantile` / getters never throw (a bad q -> NaN). Does
+  NOT use the two-lane hash.
+- `VERSION` -- string, '0.3.0'.
 
-(The canonical hash is used internally by `add`; a caller who brings their own good
-hash uses `addHashed(hi, lo)` with two uint32 lanes. ADR 0001 records the hash.)
+(The canonical hash is used internally by HyperLogLog / CountMinSketch `add`; a caller who
+brings their own good hash uses `addHashed(hi, lo)`. DDSketch bins raw values -- no hash.
+ADR 0001 records the hash.)
 
 ## HyperLogLog
 
@@ -138,6 +151,58 @@ Map oracle, measures the over-estimate per key, and GATES the fraction exceeding
 <= delta, plus one-sidedness (0 undercounts) and conservative <= plain. Space co-headline:
 d*w*4 bytes vs the exact Map's O(distinct) footprint. The over-estimate is ONE-SIDED (never
 under); the guarantee is probabilistic (delta), the hashing statistical not cryptographic.
+
+## DDSketch
+
+    new DDSketch(alpha, options?)
+
+- alpha: relative accuracy, in (0, 1) -- the guarantee knob (e.g. 0.01 = 1% relative error).
+  gamma = (1+alpha)/(1-alpha); a value x>0 lands in bucket key(x) = ceil(ln(x)/ln(gamma)), and
+  the representative 2*gamma^key/(gamma+1) is within alpha relative error of every x in the bucket.
+- options (object): { maxBins = 2048, range?: [min, max] }. An unknown option key throws
+  [lite-sketch] (did-you-mean).
+  - DEFAULT (no range) = COLLAPSING-LOWEST: a dense Float64Array(maxBins); when the value range
+    exceeds the budget, the SMALLEST-value buckets collapse into the floor bin. Unbounded value
+    range, bounded memory; the relative-error guarantee is PRESERVED for the UPPER quantiles
+    (p50/p90/p99) and degraded only for the smallest values (a disclosed co-headline). `collapsed`
+    getter reports whether any collapse has happened.
+  - range present = STRICT fixed-range fail-closed: bins cover exactly [key(min), key(max)]; a value
+    with x>0 whose key is outside the range THROWS [lite-sketch] (never collapsed). Requires 0 < min < max.
+- DOMAIN = positive + zero: x>0 is bucketed, x===0 increments a separate zero counter, x<0 THROWS
+  [lite-sketch] (no negative mirror; deferred). Values outside the indexable double range (roughly
+  [~2.2e-308, ~8.6e307] at alpha=0.01; the window widens as alpha grows) THROW fail-closed so the
+  bucket representative can never overflow to Infinity or underflow to 0.
+- Constructor throws [lite-sketch] typeof-first on a bad alpha / maxBins / range BEFORE allocation.
+
+Hot surface (add is worst-case O(1), zero allocation):
+
+- add(value, count = 1) -> this    Bucket a finite value (or increment the zero counter). count is a
+                                  positive integer in [1, 2^53). Fail closed: a non-number / NaN /
+                                  +-Infinity / negative / out-of-indexable-range value or a bad count
+                                  throws [lite-sketch] (typeof-first, BYTE-IDENTICAL no-op -- no
+                                  aggregate is touched on a rejected add).
+- quantile(q) -> number           The q-quantile (q in [0,1]) within alpha relative error. COLD,
+                                  O(bins) cumulative walk; rank = floor(q*(count-1)); returns the
+                                  bucket representative (or 0 if the rank falls in the zero bucket).
+                                  NEVER throws -- an empty sketch or a bad q returns NaN.
+- merge(other) -> this            Fold other's bins/zeroCount/count/sum into this (collapsing as
+                                  needed). Same-alpha (same gamma)-or-throw; a strict `this` throws if
+                                  an incoming key is out of range. min/max combined exactly. O(other bins).
+- clear() -> this                 Zero the bins + all scalars; reuse the allocation.
+- alpha / count / sum             Getters: the accuracy knob; the exact element count N; the exact sum.
+- min / max                       Getters: the EXACT tracked min / max (NOT bucketed -- exact while
+                                  quantile is alpha-approximate); NaN on an empty sketch.
+- zeroCount / maxBins / numBins   Getters: the exact count of zeros; the bin capacity; the live
+                                  (populated) bin count.
+- collapsed (getter)              Whether any smallest-value collapse has occurred (the small-value
+                                  guarantee was touched).
+
+Accuracy contract (the honesty anchor -- the family's sharpest): the guarantee is a HARD PER-QUERY
+relative-error bound |v_returned - v_true| <= alpha * v_true, not a statistical (HLL) or additive (CMS)
+one. The witness drives uniform + lognormal + pareto positive streams against an exact sorted-array
+oracle and GATES the measured relative error at q in {0.5, 0.9, 0.99, 0.999} against alpha. Space
+co-headline: maxBins*8 bytes (fixed) vs the exact sorted array's 8*N bytes. Uniformity is not a factor
+(no hashing); the only approximation is the log-bucket width, bounded by alpha.
 
 ## The hash (ADR 0001)
 

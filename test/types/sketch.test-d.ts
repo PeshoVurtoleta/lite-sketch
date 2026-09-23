@@ -6,9 +6,9 @@
  */
 
 import {
-    HyperLogLog, CountMinSketch, mix64, hashHi, hashLo, hashString, saltRow, VERSION,
+    HyperLogLog, CountMinSketch, DDSketch, mix64, hashHi, hashLo, hashString, saltRow, VERSION,
 } from '../../Sketch.js';
-import type { CountMinSketchOptions } from '../../Sketch.js';
+import type { CountMinSketchOptions, DDSketchOptions } from '../../Sketch.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -119,3 +119,68 @@ cms.estimate('1');
 cms.merge(42);
 // @ts-expect-error -- withAccuracy epsilon must be a number.
 CountMinSketch.withAccuracy('0.001', 0.01);
+
+// --- DDSketch ----------------------------------------------------------------
+
+const dd: DDSketch = new DDSketch(0.01);
+const ddOpts: DDSketchOptions = { maxBins: 128, range: [1, 1000] };
+const ddFull: DDSketch = new DDSketch(0.01, ddOpts);
+const ddMaxBinsOnly: DDSketch = new DDSketch(0.01, { maxBins: 128 });
+const ddRangeOnly: DDSketch = new DDSketch(0.01, { range: [1, 1000] });
+void ddFull; void ddMaxBinsOnly; void ddRangeOnly;
+
+// getters are readonly.
+const ddAlpha: number = dd.alpha;
+const ddCount: number = dd.count;
+const ddSum: number = dd.sum;
+const ddMin: number = dd.min;
+const ddMax: number = dd.max;
+const ddZeroCount: number = dd.zeroCount;
+const ddMaxBins: number = dd.maxBins;
+const ddNumBins: number = dd.numBins;
+const ddCollapsed: boolean = dd.collapsed;
+void ddAlpha; void ddCount; void ddSum; void ddMin; void ddMax;
+void ddZeroCount; void ddMaxBins; void ddNumBins; void ddCollapsed;
+
+// @ts-expect-error -- alpha is readonly.
+dd.alpha = 0.02;
+// @ts-expect-error -- count is readonly.
+dd.count = 5;
+// @ts-expect-error -- sum is readonly.
+dd.sum = 5;
+// @ts-expect-error -- min is readonly.
+dd.min = 0;
+// @ts-expect-error -- max is readonly.
+dd.max = 0;
+// @ts-expect-error -- zeroCount is readonly.
+dd.zeroCount = 0;
+// @ts-expect-error -- maxBins is readonly.
+dd.maxBins = 128;
+// @ts-expect-error -- numBins is readonly.
+dd.numBins = 0;
+// @ts-expect-error -- collapsed is readonly.
+dd.collapsed = true;
+
+// add -> this (chainable, count optional); quantile -> number; merge -> this; clear -> this.
+const ddChained: DDSketch = dd.add(1).add(2, 5);
+const ddQuantile: number = dd.quantile(0.5);
+const ddMerged: DDSketch = dd.merge(new DDSketch(0.01));
+const ddCleared: DDSketch = dd.clear();
+void ddChained; void ddQuantile; void ddMerged; void ddCleared;
+
+// @ts-expect-error -- alpha must be a number.
+new DDSketch('0.01');
+// @ts-expect-error -- options.maxBins must be a number.
+new DDSketch(0.01, { maxBins: '128' });
+// @ts-expect-error -- options.range must be a two-element numeric tuple.
+new DDSketch(0.01, { range: [1, 2, 3] });
+// @ts-expect-error -- unknown options are rejected at the type level too.
+new DDSketch(0.01, { bogus: true });
+// @ts-expect-error -- add value must be a number.
+dd.add('1');
+// @ts-expect-error -- add count must be a number.
+dd.add(1, '5');
+// @ts-expect-error -- quantile q must be a number.
+dd.quantile('0.5');
+// @ts-expect-error -- merge takes a DDSketch.
+dd.merge(42);

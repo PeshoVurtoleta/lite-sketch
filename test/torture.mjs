@@ -18,7 +18,7 @@ async function main() {
     }
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { HyperLogLog, CountMinSketch } = await import('../Sketch.js');
+    const { HyperLogLog, CountMinSketch, DDSketch } = await import('../Sketch.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -58,6 +58,24 @@ async function main() {
     let cmsLive = cmsTracker.size();
     for (let g = 0; g < 20 && cmsLive > 0; g++) { globalThis.gc(); await sleep(25); cmsLive = cmsTracker.size(); }
     const cmsFindings = cmsTracker.audit();
+
+    // ---- phase 1c: DDSketch retention (build/fill/quantile/clear cycles reclaim fully?) ----
+    const ddTracker = createLeakTracker();
+    function fillDdTracker() {
+        for (let i = 0; i < 256; i++) {
+            const d = new DDSketch(0.01);
+            for (let k = 1; k <= 4096; k++) d.add(((k ^ i) & 0x3fffffff) | 1);   // positive values
+            d.quantile(0.5);           // exercise the cold quantile walk (0 alloc)
+            d.clear();
+            ddTracker.track(d, noop, 'ddsketch', { audit: true });
+        }
+        return ddTracker.size();
+    }
+    const ddTrackedMid = fillDdTracker();
+    const ddTrackedOk = ddTrackedMid > 0;
+    let ddLive = ddTracker.size();
+    for (let g = 0; g < 20 && ddLive > 0; g++) { globalThis.gc(); await sleep(25); ddLive = ddTracker.size(); }
+    const ddFindings = ddTracker.audit();
 
     // ---- phase 2a: 0 B/op on the hot path ----
     // add(key): hash a numeric key + one register max. Built/primed OUTSIDE the window.
@@ -144,12 +162,35 @@ async function main() {
     const ceBytes = Math.max(0, Math.round(ceBpc));
     const ceOk = ceBytes === 0;
 
+    // ---- phase 2a-dd: 0 B/op on the DDSketch hot path ----
+    // add(value): compute the log-scale bucket key + one in-window Float64Array increment.
+    // Prime a positive stream OUTSIDE the measured window so the window/offset are WARM and
+    // the common path is a pure in-window increment (no slide, no collapse).
+    const dd = new DDSketch(0.01);
+    for (let k = 1; k <= 100000; k++) dd.add(k);   // anchors the window; offset now stable
+    // Push _count past 2^31 and _sum to a large double BEFORE measuring, so `_count += count`
+    // and `_sum += value*count` run against DOUBLE fields during the window -- proves the
+    // running aggregates (and the transient Math.log key) do not box a HeapNumber per op
+    // (the risk flagged in the brief; a per-op box would show as > 0 B/op below).
+    dd.add(50000, 0x7fffffff);
+    dd.add(50000, 0x7fffffff);
+    let ddV = 0, ddSink = 0;
+    const ddStep = () => {
+        ddV++; if (ddV > 99999) ddV = 1;             // walk a bounded positive range (stays in-window)
+        dd.add(ddV);
+        ddSink = (ddSink + dd._bins[0] + dd._maxKeyPop) | 0;   // observe the bank (defeat DCE)
+    };
+    const ddRes = measureAllocs(ddStep, { iterations: 100000, batches: 8 });
+    const ddBpc = ddRes.bytesPerCall === null ? 0 : ddRes.bytesPerCall;
+    const ddBytes = Math.max(0, Math.round(ddBpc));
+    const ddOk = ddBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run ----
     const gc = new GcProfiler().start();
     const HOT = 2000000;
     let SINK = 0;
-    for (let i = 0; i < HOT; i++) { addStep(); ccStep(); ceStep(); }   // HLL + CMS add + CMS query
-    SINK += addSink + ahSink + ccSink + cpSink + chSink + ceSink;
+    for (let i = 0; i < HOT; i++) { addStep(); ccStep(); ceStep(); ddStep(); }   // HLL + CMS + DD hot ops
+    SINK += addSink + ahSink + ccSink + cpSink + chSink + ceSink + ddSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -158,6 +199,7 @@ async function main() {
     const abBefore = process.memoryUsage().arrayBuffers;
     const reuse = new HyperLogLog(14, 0x1234);
     const cmsReuse = new CountMinSketch(6, 1 << 13, { seed: 0x1234 });
+    const ddReuse = new DDSketch(0.01);
     for (let c = 0; c < 200; c++) {
         for (let k = 0; k < M; k++) reuse.add((k ^ c) | 0);
         reuse.count();
@@ -165,6 +207,9 @@ async function main() {
         for (let k = 0; k < 8192; k++) cmsReuse.add((k ^ c) | 0);
         cmsReuse.estimate(c);
         cmsReuse.clear();              // O(d*w) fill(0), no new store
+        for (let k = 1; k <= 8192; k++) ddReuse.add(((k ^ c) & 0x3fffffff) | 1);
+        ddReuse.quantile(0.9);
+        ddReuse.clear();              // O(maxBins) fill(0), no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -175,31 +220,37 @@ async function main() {
     const cmsAllocOk = ccOk && cpOk && chOk && ceOk;
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         cmsTrackedOk && cmsLive === 0 && cmsFindings.length === 0 &&
-        addOk && ahOk && cmsAllocOk && report.ok && abOk;
-    const gateLive = live + cmsLive;
-    const gateFindings = findings.length + cmsFindings.length;
+        ddTrackedOk && ddLive === 0 && ddFindings.length === 0 &&
+        addOk && ahOk && cmsAllocOk && ddOk && report.ok && abOk;
+    const gateLive = live + cmsLive + ddLive;
+    const gateFindings = findings.length + cmsFindings.length + ddFindings.length;
     console.log(
         'GATE leak=size ' + gateLive + '/0 findings=' + gateFindings +
         ' | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) +
         ' | alloc=' + addBytes + ' B/op (HyperLogLog add) ' + ahBytes + ' B/op (HyperLogLog addHashed) ' +
         ccBytes + ' B/op (CountMinSketch add cons) ' + cpBytes + ' B/op (CountMinSketch add plain) ' +
-        chBytes + ' B/op (CountMinSketch addHashed) ' + ceBytes + ' B/op (CountMinSketch estimate)' +
+        chBytes + ' B/op (CountMinSketch addHashed) ' + ceBytes + ' B/op (CountMinSketch estimate) ' +
+        ddBytes + ' B/op (DDSketch add)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + '/' + cmsTrackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + '/' + cmsTrackedMid + '/' + ddTrackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: HLL tracker held ' + trackedMid + ' (expected > 0)');
         if (!cmsTrackedOk) console.error('  vacuous: CMS tracker held ' + cmsTrackedMid + ' (expected > 0)');
+        if (!ddTrackedOk) console.error('  vacuous: DD tracker held ' + ddTrackedMid + ' (expected > 0)');
         if (live !== 0) console.error('  retain: ' + live + ' HyperLogLog instances survived');
         if (cmsLive !== 0) console.error('  retain: ' + cmsLive + ' CountMinSketch instances survived');
+        if (ddLive !== 0) console.error('  retain: ' + ddLive + ' DDSketch instances survived');
         for (const f of findings) console.error('  finding ' + f.kind + ':' + f.reason);
         for (const f of cmsFindings) console.error('  cms finding ' + f.kind + ':' + f.reason);
+        for (const f of ddFindings) console.error('  dd finding ' + f.kind + ':' + f.reason);
         if (!addOk) console.error('  alloc ' + addBytes + ' B/op HyperLogLog add (raw ' + addBpc + ')');
         if (!ahOk) console.error('  alloc ' + ahBytes + ' B/op HyperLogLog addHashed (raw ' + ahBpc + ')');
         if (!ccOk) console.error('  alloc ' + ccBytes + ' B/op CountMinSketch add cons (raw ' + ccBpc + ')');
         if (!cpOk) console.error('  alloc ' + cpBytes + ' B/op CountMinSketch add plain (raw ' + cpBpc + ')');
         if (!chOk) console.error('  alloc ' + chBytes + ' B/op CountMinSketch addHashed (raw ' + chBpc + ')');
         if (!ceOk) console.error('  alloc ' + ceBytes + ' B/op CountMinSketch estimate (raw ' + ceBpc + ')');
+        if (!ddOk) console.error('  alloc ' + ddBytes + ' B/op DDSketch add (raw ' + ddBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

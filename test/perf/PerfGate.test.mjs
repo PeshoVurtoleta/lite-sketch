@@ -7,7 +7,7 @@
 // delta). A `mustFail` control that allocates per op MUST trip the gate, proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { HyperLogLog, CountMinSketch } from '../../Sketch.js';
+import { HyperLogLog, CountMinSketch, DDSketch } from '../../Sketch.js';
 
 const P = 14;
 const M = 1 << P;
@@ -17,6 +17,9 @@ function grows(s) { return s.h._reg.buffer.byteLength; }
 
 /** Zero-alloc counter: the CountMinSketch counter matrix's byte length -- fixed at construction. */
 function cmsGrows(s) { return s.c._counts.buffer.byteLength; }
+
+/** Zero-alloc counter: the DDSketch bin array's byte length -- fixed at construction. */
+function ddGrows(s) { return s.d._bins.buffer.byteLength; }
 
 /** add-stream: hash a walking numeric key + one register max each op (the hot path). */
 const addStream = {
@@ -127,6 +130,32 @@ const cmsEstimateStream = {
 };
 
 /**
+ * add-stream: DDSketch's hot path -- one Math.log/key compute + one in-window
+ * Float64Array increment. Primed to a warm, stable window OUTSIDE the measured run,
+ * then walked over a bounded positive range that stays in-window for the whole hot
+ * loop (no slide, no collapse) so the bin array never resizes.
+ */
+const ddAddStream = {
+    name: 'DDSketch add-stream (log-scale key + in-window Float64Array increment)',
+    setup() {
+        const d = new DDSketch(0.01);
+        for (let k = 1; k <= 100000; k++) d.add(k);   // prime to a warm, stable window
+        return { d, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const d = s.d;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v++; if (v > 99999) v = 1;                // walk a bounded positive range (stays in-window)
+            d.add(v);
+            sink = (sink + d._bins[0] + d._maxKeyPop) | 0;   // observe the bank (defeat DCE)
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: ddGrows(s) }; },
+};
+
+/**
  * The teeth: a per-op call that builds a FRESH array each op -- it MUST trip the gate
  * (scavenges scale with n), proving the instrument catches a real allocation.
  */
@@ -165,10 +194,11 @@ zgcSuite({
     maxOldGen: 0,
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
-    // the HyperLogLog(14) register bank is ~16 KB and the CountMinSketch(5, 16384) counter
-    // matrix is ~320 KB; setup builds each scenario's state twice + harness overhead. grows
-    // delta 0 (both counters below) is the leak invariant, not the retained-KB headline.
+    // the HyperLogLog(14) register bank is ~16 KB, the CountMinSketch(5, 16384) counter
+    // matrix is ~320 KB, and the default DDSketch(0.01) bin array (maxBins=2048) is ~16 KB;
+    // setup builds each scenario's state twice + harness overhead. grows delta 0 (all three
+    // counters below) is the leak invariant, not the retained-KB headline.
     maxRetainedKB: 1024,
-    scenarios: [addStream, addHashedStream, cmsAddConsStream, cmsAddPlainStream, cmsEstimateStream],
+    scenarios: [addStream, addHashedStream, cmsAddConsStream, cmsAddPlainStream, cmsEstimateStream, ddAddStream],
     mustFail: [mustFailAlloc],
 });

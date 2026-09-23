@@ -1,6 +1,6 @@
 # @zakkster/lite-sketch
 
-> Zero-GC approximate streaming summaries that **witness their accuracy against the paper's bound** -- HyperLogLog for distinct-count, CountMinSketch for frequency.
+> Zero-GC approximate streaming summaries that **witness their accuracy against the paper's bound** -- HyperLogLog for distinct-count, CountMinSketch for frequency, DDSketch for quantiles.
 
 ![zero deps](https://img.shields.io/badge/deps-0-brightgreen) ![zero GC](https://img.shields.io/badge/hot--path-0%20B%2Fop-brightgreen) ![ESM](https://img.shields.io/badge/module-ESM-blue) ![types](https://img.shields.io/badge/types-included-blue) ![license](https://img.shields.io/badge/license-MIT-blue)
 
@@ -29,6 +29,7 @@ hll.standardError;                         // 0.008  -- the theoretical 1.04/sqr
 - [What you get](#what-you-get)
 - [HyperLogLog](#hyperloglog)
 - [CountMinSketch](#countminsketch)
+- [DDSketch](#ddsketch)
 - [API reference](#api-reference)
 - [Composability](#composability)
 - [Zero-GC design notes](#zero-gc-design-notes)
@@ -45,8 +46,9 @@ A sketch is a promise: "I use `X` bytes and my answer is within `E` of the truth
 ## What you get
 
 - **HyperLogLog** -- distinct-count (cardinality) in fixed space, `~1.04/sqrt(m)` standard error, mergeable. (The reference member.)
-- **CountMinSketch** -- point-query frequency ("how many times have I seen `x`?") in a fixed `d x w` matrix, a one-sided over-estimate bounded by `epsilon * N`, with conservative update on by default and merge for map/reduce. (DDSketch and SpaceSaving follow, one per release, to a stable 1.0.0.)
-- **A shipped, avalanche-tested hash** -- a two-lane 64-bit-quality non-crypto mix, zero-alloc, with a pre-hashed fast path for callers who bring their own.
+- **CountMinSketch** -- point-query frequency ("how many times have I seen `x`?") in a fixed `d x w` matrix, a one-sided over-estimate bounded by `epsilon * N`, with conservative update on by default and merge for map/reduce.
+- **DDSketch** -- relative-error quantiles (p50/p90/p99/...) in fixed space, with a *hard* per-query guarantee `|v - v_true| <= alpha * v_true` -- the family's sharpest bound. Collapsing-lowest keeps the tail accurate; strict fixed-range is an opt-in. (SpaceSaving follows, to a stable 1.0.0.)
+- **A shipped, avalanche-tested hash** -- a two-lane 64-bit-quality non-crypto mix, zero-alloc, with a pre-hashed fast path for callers who bring their own. (HyperLogLog and CountMinSketch use it; DDSketch bins raw values.)
 - **The accuracy witness** -- measured error vs the theoretical bound, printed side by side, with the exact-`Set` foil whose memory climbs without bound.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** proven by a leak + GC-profiler torture gate.
 
@@ -107,6 +109,36 @@ total.estimate(k);                                       // same answer as one s
 Every counter a key touches is `true count + (collisions from other keys)`. Collisions are non-negative, so *every* cell is an over-estimate and the smallest one is the tightest -- that is why `estimate` takes the min, and why it can never undercount. The Cormode-Muthukrishnan bound sets the geometry: `w = ceil(e / epsilon)` columns cap the expected collision mass at `epsilon * N` per row, and `d = ceil(ln(1/delta))` independent rows drive the probability that *all* rows are unlucky down to `delta`. `withAccuracy(epsilon, delta)` inverts that; the raw `new CountMinSketch(d, w)` gives you the dial directly (`w` rounds up to a power of two so a column is a single `& (w-1)` mask). Memory is a flat `d * w * 4` bytes regardless of how many distinct keys arrive -- against an exact `Map` whose footprint grows with the distinct count. Counters saturate at `2^32 - 1` rather than wrapping (a wrap would break the min's monotonicity). The accuracy witness gates the measured over-estimate against `epsilon * N` on a Zipfian stream, and confirms conservative <= plain, on every release.
 </details>
 
+## DDSketch
+
+Answer "what is the p99?" over an unbounded stream in fixed space, with a **hard relative-error guarantee**: for any quantile q, the returned value v satisfies `|v - v_true| <= alpha * v_true`. Unlike HyperLogLog (statistical error) and CountMinSketch (additive error), DDSketch's bound is *per-query and worst-case* -- the sharpest promise in the family. It works by bucketing on a log scale: with `gamma = (1 + alpha) / (1 - alpha)`, a value `x > 0` lands in bucket `ceil(log_gamma x)`, and every value in that bucket is within `alpha` relative error of the bucket's representative.
+
+```js
+import { DDSketch } from '@zakkster/lite-sketch';
+
+const lat = new DDSketch(0.01);           // 1% relative accuracy on every quantile
+for (const ms of responseTimes) lat.add(ms);
+lat.quantile(0.5);                        // p50, within 1% of the true median
+lat.quantile(0.99);                       // p99, within 1% of the true p99 -- the number that matters
+lat.max;                                  // the EXACT max (not bucketed); min/max are exact
+```
+
+`add` takes raw values (no hashing) and is 0 bytes/op; `quantile` is a cold O(bins) walk. The domain is **positive + zero** (a negative value throws -- latencies, sizes, and durations are non-negative); values are bucketed on a log scale, so the dynamic range is enormous (a single small sketch spans nanoseconds to hours). Memory is bounded by `maxBins` (default 2048): when a stream's value range would exceed the budget, DDSketch **collapses the smallest-value buckets** into the floor, which keeps the *upper* quantiles (p50/p90/p99 -- the ones you page on) within `alpha` and degrades only the smallest values. For a hard cap on the value range instead, pass `{ range: [min, max] }` for strict fixed-range mode, which throws on an out-of-range value rather than collapsing.
+
+```js
+// Distributed p99: sketch per shard, merge for the global quantile (same alpha).
+const merged = shards
+    .map(rows => { const s = new DDSketch(0.01); for (const r of rows) s.add(r.latency); return s; })
+    .reduce((acc, s) => acc.merge(s), new DDSketch(0.01));
+merged.quantile(0.99);                     // global p99 across every shard, within 1%
+```
+
+<details>
+<summary><b>Why relative-error bucketing beats rank-error sketches for tails (deep dive)</b></summary>
+
+Rank-error quantile sketches (t-digest, GK) promise the returned value is near the value at rank `q +/- epsilon` -- but at the tail, a tiny rank error can be a huge *value* error, exactly where latencies matter most. DDSketch instead fixes the *relative value* error: bucket `i` covers `(gamma^(i-1), gamma^i]`, so the representative `2 * gamma^i / (gamma + 1)` is within `alpha` of every value in the bucket, at *every* quantile equally. The bins are a dense `Float64Array` (counts exact to 2^53 -- no saturation, because a quantile needs an exact cumulative count), allocated once at `maxBins` and never re-grown: "extending" the window and "collapsing the lowest buckets" both shift counts *within* the fixed array, so `add` stays 0 bytes/op. `count` and `sum` are exact; `min` and `max` are tracked exactly (not read from a bucket). Values outside the representable double range (roughly `[~2.2e-308, ~8.6e307]` at `alpha=0.01`) are rejected fail-closed so a bucket representative can never overflow to `Infinity`. The accuracy witness gates the measured relative error against `alpha` at p50/p90/p99/p999 on uniform, lognormal, and pareto streams on every release.
+</details>
+
 ## API reference
 
 ```js
@@ -147,8 +179,6 @@ cms.conservative -> boolean              // whether conservative update is on (g
 cms.total -> number                      // the exact running sum N of all added counts (getter)
 cms.epsilon -> number                    // e / w -- the theoretical additive-error fraction (getter)
 cms.delta -> number                      // e^-d -- the theoretical failure probability (getter)
-
-VERSION -> string                        // '0.2.0'
 ```
 
 | epsilon | w = next pow2 >= e/epsilon | delta | d = ceil(ln 1/delta) | memory (d*w*4) |
@@ -159,6 +189,35 @@ VERSION -> string                        // '0.2.0'
 | 0.0001  | 32768                      | 0.001 | 7                    | ~896 KB        |
 
 More columns `w` shrink the error `epsilon`; more rows `d` shrink the failure probability `delta` -- the two independent dials, at `d * w * 4` bytes.
+
+```js
+new DDSketch(alpha, options?)            // alpha in (0,1) = relative accuracy. options: { maxBins = 2048, range?: [min, max] }.
+                                         //   Throws [lite-sketch] on a bad alpha/maxBins/range BEFORE allocating. range present = strict fixed-range.
+
+dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite value (x=0 -> zero counter). Throws on x<0, non-finite,
+                                         //   out-of-indexable-range, or a bad count -- a byte-identical no-op.
+dd.quantile(q) -> number                 // COLD, O(bins). The q-quantile (q in [0,1]) within alpha relative error. NEVER throws (empty/bad q -> NaN).
+dd.merge(other) -> this                  // Fold other in (collapsing as needed). Throws [lite-sketch] on a non-DDSketch or unequal alpha.
+dd.clear() -> this                       // Zero the bins + all scalars; reuse the allocation.
+dd.alpha -> number                       // the relative-accuracy knob (getter)
+dd.count -> number                       // exact element count N (getter)
+dd.sum -> number                         // exact sum of all added values (getter)
+dd.min / dd.max -> number                // the EXACT min / max (not bucketed; NaN when empty) (getters)
+dd.zeroCount -> number                   // exact count of zero values (getter)
+dd.maxBins -> number                     // the bin capacity (getter)
+dd.numBins -> number                     // the live (populated) bin count (getter)
+dd.collapsed -> boolean                  // whether any smallest-value collapse has happened (getter)
+
+VERSION -> string                        // '0.3.0'
+```
+
+| alpha | gamma = (1+a)/(1-a) | guarantee                 | memory (maxBins=2048) |
+|-------|---------------------|---------------------------|-----------------------|
+| 0.02  | ~1.041              | every quantile within 2%  | ~16 KB (fixed)        |
+| 0.01  | ~1.020              | every quantile within 1%  | ~16 KB (fixed)        |
+| 0.005 | ~1.010              | every quantile within 0.5%| ~16 KB (fixed)        |
+
+Smaller `alpha` -> finer buckets -> more bins used for a given value range (raise `maxBins` to avoid collapsing the smallest values); the guarantee holds at *every* quantile equally, and `min`/`max` are always exact.
 
 ## Composability
 
@@ -196,6 +255,8 @@ Every hot op allocates **0 bytes** after construction; the only allocator is the
 
 CountMinSketch is the same discipline: `add` / `addHashed` / `estimate` are **0 B/op** (the murmur is inlined into int32 locals and the `d` chosen cell indices are staged in a pre-allocated `Int32Array(d)` scratch, so even conservative update's two passes allocate nothing); `merge` / `clear` are in-place; only the constructor allocates (one `Uint32Array(d * w)`). The torture gate proves all of it.
 
+DDSketch too: `add` is **0 B/op** -- the log-scale key is a transient double (never stored to the heap), the bin array is a single `Float64Array(maxBins)` allocated once and never re-grown, and both window-extend and lowest-bucket-collapse shift counts *within* that fixed array (a `copyWithin`, no allocation). `quantile` / `merge` / `clear` are cold in-place walks. The torture gate proves `add` at 0 B/op even after collapse.
+
 **The hash (ADR 0001).** Zero-dep means the package ships its own hash, and accuracy proofs assume it is good. `lite-sketch` ships a two-lane 64-bit-quality non-crypto mix (`Math.imul`, no BigInt -- BigInt allocates), returned through module-scope lane slots so `add` allocates nothing. HLL reads both lanes for `rho`, so its bit-depth does not cap at high cardinality. The **avalanche property** -- a 1-bit input flip flips ~half the output bits -- is a shipped test.
 
 **The accuracy witness.** The torture gate proves `add` at **0 B/op**; the accuracy witness proves the *number* is right: it drives the sketch on a stream with an exact `Set` oracle, measures the relative error across an N-sweep, and gates it against `~1.5 * 1.04/sqrt(m)` (p99 within ~3 sigma, error halving as `p += 2`), printing MEASURED vs THEORETICAL side by side. The `Set` foil's memory grows O(distinct) while HLL stays a fixed `m` bytes -- the space half of the co-headline.
@@ -203,7 +264,8 @@ CountMinSketch is the same discipline: `add` / `addHashed` / `estimate` are **0 
 
 ## Design decisions worth knowing
 
-- **Accuracy is a co-headline, stated honestly.** Every member states space AND error AND whether the error is one-sided or two-sided, statistical or hard. HLL's is a *statistical* two-sided `~1.04/sqrt(m)`; CountMinSketch's is a *one-sided* over-estimate bounded by `epsilon * N` with probability `1 - delta`.
+- **Accuracy is a co-headline, stated honestly.** Every member states space AND error AND whether the error is one-sided or two-sided, statistical or hard. HLL's is a *statistical* two-sided `~1.04/sqrt(m)`; CountMinSketch's is a *one-sided* over-estimate bounded by `epsilon * N` with probability `1 - delta`; DDSketch's is a *hard per-query* relative bound `|v - v_true| <= alpha * v_true` -- three different guarantee shapes, each named for what it actually is.
+- **Collapsing-lowest protects the tail (DDSketch).** When memory is tight the smallest-value buckets collapse, never the largest -- because p99, not p1, is what you page on. The degradation is disclosed (the smallest values may exceed `alpha`); strict fixed-range mode trades the unbounded range for a hard fail-closed door instead.
 - **Conservative update by default (CountMinSketch).** It cannot change the min-query answer, only tighten it, so it is a free accuracy win on skewed streams -- the default. The one cost is that it is not linearly mergeable, so plain mode stays available for exact map/reduce (an explicit `{ conservative: false }`).
 - **Numeric-key core.** `add` hashes a number; strings/objects are the caller's to hash (or use `addHashed` with two lanes). The zero-GC law forbids retaining references.
 - **Dense registers only.** A sparse representation is more accurate at tiny cardinality but allocates; it is deferred. The dense `Uint8Array` is the zero-GC reference.
@@ -225,7 +287,8 @@ CountMinSketch is the same discipline: `add` / `addHashed` / `estimate` are **0 
 - **Not membership.** "Is `x` in the set?" is a filter's job -- see `@zakkster/lite-filter`.
 - **Not cryptographic.** The shipped hash is a fast non-crypto mix; uniformity is statistical, not adversarial. Draw from `crypto` for adversarial inputs.
 - **Not a key -> value store, and not enumerable.** CountMinSketch stores counts, not keys: there is no `forEach` / iterator, because the key set is not recoverable. It answers "how many times key `x`?", not "which keys?" -- for the top-k keys themselves, SpaceSaving is on the roadmap.
-- **Not (yet) quantile / top-k.** DDSketch (quantiles) and SpaceSaving (heavy hitters) are on the roadmap to 1.0.0.
+- **DDSketch is positive + zero only, and range-bounded.** A negative value throws (latencies/sizes/durations are non-negative -- a signed sketch is deferred); so do values outside the representable double range. Its `quantile` is relative-error approximate (use `min`/`max` for the exact extremes), and under collapsing the *smallest* values can exceed `alpha` (the tail stays within it).
+- **Not (yet) top-k / heavy-hitters.** SpaceSaving is the last member on the roadmap to 1.0.0.
 
 ## Ecosystem
 

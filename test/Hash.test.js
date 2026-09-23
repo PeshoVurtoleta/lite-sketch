@@ -14,8 +14,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mix64, hashHi, hashLo, hashString, saltRow, VERSION } from '../Sketch.js';
 
-test('VERSION is the frozen 0.2.0 string', () => {
-    assert.equal(VERSION, '0.2.0');
+test('VERSION is the frozen 0.3.0 string', () => {
+    assert.equal(VERSION, '0.3.0');
 });
 
 // --- determinism -----------------------------------------------------------

@@ -152,3 +152,72 @@ export class CountMinSketch {
     /** Zero every counter and the running total; reuse the same allocation. */
     clear(): this;
 }
+
+/** Options accepted by the `DDSketch` constructor. */
+export interface DDSketchOptions {
+    /** Bin-array length, an integer in [1, 2^20] (default 2048). Ignored in strict mode (derived from `range`). */
+    maxBins?: number;
+    /** `[min, max]` with finite `0 < min < max` -> STRICT mode (fail-closed, no collapse). */
+    range?: [number, number];
+}
+
+/**
+ * DDSketch -- a zero-GC, relative-error QUANTILE sketch over a dense
+ * `Float64Array` of log-scale bins (Masson, Rim, Lee -- "DDSketch: A Fast and
+ * Fully-Mergeable Quantile Sketch with Relative-Error Guarantees"). Unlike
+ * HyperLogLog / CountMinSketch it does NOT hash -- it bins raw values on a log
+ * scale, `key(x) = ceil(ln(x) * multiplier)` with `gamma = (1+alpha)/(1-alpha)`.
+ * `quantile(q)` returns `v` with `|v - v_true| <= alpha * v_true`. Zeros route to
+ * a dedicated exact `zeroCount`; negatives fail closed. Default mode collapses the
+ * LOWEST bins under a fixed `maxBins` window (disclosed via `collapsed`); `range`
+ * switches to a STRICT fixed window that throws on an out-of-range value instead
+ * of collapsing. `count` / `sum` / `min` / `max` / `zeroCount` are EXACT running
+ * aggregates; `quantile` is the alpha-approximate member.
+ */
+export class DDSketch {
+    /**
+     * @param alpha relative-error target, a number in (0, 1).
+     * @param options maxBins / range. Throws [lite-sketch] on any bad argument
+     *   BEFORE the bin array is allocated (incl. an unknown option key).
+     */
+    constructor(alpha: number, options?: DDSketchOptions);
+
+    /** The relative-error target alpha. O(1). */
+    readonly alpha: number;
+
+    /** Total values added (sum of all counts, incl. zeros). O(1). */
+    readonly count: number;
+
+    /** Exact running sum of every added value. O(1). */
+    readonly sum: number;
+
+    /** EXACT minimum value seen (NaN if empty). O(1). */
+    readonly min: number;
+
+    /** EXACT maximum value seen (NaN if empty). O(1). */
+    readonly max: number;
+
+    /** How many exact zeros were added. O(1). */
+    readonly zeroCount: number;
+
+    /** Bin-array length (the space cap on the log-scale window). O(1). */
+    readonly maxBins: number;
+
+    /** Count of currently non-empty bins. COLD, O(maxBins) scan. */
+    readonly numBins: number;
+
+    /** Whether any nonzero mass has ever been folded into the collapsed floor. O(1). */
+    readonly collapsed: boolean;
+
+    /** Add a value with a positive integer `count` (default 1). HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-finite / negative value, a non-positive-integer count, or (strict mode) a value outside the fixed range. */
+    add(value: number, count?: number): this;
+
+    /** Estimate the value at quantile q in [0, 1] -- the alpha-approximate member. COLD, O(bins). NEVER throws; returns NaN for a bad q or an empty sketch. */
+    quantile(q: number): number;
+
+    /** Merge `other` into this: fold the running aggregates and every populated bin through the same collapse logic as `add`. O(other bins). Throws [lite-sketch] on a non-DDSketch, an unequal alpha/gamma, or (strict mode) an incoming key outside the fixed range. */
+    merge(other: DDSketch): this;
+
+    /** Reset the sketch to empty. O(maxBins). */
+    clear(): this;
+}

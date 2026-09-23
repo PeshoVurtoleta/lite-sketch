@@ -5,12 +5,14 @@
  * one axis over: measured error vs the theoretical error), while allocating ZERO
  * bytes on every hot op (the lite-o1 zero-GC discipline).
  *
- * v0.2.0 ships TWO members -- HyperLogLog (cardinality / distinct-count over an
- * unbounded stream in fixed space, via a dense Uint8Array register bank) and
+ * v0.3.0 ships THREE members -- HyperLogLog (cardinality / distinct-count over an
+ * unbounded stream in fixed space, via a dense Uint8Array register bank),
  * CountMinSketch (point-query frequency estimation over a Uint32Array counter
- * matrix) -- both over the canonical two-lane 64-bit non-crypto hash. Future
- * members (DDSketch, SpaceSaving, ...) are PURE-APPENDED below the shared hash +
- * these classes; prior members stay byte-identical, only this header + VERSION change.
+ * matrix), both over the canonical two-lane 64-bit non-crypto hash, and DDSketch
+ * (relative-error quantiles over a Float64Array of log-scale bins -- NOT hashed,
+ * it bins raw values). Future members (SpaceSaving, ...) are PURE-APPENDED below
+ * the shared hash + these classes; prior members stay byte-identical, only this
+ * header + VERSION change.
  *
  * ASCII-only source (no Unicode). Zero runtime deps; node:test only.
  *
@@ -18,7 +20,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 // ===========================================================================
 // The canonical two-lane 64-bit hash (ADR 0001 -- LOCKED)
@@ -794,5 +796,444 @@ export class CountMinSketch {
         throw new TypeError(
             '[lite-sketch] CountMinSketch unknown option "' + String(key) +
             '"; known options: ' + Object.keys(CMS_KNOWN_OPTS).join(', '));
+    }
+}
+
+// ===========================================================================
+// DDSketch (ADR 0004) -- the quantile member (relative-error quantiles)
+// ===========================================================================
+
+/** Default bin-array length when no strict range is given. */
+const DD_MAX_BINS_DEFAULT = 2048;
+/** Hard ceiling on the bin array so a strict range can never request an unbounded alloc. */
+const DD_MAX_BINS_CAP = 1 << 20;
+/** Frozen marker of the known option keys -- an unknown key is a throw with a did-you-mean. */
+const DD_KNOWN_OPTS = Object.freeze({ maxBins: true, range: true });
+
+/**
+ * DDSketch -- RELATIVE-ERROR QUANTILE estimation over a positive-and-zero value
+ * stream in bounded space (Masson, Rim, Lee -- "DDSketch: A Fast and Fully-Mergeable
+ * Quantile Sketch with Relative-Error Guarantees", Datadog / VLDB 2019). Unlike the
+ * other members it does NOT hash -- it BINS raw values on a log scale.
+ *
+ * Headline (the family's SHARPEST honesty anchor -- a HARD per-query bound, not a
+ * statistical one): `quantile(q)` returns v with `|v - v_true| <= alpha * v_true`.
+ * A value x > 0 lands in bucket `key(x) = ceil(ln(x) * multiplier)` where
+ * `gamma = (1 + alpha) / (1 - alpha)` and `multiplier = 1 / ln(gamma)`; every x in a
+ * bucket shares the representative `gamma^key`, which is within `alpha` relative error
+ * of x. Zeros go to a dedicated `_zeroCount` (they are the smallest values); negatives
+ * are outside the log domain and fail closed (throw, after the zero check).
+ *
+ * Bounded space, two disclosed modes:
+ *   - DEFAULT (collapsing-lowest): a `Float64Array(maxBins)` window. When a value's key
+ *     climbs above the array top the window slides UP and the lowest cells fold (sum)
+ *     into the collapsed floor (bin 0). Collapsing the LOW end keeps the HIGH tail
+ *     (p90 / p99 / p999 -- what quantile sketches are bought for) exact; only the
+ *     smallest values degrade, and `collapsed` discloses when it has happened.
+ *   - STRICT (`range: [min, max]`): a fixed bin array sized to exactly cover
+ *     `[key(min), key(max)]`; a positive value whose key falls outside THROWS
+ *     `[lite-sketch]` -- it never silently collapses. `min` must be > 0 (the log domain).
+ *
+ * Hot path (`add`, 0 B/op): typeof-guard value + count FIRST, update running stats,
+ * route zeros / negatives, compute the bucket key (a transient double -- no BigInt, no
+ * box), and in the common steady state increment ONE `Float64Array` cell in the live
+ * window and return. The window math (first value, slide + collapse, strict range
+ * check) is a COLD tail-call (`_addKey`) off the hot body.
+ *
+ * Exact vs approximate (disclosed): `count` / `sum` / `min` / `max` / `zeroCount` are
+ * EXACT running aggregates; `quantile` is the alpha-approximate one. `merge` folds
+ * another same-gamma sketch bucket-by-bucket through the same collapse logic.
+ *
+ * Indexable range (fail-closed door, the DDSketch-reference behavior): a positive value
+ * so large or so tiny that its bucket representative `2*gamma^K/(gamma+1)` would overflow
+ * to Infinity or underflow to 0 is REJECTED at `add` time (a throw, byte-identical no-op)
+ * -- so `quantile` is ALWAYS a finite, alpha-bounded value. At alpha=0.01 the door admits
+ * roughly `[~1e-305, ~8.6e307]`; the window widens as alpha grows and narrows as it shrinks.
+ *
+ * Fail closed: a bad alpha / maxBins / range (incl. a range whose ends are not indexable) /
+ * unknown option throws `[lite-sketch]` at the ctor door BEFORE any allocation (no half-built
+ * instance); `add` typeof-guards value + count FIRST (Symbol / BigInt / NaN / +-Infinity /
+ * non-integer count is a throw, negative value is a throw, out-of-indexable-range is a throw,
+ * strict-out-of-range is a throw) -- every throwing path is a byte-identical no-op; `quantile`
+ * / getters / a valid `merge` never throw (`quantile` of an empty sketch is NaN). null is not zero.
+ */
+export class DDSketch {
+    /**
+     * @param {number} alpha relative-error target; a number in (0, 1).
+     * @param {{maxBins?: number, range?: [number, number]}} [options]
+     *   maxBins: bin-array length in [1, 2^20] (default 2048); ignored in strict mode
+     *            where the length is derived from `range`.
+     *   range: [min, max] with finite `0 < min < max` -> STRICT mode (fail-closed, no collapse).
+     */
+    constructor(alpha, options) {
+        // typeof guard FIRST, BEFORE any allocation.
+        if (typeof alpha !== 'number' || !(alpha > 0 && alpha < 1)) {
+            throw new RangeError(
+                '[lite-sketch] DDSketch alpha must be a number in (0, 1), got ' + String(alpha));
+        }
+        let maxBins = DD_MAX_BINS_DEFAULT;
+        let range;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+                throw new TypeError(
+                    '[lite-sketch] DDSketch options must be a plain object, got ' + String(options));
+            }
+            const keys = Object.keys(options);
+            for (let i = 0; i < keys.length; i++) {
+                if (!(keys[i] in DD_KNOWN_OPTS)) this._badOption(keys[i]);
+            }
+            if (options.maxBins !== undefined) {
+                maxBins = options.maxBins;
+                if (typeof maxBins !== 'number' || (maxBins | 0) !== maxBins ||
+                    maxBins < 1 || maxBins > DD_MAX_BINS_CAP) {
+                    throw new RangeError(
+                        '[lite-sketch] DDSketch maxBins must be an integer in [1, ' +
+                        DD_MAX_BINS_CAP + '], got ' + String(maxBins));
+                }
+            }
+            if (options.range !== undefined) range = options.range;
+        }
+        const gamma = (1 + alpha) / (1 - alpha);
+        const multiplier = 1 / Math.log(gamma);
+        const lnGamma = Math.log(gamma);
+        // The KEY bounds for which the representative `2*gamma^K/(gamma+1)` stays a finite,
+        // NORMAL (full-relative-precision) double: above _maxKeyIndexable it overflows to
+        // Infinity; below _minKeyIndexable it falls into the denormal range where a double
+        // loses relative precision and the alpha guarantee breaks (bottoming out at
+        // underflow-to-0 / ~100% error). A value whose key falls outside is rejected at add()
+        // time (the DDSketch-reference fail-closed door). The closed form
+        // `K <= log(MAX_VALUE*(gamma+1)/2)/log(gamma)` is computed as a SUM OF LOGS (so the
+        // `MAX_VALUE*(gamma+1)/2` term never overflows to Infinity before the log), then
+        // tightened by a cold verification step so the representative AT the bound is provably
+        // finite and normal despite float rounding of the log/pow. MIN_NORMAL = 2^-1022 is
+        // the smallest normal double.
+        const MIN_NORMAL = 2 ** -1022;
+        const lnHalfGammaPlus1 = Math.log((gamma + 1) / 2);
+        let maxKeyIndexable = Math.floor((Math.log(Number.MAX_VALUE) + lnHalfGammaPlus1) / lnGamma);
+        while (maxKeyIndexable > 0 &&
+            !Number.isFinite(2 * Math.pow(gamma, maxKeyIndexable) / (gamma + 1))) maxKeyIndexable--;
+        let minKeyIndexable = Math.ceil((Math.log(MIN_NORMAL) + lnHalfGammaPlus1) / lnGamma);
+        while (minKeyIndexable < 0 &&
+            2 * Math.pow(gamma, minKeyIndexable) / (gamma + 1) < MIN_NORMAL) minKeyIndexable++;
+        let strict = false;
+        let minKey = 0, maxKeyStrict = 0, nb = 0;
+        if (range !== undefined) {
+            if (!Array.isArray(range) || range.length !== 2) this._badRange(range);
+            const rmin = range[0], rmax = range[1];
+            // min must be > 0 (the log domain); zeros always route to _zeroCount regardless.
+            if (typeof rmin !== 'number' || typeof rmax !== 'number' ||
+                !Number.isFinite(rmin) || !Number.isFinite(rmax) ||
+                !(rmin > 0) || !(rmin < rmax)) {
+                this._badRange(range);
+            }
+            strict = true;
+            minKey = Math.ceil(Math.log(rmin) * multiplier);
+            maxKeyStrict = Math.ceil(Math.log(rmax) * multiplier);
+            // A declared range whose ends can't be represented is invalid (fail closed).
+            if (minKey < minKeyIndexable || maxKeyStrict > maxKeyIndexable) this._badRange(range);
+            nb = maxKeyStrict - minKey + 1;
+            if (nb > DD_MAX_BINS_CAP) {
+                throw new RangeError(
+                    '[lite-sketch] DDSketch strict range needs ' + nb +
+                    ' bins, exceeds cap ' + DD_MAX_BINS_CAP);
+            }
+        }
+        // Allocate LAST (no half-built instance on any thrown path above).
+        this._alpha = alpha;
+        this._gamma = gamma;
+        this._multiplier = multiplier;
+        this._strict = strict;
+        this._minKey = minKey;              // strict: lowest legal key (also the fixed _offset)
+        this._maxKeyStrict = maxKeyStrict;  // strict: highest legal key
+        this._maxKeyIndexable = maxKeyIndexable;  // key ceiling: representative stays finite
+        this._minKeyIndexable = minKeyIndexable;  // key floor: representative stays positive
+        this._bins = new Float64Array(strict ? nb : maxBins);
+        this._maxBins = this._bins.length;
+        // physical index of key K is K - _offset; the array spans keys [_offset, _offset+maxBins-1].
+        this._offset = strict ? minKey : 0;
+        this._maxKeyPop = 0;   // highest populated key -- bounds the quantile walk (valid iff _binCount)
+        this._zeroCount = 0;
+        this._count = 0;
+        this._sum = 0;
+        this._min = Infinity;
+        this._max = -Infinity;
+        this._collapsed = false;
+        this._binCount = 0;    // 0 => no bin populated yet (the window is not yet anchored)
+    }
+
+    /** The relative-error target alpha. O(1). */
+    get alpha() { return this._alpha; }
+    /** Total values added (sum of all counts, incl. zeros). O(1). */
+    get count() { return this._count; }
+    /** Exact running sum of every added value. O(1). */
+    get sum() { return this._sum; }
+    /** EXACT minimum value seen (NaN if empty). O(1). */
+    get min() { return this._count ? this._min : NaN; }
+    /** EXACT maximum value seen (NaN if empty). O(1). */
+    get max() { return this._count ? this._max : NaN; }
+    /** How many exact zeros were added. O(1). */
+    get zeroCount() { return this._zeroCount; }
+    /** Bin-array length (the space cap on the log-scale window). O(1). */
+    get maxBins() { return this._maxBins; }
+    /** Count of currently non-empty bins (COLD, O(maxBins) scan). */
+    get numBins() {
+        const bins = this._bins;
+        const n = bins.length;
+        let c = 0;
+        for (let i = 0; i < n; i++) if (bins[i] !== 0) c++;
+        return c;
+    }
+    /** Whether any nonzero mass has ever been folded into the collapsed floor (precision lost at the low end). O(1). */
+    get collapsed() { return this._collapsed; }
+
+    /**
+     * Add a value with a positive integer `count` (default 1). HOT, 0 B/op. Updates the
+     * exact running stats, routes zeros to `_zeroCount`, fails closed on negatives, then
+     * bins the value on the log scale: in the steady state it increments ONE cell of the
+     * live window and returns. Everything else (first value, window slide + collapse,
+     * strict range check) is the cold `_addKey` tail-call.
+     *
+     * `Math.log` and the bucket key are transient DOUBLES kept in locals -- no BigInt, no
+     * object, no boxed slot -- so the in-window path is a true 0 B/op.
+     *
+     * Fails closed: a non-number / NaN / +-Infinity value throws, a negative value throws
+     * (positive+zero domain), a non-positive-integer count throws -- all `[lite-sketch]`,
+     * typeof guards FIRST.
+     * @param {number} value a finite number >= 0 (negatives throw).
+     * @param {number} [count=1] a positive integer.
+     * @returns {DDSketch} this
+     */
+    add(value, count = 1) {
+        // ALL validation precedes ANY state write: every throwing path is a byte-identical no-op.
+        if (typeof value !== 'number' || value !== value ||
+            value === Infinity || value === -Infinity) return this._badValue(value);
+        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+            return this._badCount(count);
+        }
+        if (value < 0) return this._badValue(value);   // negatives fail closed BEFORE any aggregate write
+        if (value === 0) {                             // zeros are the smallest values (0 can be a new min/max)
+            this._count += count;
+            if (value < this._min) this._min = value;
+            if (value > this._max) this._max = value;
+            this._zeroCount += count;
+            return this;
+        }
+        const k = Math.ceil(Math.log(value) * this._multiplier);
+        // INDEXABLE range: a key whose representative would overflow/underflow the double
+        // range is rejected (fail closed) so quantile() is always a finite, alpha-bounded value.
+        if (k > this._maxKeyIndexable || k < this._minKeyIndexable) return this._badIndexable(value);
+        // STRICT range validated BEFORE aggregates so a rejected add corrupts nothing.
+        if (this._strict && (k < this._minKey || k > this._maxKeyStrict)) return this._badValue(value);
+        // Only now, past every throw, write the exact running aggregates.
+        this._count += count;
+        this._sum += value * count;
+        if (value < this._min) this._min = value;
+        if (value > this._max) this._max = value;
+        const idx = k - this._offset;
+        if (this._binCount !== 0 && idx >= 0 && idx < this._maxBins) {
+            this._bins[idx] += count;                  // the HOT common path: one in-window increment
+            if (k > this._maxKeyPop) this._maxKeyPop = k;
+            return this;
+        }
+        return this._addKey(k, count);                 // cold: first value / slide (strict already validated)
+    }
+
+    /**
+     * @private The cold window math shared by `add` (out-of-window) and `merge`
+     * (bucket-by-bucket). NEVER throws -- both callers validate the strict range up
+     * front (a rejected add/merge must be a byte-identical no-op), so by the time a
+     * key reaches here it is guaranteed placeable. Routes a (key, mass) pair:
+     *   - strict mode: the array already spans exactly [_minKey, _maxKeyStrict], so
+     *     drop the key straight into its cell (no collapse, no slide);
+     *   - non-strict first bucketed value: anchor the key at the TOP of the array so
+     *     smaller values fill downward (collapsing-lowest protects the high end);
+     *   - non-strict in-window key (merge case): a single increment;
+     *   - non-strict, key BELOW the floor: fold into bin 0 (collapsed, offset unchanged);
+     *   - non-strict, key ABOVE the top: slide the window up, folding the vacated low
+     *     cells into the new bin 0.
+     * @param {number} k bucket key
+     * @param {number} mass count to add
+     * @returns {DDSketch} this
+     */
+    _addKey(k, mass) {
+        const maxBins = this._maxBins;
+        const bins = this._bins;
+        if (this._strict) {                            // _offset == _minKey; k pre-validated in range
+            bins[k - this._offset] += mass;
+            if (this._binCount === 0) { this._binCount = 1; this._maxKeyPop = k; }
+            else if (k > this._maxKeyPop) this._maxKeyPop = k;
+            return this;
+        }
+        if (this._binCount === 0) {
+            this._offset = k - (maxBins - 1);          // anchor at the TOP, fill downward
+            bins[k - this._offset] += mass;
+            this._maxKeyPop = k;
+            this._binCount = 1;
+            return this;
+        }
+        const idx = k - this._offset;
+        if (idx >= 0 && idx < maxBins) {               // in-window (reached via merge)
+            bins[idx] += mass;
+            if (k > this._maxKeyPop) this._maxKeyPop = k;
+            return this;
+        }
+        if (idx < 0) {                                  // below the floor: collapsing-lowest fold
+            bins[0] += mass;
+            this._collapsed = true;
+            return this;                                // _offset unchanged (the low end is collapsed)
+        }
+        // idx > maxBins - 1: slide the window UP so k sits at the top.
+        const newOffset = k - (maxBins - 1);
+        const delta = newOffset - this._offset;         // > 0
+        if (delta >= maxBins) {                          // everything folds into bin 0
+            let m = 0;
+            for (let i = 0; i < maxBins; i++) { m += bins[i]; bins[i] = 0; }
+            if (m !== 0) this._collapsed = true;
+            bins[0] = m;
+        } else {                                         // fold the delta lowest cells into bin 0
+            let m = 0;
+            for (let i = 0; i < delta; i++) m += bins[i];
+            bins.copyWithin(0, delta, maxBins);          // shift counts DOWN by delta (in place)
+            bins.fill(0, maxBins - delta, maxBins);      // zero the vacated top
+            bins[0] += m;
+            if (m !== 0) this._collapsed = true;
+        }
+        this._offset = newOffset;
+        bins[k - this._offset] += mass;
+        this._maxKeyPop = k;                             // the floor rose; the new key is the top
+        return this;
+    }
+
+    /**
+     * Estimate the value at quantile q in [0, 1] -- the alpha-approximate member. COLD,
+     * O(bins), NEVER throws. Returns NaN for a bad q or an empty sketch. Zeros are the
+     * smallest values (they precede bin 0); the returned representative
+     * `2 * gamma^K / (gamma + 1)` is the bucket midpoint, within `alpha` relative error
+     * of the true value.
+     * @param {number} q a number in [0, 1].
+     * @returns {number}
+     */
+    quantile(q) {
+        if (typeof q !== 'number' || q !== q || q < 0 || q > 1 || this._count === 0) return NaN;
+        const rank = Math.floor(q * (this._count - 1));  // 0-indexed target rank
+        let cum = this._zeroCount;
+        if (rank < cum) return 0;                         // the target falls in the zero bucket
+        const bins = this._bins;
+        const offset = this._offset;
+        const gamma = this._gamma;
+        const top = this._binCount === 0 ? -1 : this._maxKeyPop - offset;
+        for (let i = 0; i <= top; i++) {
+            cum += bins[i];
+            if (cum > rank) {
+                const K = i + offset;
+                return 2 * Math.pow(gamma, K) / (gamma + 1);
+            }
+        }
+        if (top >= 0) {                                   // rounding at q=1: highest populated bucket
+            return 2 * Math.pow(gamma, this._maxKeyPop) / (gamma + 1);
+        }
+        return NaN;
+    }
+
+    /**
+     * Merge `other` into this: add the running aggregates and fold every populated bin of
+     * `other` through the same collapse logic as `add` (so the collapsed floor stays
+     * consistent). O(other bins), NEVER allocates. Fails closed `[lite-sketch]` if `other`
+     * is not a DDSketch or has a different gamma (i.e. a different alpha). If this is in
+     * STRICT mode, an incoming key outside the fixed range throws (documented fail-closed).
+     * @param {DDSketch} other
+     * @returns {DDSketch} this
+     */
+    merge(other) {
+        if (!(other instanceof DDSketch) || other._gamma !== this._gamma) return this._badMerge(other);
+        // STRICT: pre-scan other's populated keys against this fixed range and fail closed
+        // BEFORE any aggregate/bin write -- a rejected merge is a byte-identical no-op too.
+        if (this._strict && other._binCount !== 0) {
+            const ob = other._bins;
+            const ooff = other._offset;
+            const gamma = this._gamma;
+            const otop = other._maxKeyPop - ooff;
+            for (let i = 0; i <= otop; i++) {
+                if (ob[i] !== 0) {
+                    const key = i + ooff;
+                    if (key < this._minKey || key > this._maxKeyStrict) {
+                        return this._badValue(2 * Math.pow(gamma, key) / (gamma + 1));
+                    }
+                }
+            }
+        }
+        // Past every throw: write the aggregates, then fold each populated bin.
+        this._zeroCount += other._zeroCount;
+        this._count += other._count;
+        this._sum += other._sum;
+        if (other._min < this._min) this._min = other._min;
+        if (other._max > this._max) this._max = other._max;
+        if (other._binCount !== 0) {
+            const ob = other._bins;
+            const ooff = other._offset;
+            const otop = other._maxKeyPop - ooff;
+            for (let i = 0; i <= otop; i++) {
+                const mass = ob[i];
+                if (mass !== 0) this._addKey(i + ooff, mass);
+            }
+        }
+        return this;
+    }
+
+    /** Reset the sketch to empty. O(maxBins). @returns {DDSketch} this */
+    clear() {
+        this._bins.fill(0);
+        this._offset = this._strict ? this._minKey : 0;
+        this._maxKeyPop = 0;
+        this._zeroCount = 0;
+        this._count = 0;
+        this._sum = 0;
+        this._min = Infinity;
+        this._max = -Infinity;
+        this._collapsed = false;
+        this._binCount = 0;
+        return this;
+    }
+
+    /** @private Cold thrower for a bad value (non-finite / negative / strict-out-of-range). */
+    _badValue(value) {
+        throw new TypeError(
+            '[lite-sketch] DDSketch value must be finite, non-negative, and within the strict ' +
+            'range if configured, got ' + String(value));
+    }
+
+    /** @private Cold thrower for a value outside the indexable range (representative would over/underflow). */
+    _badIndexable(value) {
+        throw new RangeError(
+            '[lite-sketch] DDSketch.add value ' + String(value) + ' is outside the sketch\'s indexable range');
+    }
+
+    /** @private Cold thrower for a bad count. */
+    _badCount(count) {
+        throw new RangeError(
+            '[lite-sketch] DDSketch.add count must be a positive integer, got ' + String(count));
+    }
+
+    /** @private Cold thrower for a bad strict range. */
+    _badRange(range) {
+        throw new RangeError(
+            '[lite-sketch] DDSketch range must be [min, max] with finite 0 < min < max, got ' + String(range));
+    }
+
+    /** @private Cold thrower for an incompatible merge (non-instance vs unequal gamma/alpha). */
+    _badMerge(other) {
+        if (!(other instanceof DDSketch)) {
+            throw new TypeError('[lite-sketch] DDSketch.merge expects a DDSketch');
+        }
+        throw new RangeError(
+            '[lite-sketch] DDSketch.merge requires equal gamma/alpha: this alpha=' + this._alpha +
+            ', other alpha=' + other._alpha);
+    }
+
+    /** @private Cold thrower for an unknown option key (did-you-mean listing known keys). */
+    _badOption(key) {
+        throw new TypeError(
+            '[lite-sketch] DDSketch unknown option "' + String(key) +
+            '"; known options: ' + Object.keys(DD_KNOWN_OPTS).join(', '));
     }
 }
