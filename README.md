@@ -282,7 +282,7 @@ ss.epsilon -> number                     // 1 / capacity -- the theoretical erro
 ss.seed -> number                        // the uint32 hash seed (getter)
 // NOTE: SpaceSaving has NO addHashed -- it stores key identities, so there is no pre-hashed fast path.
 
-VERSION -> string                        // '1.1.1'
+VERSION -> string                        // '1.1.2'
 ```
 
 | capacity k | guaranteed to report | over-count bound | memory        |
