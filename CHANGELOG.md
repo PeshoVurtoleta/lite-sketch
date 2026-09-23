@@ -8,6 +8,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.0.0] - 2026-09-23
+
+The four-member API is declared STABLE. No new member; this is the semver-stability
+milestone for the complete roster (HyperLogLog, CountMinSketch, DDSketch, SpaceSaving).
+One pre-freeze correctness fix brought `HyperLogLog` into parity with the other hashing
+members before the surface was locked.
+
+### Changed
+
+- **The public four-member surface is now stable under Semantic Versioning.** Constructors,
+  static factories (`CountMinSketch.withAccuracy`, `SpaceSaving.withError`), hot methods
+  (`add` / `addHashed` / `estimate` / `estimateHashed` / `quantile` / `merge` / `clear`),
+  query methods (`count` / `topK` / `heavyHitters` / `errorOf` / `forEach`), and getters are
+  frozen; breaking changes require a major bump.
+
+### Fixed
+
+- **`HyperLogLog.merge(other)` now fails closed on a seed mismatch**, matching `CountMinSketch`
+  and `SpaceSaving`. Two HyperLogLogs built with different seeds hash the same key to different
+  registers, so a register-wise-max merge produced a silently wrong union estimate; it now throws
+  `[lite-sketch]` (`RangeError`) with both seeds, as a byte-identical no-op. Equal-m and equal-seed
+  are both required. The `merge` hot/cold split is unchanged; the guard runs before any register read.
+
+### Added
+
+- **`HyperLogLog.seed` getter** (returns the effective `uint32` seed), completing seed-getter parity
+  across the three hashing members (`CountMinSketch` and `SpaceSaving` already exposed it).
+
 ## [0.4.0] - 2026-09-23
 
 The heavy-hitters member, pure-appended -- the roster is complete (four members).

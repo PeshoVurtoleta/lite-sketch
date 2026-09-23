@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-sketch",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "description": "Zero-dependency, zero-GC family of approximate streaming summaries that witnesses its ACCURACY against the paper's theoretical bound: HyperLogLog (distinct-count), CountMinSketch (frequency), DDSketch (relative-error quantiles), and SpaceSaving (heavy hitters / top-k), over a shipped two-lane 64-bit non-crypto hash. Tree-shakeable named exports.",
   "type": "module",
   "main": "./Sketch.js",

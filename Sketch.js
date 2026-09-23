@@ -5,7 +5,7 @@
  * one axis over: measured error vs the theoretical error), while allocating ZERO
  * bytes on every hot op (the lite-o1 zero-GC discipline).
  *
- * v0.4.0 ships FOUR members -- HyperLogLog (cardinality / distinct-count over an
+ * v1.0.0 freezes a STABLE FOUR-member API -- HyperLogLog (cardinality / distinct-count over an
  * unbounded stream in fixed space, via a dense Uint8Array register bank),
  * CountMinSketch (point-query frequency estimation over a Uint32Array counter
  * matrix), both over the canonical two-lane 64-bit non-crypto hash, DDSketch
@@ -21,7 +21,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.4.0';
+export const VERSION = '1.0.0';
 
 // ===========================================================================
 // The canonical two-lane 64-bit hash (ADR 0001 -- LOCKED)
@@ -276,6 +276,8 @@ export class HyperLogLog {
     get m() { return this._m; }
     /** The theoretical standard error 1.04 / sqrt(m). O(1). */
     get standardError() { return 1.04 / Math.sqrt(this._m); }
+    /** The uint32 hash seed. O(1). */
+    get seed() { return this._seed >>> 0; }
 
     /**
      * Add a numeric key. HOT, 0 B/op. Hashes the key to two lanes, picks register j
@@ -367,13 +369,17 @@ export class HyperLogLog {
 
     /**
      * Merge `other` into this by register-wise max (the mergeability that makes HLL
-     * distributable). O(m), 0 alloc. Equal-m-or-throw: fails closed `[lite-sketch]`
-     * if `other` is not a HyperLogLog or has a different m.
+     * distributable). O(m), 0 alloc. Equal-m-AND-seed-or-throw: fails closed
+     * `[lite-sketch]` if `other` is not a HyperLogLog or differs in m / seed (a
+     * differently-seeded HLL hashes the same key to a different register, so a
+     * register-wise max would silently combine to garbage).
      * @param {HyperLogLog} other
      * @returns {HyperLogLog} this
      */
     merge(other) {
-        if (!(other instanceof HyperLogLog) || other._m !== this._m) return this._badMerge(other);
+        if (!(other instanceof HyperLogLog) || other._m !== this._m || other._seed !== this._seed) {
+            return this._badMerge(other);
+        }
         const a = this._reg;
         const b = other._reg;
         const m = this._m;
@@ -399,13 +405,18 @@ export class HyperLogLog {
         throw new TypeError('[lite-sketch] HyperLogLog.addHashed lanes must be uint32, got ' + String(x));
     }
 
-    /** @private Cold thrower for an incompatible merge. */
+    /** @private Cold thrower for an incompatible merge (non-instance vs m/seed mismatch). */
     _badMerge(other) {
         if (!(other instanceof HyperLogLog)) {
             throw new TypeError('[lite-sketch] HyperLogLog.merge expects a HyperLogLog');
         }
+        if (other._m !== this._m) {
+            throw new RangeError(
+                '[lite-sketch] HyperLogLog.merge requires equal m: this m=' + this._m + ', other m=' + other._m);
+        }
         throw new RangeError(
-            '[lite-sketch] HyperLogLog.merge requires equal m: this m=' + this._m + ', other m=' + other._m);
+            '[lite-sketch] HyperLogLog.merge requires equal seed: this seed=' + (this._seed >>> 0) +
+            ', other seed=' + (other._seed >>> 0));
     }
 }
 

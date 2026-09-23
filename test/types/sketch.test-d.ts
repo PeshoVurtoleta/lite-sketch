@@ -37,12 +37,15 @@ void hllSeeded; void hllDefault;
 const p: number = hll.p;
 const m: number = hll.m;
 const se: number = hll.standardError;
-void p; void m; void se;
+const hllSeed: number = hll.seed;
+void p; void m; void se; void hllSeed;
 
 // @ts-expect-error -- p is readonly.
 hll.p = 12;
 // @ts-expect-error -- standardError is readonly.
 hll.standardError = 0.5;
+// @ts-expect-error -- seed is readonly.
+hll.seed = 7;
 
 // add / addHashed -> this (chainable); count -> number; merge -> this; clear -> this.
 const chained: HyperLogLog = hll.add(1).add(2).addHashed(0xdeadbeef, 0x1234);

@@ -49,7 +49,7 @@ A sketch is a promise: "I use `X` bytes and my answer is within `E` of the truth
 - **HyperLogLog** -- distinct-count (cardinality) in fixed space, `~1.04/sqrt(m)` standard error, mergeable. (The reference member.)
 - **CountMinSketch** -- point-query frequency ("how many times have I seen `x`?") in a fixed `d x w` matrix, a one-sided over-estimate bounded by `epsilon * N`, with conservative update on by default and merge for map/reduce.
 - **DDSketch** -- relative-error quantiles (p50/p90/p99/...) in fixed space, with a *hard* per-query guarantee `|v - v_true| <= alpha * v_true` -- the family's sharpest bound. Collapsing-lowest keeps the tail accurate; strict fixed-range is an opt-in.
-- **SpaceSaving** -- heavy hitters / top-k in `k` fixed counters: every element above `N/k` frequency is reported (no false negatives), with a bracketed `[count - error, count]` on each. Completes the roster (the four-member API freezes at 1.0.0).
+- **SpaceSaving** -- heavy hitters / top-k in `k` fixed counters: every element above `N/k` frequency is reported (no false negatives), with a bracketed `[count - error, count]` on each. Completes the roster -- the four-member API is stable as of 1.0.0.
 - **A shipped, avalanche-tested hash** -- a two-lane 64-bit-quality non-crypto mix, zero-alloc, with a pre-hashed fast path for callers who bring their own. (HyperLogLog and CountMinSketch use it; DDSketch bins raw values.)
 - **The accuracy witness** -- measured error vs the theoretical bound, printed side by side, with the exact-`Set` foil whose memory climbs without bound.
 - **Zero runtime dependencies**, ESM, tree-shakeable named exports, TypeScript types, and a **0 bytes/op hot path** proven by a leak + GC-profiler torture gate.
@@ -179,11 +179,12 @@ new HyperLogLog(p = 14, seed?)   // p in [4, 18]; m = 2^p registers. Throws [lit
 hll.add(key) -> this             // HOT, O(1), 0 B/op. Hash a numeric key + record its register. Throws on a non-number key.
 hll.addHashed(hi, lo) -> this    // HOT, O(1), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
 hll.count() -> number            // COLD, O(m). Estimated distinct count (Ertl's improved estimator -- table-free, full-range).
-hll.merge(other) -> this         // Register-wise max into this. Throws [lite-sketch] on a non-HLL or unequal m.
+hll.merge(other) -> this         // Register-wise max into this. Throws [lite-sketch] on a non-HLL or unequal m OR seed.
 hll.clear() -> this              // Zero the registers; reuse the same allocation.
 hll.p -> number                  // the precision p (getter)
 hll.m -> number                  // register count, 2^p (getter)
 hll.standardError -> number      // 1.04 / sqrt(m) -- the theoretical relative standard error (getter)
+hll.seed -> number               // the uint32 hash seed (getter)
 ```
 
 | p  | m = 2^p | memory  | standard error (1.04/sqrt(m)) |
@@ -266,7 +267,7 @@ ss.epsilon -> number                     // 1 / capacity -- the theoretical erro
 ss.seed -> number                        // the uint32 hash seed (getter)
 // NOTE: SpaceSaving has NO addHashed -- it stores key identities, so there is no pre-hashed fast path.
 
-VERSION -> string                        // '0.4.0'
+VERSION -> string                        // '1.0.0'
 ```
 
 | capacity k | guaranteed to report | over-count bound | memory        |
@@ -308,7 +309,7 @@ Every hot op allocates **0 bytes** after construction; the only allocator is the
 | `count()`                   | **0** (an O(m) scan over the register array; a disclosed co-headline, not per-add) |
 | `merge(other)`              | **0** (register-wise max in place) |
 | `clear()`                   | **0** (`fill(0)` over the reused array) |
-| `p` / `m` / `standardError` | **0** (O(1) getters) |
+| `p` / `m` / `standardError` / `seed` | **0** (O(1) getters) |
 | `new HyperLogLog(p)`        | once, at construction (one `Uint8Array(2^p)`) |
 
 CountMinSketch is the same discipline: `add` / `addHashed` / `estimate` are **0 B/op** (the murmur is inlined into int32 locals and the `d` chosen cell indices are staged in a pre-allocated `Int32Array(d)` scratch, so even conservative update's two passes allocate nothing); `merge` / `clear` are in-place; only the constructor allocates (one `Uint32Array(d * w)`). The torture gate proves all of it.
@@ -347,7 +348,7 @@ SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the e
 - **Not exact.** A sketch trades bounded error for fixed memory. Need an exact distinct count and can afford the memory? Use a `Set` (or `@zakkster/lite-o1`'s structures for exact O(1) work).
 - **Not membership.** "Is `x` in the set?" is a filter's job -- see `@zakkster/lite-filter`.
 - **Not cryptographic.** The shipped hash is a fast non-crypto mix; uniformity is statistical, not adversarial. Draw from `crypto` for adversarial inputs.
-- **Not a key -> value store, and not enumerable.** CountMinSketch stores counts, not keys: there is no `forEach` / iterator, because the key set is not recoverable. It answers "how many times key `x`?", not "which keys?" -- for the top-k keys themselves, SpaceSaving is on the roadmap.
+- **Not a key -> value store, and not enumerable.** CountMinSketch stores counts, not keys: there is no `forEach` / iterator, because the key set is not recoverable. It answers "how many times key `x`?", not "which keys?" -- for the top-k keys themselves, use SpaceSaving.
 - **DDSketch is positive + zero only, and range-bounded.** A negative value throws (latencies/sizes/durations are non-negative -- a signed sketch is deferred); so do values outside the representable double range. Its `quantile` is relative-error approximate (use `min`/`max` for the exact extremes), and under collapsing the *smallest* values can exceed `alpha` (the tail stays within it).
 - **SpaceSaving reports a superset, over-counts, and needs numeric keys.** `heavyHitters` never misses a true hitter but may include a few false positives (filter by `count - error` for the guaranteed subset); a monitored `count` is an upper bound, not exact. Keys are numeric safe integers -- hash strings to integers yourself. It has no `addHashed` (it must retain key identity).
 

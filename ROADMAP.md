@@ -5,9 +5,10 @@ and the `../LiteFilter` cadence (reference member + one per release, complete at
 `RESEARCH.md` for the identity, the accuracy witness, the roster rationale, and the open
 questions. ASCII-only (`->`, `<=`, `x`).
 
-Status: pre-code. Settle the HASH (ADR 0001) before M1. Each milestone is a full pipeline
-session (planner -> settle -> coder -> reviewer -> qa); user commits/publishes; /release gate
-+ catalog card sync after, exactly as lite-o1.
+Status: COMPLETE at 1.0.0 -- the four-member API is STABLE (HyperLogLog -> CountMinSketch ->
+DDSketch -> SpaceSaving). Each milestone was a full pipeline session (planner -> settle -> coder
+-> reviewer -> qa); user commits/publishes; /release gate + catalog card sync after, exactly as
+lite-o1. New work moves to post-1.0 members (below) and the sibling packages (lite-adaptive).
 
 ## Milestones
 
@@ -18,7 +19,7 @@ session (planner -> settle -> coder -> reviewer -> qa); user commits/publishes; 
 | **M2** | **CountMinSketch** (frequency) | 0.2.0 | d x w Uint32 -> `epsilon=e/w` overestimate at `delta=e^-d`; conservative-update default | SHIPPED (ADR 0003) |
 | **M3** | **DDSketch** (quantiles) | 0.3.0 | dense log-bins -> HARD relative error `<= alpha`; collapsing-lowest default + strict opt-in; positive+zero | SHIPPED (ADR 0004) |
 | **M4** | **SpaceSaving** (heavy hitters / top-k) | 0.4.0 | k counters -> overestimate `<= min-counter`; no false negatives above N/k; dual ctor + merge | SHIPPED (ADR 0005) |
-| -- | **1.0.0** -- API declared STABLE at four members | 1.0.0 | reference + 3, the lite-filter cadence | planned |
+| -- | **1.0.0** -- API declared STABLE at four members | 1.0.0 | reference + 3, the lite-filter cadence; pre-freeze fix: HyperLogLog seed-checked merge + seed getter (parity with CMS/SpaceSaving) | SHIPPED |
 | M5+ | KMV/MinHash, CountSketch, HeavyKeeper, SlidingHLL | post-1.0 | one per release (RESEARCH.md Tier 2) | backlog |
 
 ## 0. Preflight -- new-package scaffold (do once, with M0/M1)

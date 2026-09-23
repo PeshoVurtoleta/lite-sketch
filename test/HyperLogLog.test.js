@@ -28,8 +28,8 @@ function expected(hi, lo, p) {
     return { j, rho };
 }
 
-test('VERSION is the frozen 0.4.0 string', () => {
-    assert.equal(VERSION, '0.4.0');
+test('VERSION is the frozen 1.0.0 string', () => {
+    assert.equal(VERSION, '1.0.0');
 });
 
 // --- ctor fail-closed ------------------------------------------------------
@@ -255,6 +255,145 @@ test('merge: a non-HyperLogLog throws [lite-sketch]', () => {
     for (const bad of [null, undefined, {}, { _m: 1024, _reg: new Uint8Array(1024) }, 5]) {
         assert.throws(() => a.merge(bad), liteSketch, String(bad));
     }
+});
+
+test('merge: a non-HyperLogLog throws a TypeError specifically (regression guard)', () => {
+    const a = new HyperLogLog(10);
+    for (const bad of [null, undefined, {}, 5]) {
+        assert.throws(() => a.merge(bad), (e) => e instanceof TypeError && liteSketch(e), String(bad));
+    }
+});
+
+// --- merge: seed parity (new behavior) --------------------------------------
+
+test('merge: mismatched seed throws [lite-sketch] RangeError and does NOT mutate the receiver', () => {
+    const h = new HyperLogLog(12, 1);
+    for (let i = 0; i < 1000; i++) h.add(i);
+    const before = h.count();
+    const regSnapshot = h._reg.slice();
+    const other = new HyperLogLog(12, 2); // same m, different seed
+    for (let i = 0; i < 1000; i++) other.add(i + 10000);
+
+    let thrown;
+    try {
+        h.merge(other);
+    } catch (e) {
+        thrown = e;
+    }
+    assert.ok(thrown instanceof RangeError, 'expected a RangeError');
+    assert.ok(liteSketch(thrown), 'message must carry [lite-sketch]');
+    // fail-closed: byte-identical no-op on the receiver's registers, and count() unchanged.
+    assert.deepEqual(h._reg, regSnapshot, 'registers mutated by a rejected merge');
+    assert.equal(h.count(), before, 'count() drifted after a rejected merge');
+
+    // duplicate attempt: repeating the illegal merge is consistently rejected, no cumulative damage.
+    assert.throws(() => h.merge(other), liteSketch);
+    assert.deepEqual(h._reg, regSnapshot, 'registers mutated by a SECOND rejected merge');
+
+    // re-entrant recovery: a LEGAL merge immediately after a rejected one still works cleanly
+    // (the failed attempt left no partial/half-applied state behind).
+    const good = new HyperLogLog(12, 1); // same seed as h
+    good.add(999999);
+    assert.equal(h.merge(good), h);
+    assert.ok(h.count() >= before, 'legal merge after a rejected one did not apply');
+});
+
+test('merge: same explicit seed still merges disjoint halves to a sensible union estimate', () => {
+    const p = 14;
+    const seed = 0xC0FFEE;
+    const se = 1.04 / Math.sqrt(1 << p);
+    const N = 100000;
+    const a = new HyperLogLog(p, seed);
+    const b = new HyperLogLog(p, seed);
+    for (let i = 0; i < N; i++) (i < N / 2 ? a : b).add(i);
+    assert.equal(a.merge(b), a);
+    const rel = Math.abs(a.count() - N) / N;
+    assert.ok(rel <= 3 * se, 'merged rel=' + rel.toFixed(5));
+});
+
+test('merge: unequal-m mismatch and unequal-seed mismatch throw DISTINCT [lite-sketch] messages', () => {
+    let mErr, seedErr;
+    try {
+        new HyperLogLog(14).merge(new HyperLogLog(12));
+    } catch (e) {
+        mErr = e;
+    }
+    try {
+        new HyperLogLog(14, 1).merge(new HyperLogLog(14, 2));
+    } catch (e) {
+        seedErr = e;
+    }
+    assert.ok(liteSketch(mErr) && mErr instanceof RangeError, 'm-mismatch must be [lite-sketch] RangeError');
+    assert.ok(liteSketch(seedErr) && seedErr instanceof RangeError, 'seed-mismatch must be [lite-sketch] RangeError');
+    assert.notEqual(mErr.message, seedErr.message, 'the two _badMerge branches must not share a message');
+    assert.match(mErr.message, /equal m/);
+    assert.match(seedErr.message, /equal seed/);
+});
+
+test('merge: two same-p same-seed HLLs fed the SAME keys produce the SAME registers (true no-op union)', () => {
+    const p = 10;
+    const seed = 555;
+    const a = new HyperLogLog(p, seed);
+    const b = new HyperLogLog(p, seed);
+    for (let i = 0; i < 5000; i++) {
+        a.add(i);
+        b.add(i);
+    }
+    assert.deepEqual(a._reg, b._reg, 'identical stream + identical seed must produce identical registers');
+    const before = a._reg.slice();
+    a.merge(b);
+    assert.deepEqual(a._reg, before, 'merging an identical-registers peer must be a byte-identical no-op');
+});
+
+// --- seed getter -------------------------------------------------------------
+
+test('seed getter returns the ctor seed as an effective uint32', () => {
+    assert.equal(new HyperLogLog(14, 7).seed, 7);
+    const d = new HyperLogLog();
+    assert.equal(typeof d.seed, 'number');
+    assert.ok(d.seed >= 0);
+    assert.equal(d.seed, d.seed >>> 0);
+});
+
+test('seed getter boundary matrix: 0, 1, -0, int32 max/min, uint32 max round-trip through >>> 0', () => {
+    // 0 / 1 -- the low boundary.
+    assert.equal(new HyperLogLog(8, 0).seed, 0);
+    assert.equal(new HyperLogLog(8, 1).seed, 1);
+    // -0 -- ctor accepts it (Number.isInteger(-0) is true); the getter normalizes to +0.
+    assert.equal(new HyperLogLog(8, -0).seed, 0);
+    assert.ok(!Object.is(new HyperLogLog(8, -0).seed, -0), 'seed getter must not leak a signed -0');
+    // N-1 / N / N+1 around the int32 boundary (2^31 - 1, 2^31, 2^31 + 1): the ctor stores
+    // `seed | 0` (signed int32) and the getter reads it back `>>> 0` (unsigned) -- the
+    // round trip must survive the sign flip at the boundary.
+    assert.equal(new HyperLogLog(8, 0x7fffffff).seed, 0x7fffffff);     // N-1: last positive int32
+    assert.equal(new HyperLogLog(8, -0x80000000).seed, 0x80000000);    // N: first negative int32, as uint32
+    assert.equal(new HyperLogLog(8, -0x7fffffff).seed, 0x80000001);    // N+1
+    // full uint32 max and the documented 0xDEADBEEF example.
+    assert.equal(new HyperLogLog(8, -1).seed, 0xffffffff);
+    assert.equal(new HyperLogLog(8, 0xDEADBEEF | 0).seed, 0xDEADBEEF);
+});
+
+test('seed getter is read-only: assignment throws in strict-mode ESM', () => {
+    const h = new HyperLogLog(8, 42);
+    assert.throws(() => { h.seed = 99; }, TypeError);
+    assert.equal(h.seed, 42, 'a rejected assignment must not have mutated the seed');
+});
+
+test('adversarial: a self-merge with a corrupted NaN _seed still fails closed (NaN !== NaN)', () => {
+    // Not a planner-anticipated path: `other` IS `this` (same object reference), so the
+    // instanceof and m checks trivially pass -- but if `_seed` is ever NaN (e.g. corrupted
+    // by a future refactor bypassing the ctor guard), `other._seed !== this._seed` is TRUE
+    // even comparing the SAME value to itself, because NaN !== NaN. merge() must still
+    // reject rather than silently accept a self-merge as a no-op.
+    const h = new HyperLogLog(8, 1);
+    h.add(1); h.add(2); h.add(3);
+    const before = h._reg.slice();
+    h._seed = NaN; // white-box corruption, simulating a broken invariant
+    assert.throws(() => h.merge(h), (e) => liteSketch(e) && e instanceof RangeError && /equal seed/.test(e.message));
+    assert.deepEqual(h._reg, before, 'a self-merge that throws must not touch the registers');
+    // the getter still coerces the corrupted NaN seed to a uint32 (NaN >>> 0 === 0) --
+    // fail-closed does not mean the getter itself throws; only the merge equality check does.
+    assert.equal(h.seed, 0);
 });
 
 // --- clear -----------------------------------------------------------------

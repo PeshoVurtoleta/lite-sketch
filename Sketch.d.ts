@@ -45,8 +45,9 @@ export function saltRow(h: number, i: number): number;
 /**
  * HyperLogLog -- a zero-GC distinct-count (cardinality) sketch over a dense
  * `Uint8Array(m)` of one-byte registers, `m = 2^p`, `p in [4, 18]`. `add` records one
- * register per element (0 B/op); `count()` estimates the distinct total with standard
- * error `1.04/sqrt(m)`. Mergeable (register-wise max). Dense-only; no crypto hashing.
+ * register per element (0 B/op); `count()` estimates the distinct total via Ertl's
+ * improved estimator with standard error `1.04/sqrt(m)`. Mergeable (register-wise max,
+ * equal m AND seed). Dense-only; no crypto hashing.
  */
 export class HyperLogLog {
     /** @param p precision, integer in [4, 18] (m = 2^p registers; default 14). @param seed per-instance uint32. Throws [lite-sketch] on a bad p / seed BEFORE the register array is allocated. */
@@ -61,16 +62,19 @@ export class HyperLogLog {
     /** The theoretical relative standard error, 1.04 / sqrt(m). O(1). */
     readonly standardError: number;
 
+    /** The uint32 hash seed. O(1). */
+    readonly seed: number;
+
     /** Hash a numeric key and record its register (running max of rho). HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-number / NaN key. */
     add(key: number): this;
 
     /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-uint32 lane. */
     addHashed(hi: number, lo: number): this;
 
-    /** The estimated distinct count (raw HLL estimate + small-range linear counting). COLD, O(m) -- a disclosed co-headline, not per-add. Never throws. */
+    /** The estimated distinct count via Ertl's improved estimator (table-free, accurate across the whole range). COLD, O(m) -- a disclosed co-headline, not per-add. Never throws. */
     count(): number;
 
-    /** Register-wise max of `other` into this (the union). Throws [lite-sketch] on a non-HyperLogLog or unequal m. */
+    /** Register-wise max of `other` into this (the union). Throws [lite-sketch] on a non-HyperLogLog or a m / seed mismatch. */
     merge(other: HyperLogLog): this;
 
     /** Zero the registers; reuse the same allocation. */
