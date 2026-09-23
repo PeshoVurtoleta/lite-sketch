@@ -28,8 +28,8 @@ function expected(hi, lo, p) {
     return { j, rho };
 }
 
-test('VERSION is the frozen 1.1.0 string', () => {
-    assert.equal(VERSION, '1.1.0');
+test('VERSION is the frozen 1.1.1 string', () => {
+    assert.equal(VERSION, '1.1.1');
 });
 
 // --- ctor fail-closed ------------------------------------------------------

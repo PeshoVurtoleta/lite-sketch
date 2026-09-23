@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-sketch",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "description": "Zero-dependency, zero-GC family of approximate streaming summaries that witnesses its ACCURACY against the paper's theoretical bound: HyperLogLog (distinct-count), CountMinSketch (frequency), DDSketch (relative-error quantiles), and SpaceSaving (heavy hitters / top-k), over a shipped two-lane 64-bit non-crypto hash. Tree-shakeable named exports.",
   "type": "module",
   "main": "./Sketch.js",
@@ -72,6 +72,19 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-sketch.git"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-sketch#readme",
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-sketch/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
   },
   "sideEffects": false
 }

@@ -2,7 +2,16 @@
 
 > Zero-GC approximate streaming summaries that **witness their accuracy against the paper's bound** -- HyperLogLog for distinct-count, CountMinSketch for frequency, DDSketch for quantiles, SpaceSaving for top-k.
 
-![zero deps](https://img.shields.io/badge/deps-0-brightgreen) ![zero GC](https://img.shields.io/badge/hot--path-0%20B%2Fop-brightgreen) ![ESM](https://img.shields.io/badge/module-ESM-blue) ![types](https://img.shields.io/badge/types-included-blue) ![license](https://img.shields.io/badge/license-MIT-blue)
+[![npm version](https://img.shields.io/npm/v/@zakkster/lite-sketch.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-sketch)
+[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+![Zero-GC](https://img.shields.io/badge/Zero--GC-Engine-00C853?style=for-the-badge&logo=leaf&logoColor=white)
+[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-sketch?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-sketch)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-sketch?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-sketch)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-sketch?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-sketch)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
+![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
 ## The approximate-summary family the ecosystem was missing
 
@@ -273,7 +282,7 @@ ss.epsilon -> number                     // 1 / capacity -- the theoretical erro
 ss.seed -> number                        // the uint32 hash seed (getter)
 // NOTE: SpaceSaving has NO addHashed -- it stores key identities, so there is no pre-hashed fast path.
 
-VERSION -> string                        // '1.1.0'
+VERSION -> string                        // '1.1.1'
 ```
 
 | capacity k | guaranteed to report | over-count bound | memory        |

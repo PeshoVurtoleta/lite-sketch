@@ -5,7 +5,7 @@
  * one axis over: measured error vs the theoretical error), while allocating ZERO
  * bytes on every hot op (the lite-o1 zero-GC discipline).
  *
- * v1.1.0 ships the STABLE FOUR-member API (frozen at 1.0.0; 1.1.0 adds DDSketch addFrom + getters, additive) -- HyperLogLog (cardinality / distinct-count over an
+ * v1.1.1 ships the STABLE FOUR-member API (frozen at 1.0.0; 1.1.0 added DDSketch addFrom + getters; 1.1.1 = packaging metadata only) -- HyperLogLog (cardinality / distinct-count over an
  * unbounded stream in fixed space, via a dense Uint8Array register bank),
  * CountMinSketch (point-query frequency estimation over a Uint32Array counter
  * matrix), both over the canonical two-lane 64-bit non-crypto hash, DDSketch
@@ -21,7 +21,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.1.0';
+export const VERSION = '1.1.1';
 
 // ===========================================================================
 // The canonical two-lane 64-bit hash (ADR 0001 -- LOCKED)

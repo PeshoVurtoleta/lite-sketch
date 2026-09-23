@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.1.1] - 2026-09-23
+
+Packaging metadata only -- NO source, API, or behavior change (`Sketch.js` byte-identical
+apart from the `VERSION` string and its header comment).
+
+### Changed
+
+- **`package.json` gains `repository`, `homepage`, `bugs`, and `funding`** (GitHub:
+  `PeshoVurtoleta/lite-sketch`; sponsor link), matching the rest of the `@zakkster` suite --
+  npm and GitHub now cross-link correctly and the sponsor button appears.
+- **README badges** brought in line with the suite: npm version, sponsor, Zero-GC, and bundle
+  size (replacing the older static badge row).
+
 ## [1.1.0] - 2026-09-23
 
 Post-1.0 hardening (H1) -- the close-out of the 2026-09-23 zero-GC audit (verdict: the

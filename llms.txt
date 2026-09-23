@@ -1,6 +1,6 @@
 # @zakkster/lite-sketch
 
-Version: 1.1.0
+Version: 1.1.1
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,7 +14,7 @@ It is the approximate-aggregate corner of the suite -- @zakkster/lite-filter is
 approximate MEMBERSHIP, @zakkster/lite-o1 is EXACT O(1), and lite-sketch is
 APPROXIMATE aggregates (count / frequency / quantile / top-k).
 
-v1.1.0 ships the STABLE FOUR-member API -- the complete roster: HyperLogLog (distinct-count /
+v1.1.1 ships the STABLE FOUR-member API -- the complete roster: HyperLogLog (distinct-count /
 cardinality), CountMinSketch (point-query frequency), and SpaceSaving (heavy hitters
 / top-k) over the shipped, avalanche-tested two-lane 64-bit hash, plus DDSketch
 (relative-error quantiles), which bins raw values on a log scale and does NOT use the
@@ -71,7 +71,7 @@ Members share no mutable module state, so a bundler that imports one drops the o
   keeps the top-k. `SpaceSaving.withError(epsilon)` sizes k = ceil(1/epsilon). There is deliberately
   NO addHashed (it stores key identities, so there is no honest pre-hashed path). Fail closed on a
   bad ctor arg / key / count (typeof-first, byte-identical no-op); queries never throw.
-- `VERSION` -- string, '1.1.0'.
+- `VERSION` -- string, '1.1.1'.
 
 (The canonical hash is used internally by HyperLogLog / CountMinSketch `add`; a caller who
 brings their own good hash uses `addHashed(hi, lo)`. DDSketch bins raw values -- no hash.
