@@ -1,6 +1,6 @@
 # @zakkster/lite-sketch
 
-Version: 0.1.0
+Version: 0.2.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,11 +14,11 @@ It is the approximate-aggregate corner of the suite -- @zakkster/lite-filter is
 approximate MEMBERSHIP, @zakkster/lite-o1 is EXACT O(1), and lite-sketch is
 APPROXIMATE aggregates (count / frequency / quantile / top-k).
 
-v0.1.0 ships one member -- HyperLogLog (distinct-count / cardinality) -- over a
-shipped, avalanche-tested two-lane 64-bit hash. CountMinSketch (frequency),
-DDSketch (quantiles), and SpaceSaving (heavy hitters) follow one per release to a
-stable 1.0.0. Members share no mutable module state, so a bundler that imports one
-drops the others (tree-shakeable).
+v0.2.0 ships two members -- HyperLogLog (distinct-count / cardinality) and
+CountMinSketch (point-query frequency) -- over a shipped, avalanche-tested two-lane
+64-bit hash. DDSketch (quantiles) and SpaceSaving (heavy hitters) follow one per
+release to a stable 1.0.0. Members share no mutable module state, so a bundler that
+imports one drops the others (tree-shakeable).
 
 ## Exports (from the single main file Sketch.js)
 
@@ -32,7 +32,18 @@ drops the others (tree-shakeable).
   the allocation. Standard error `1.04/sqrt(m)` (statistical, two-sided). Dense-only
   (sparse deferred); no crypto hashing. Fail closed on a bad p (throws typeof-first
   BEFORE allocation); `add` guards a non-number key; `count` / getters never throw.
-- `VERSION` -- string, '0.1.0'.
+- `CountMinSketch` -- class. A zero-GC point-query FREQUENCY sketch over a dense
+  `Uint32Array(d * w)` counter matrix (d rows x w columns, w a power of two). `add(key,
+  count = 1)` / `addHashed(hi, lo, count = 1)` are worst-case O(d), 0 B/op (one increment
+  per row); `estimate(key)` / `estimateHashed(hi, lo)` return the MIN of the d cells -- the
+  one-sided over-estimate (`f_hat >= f_true`, `f_hat - f_true <= epsilon*N` w.p. `1 - delta`,
+  `epsilon = e/w`, `delta = e^-d`). Conservative update (Estan-Varghese) is the DEFAULT
+  (tightens the over-estimate on skewed streams); `conservative: false` is the classic
+  linearly-mergeable plain matrix. `CountMinSketch.withAccuracy(epsilon, delta)` sizes it from
+  the paper's bound. `merge(other)` is element-wise saturating add (equal-d/w/seed-or-throw);
+  `clear()` reuses the allocation. Counters saturate at 2^32-1. Fail closed on a bad ctor arg /
+  key / lane / count (throws typeof-first BEFORE allocation); `estimate` never throws.
+- `VERSION` -- string, '0.2.0'.
 
 (The canonical hash is used internally by `add`; a caller who brings their own good
 hash uses `addHashed(hi, lo)` with two uint32 lanes. ADR 0001 records the hash.)
@@ -78,6 +89,55 @@ exact Set oracle, measures the relative error, and GATES it against theory -- RM
 relative error <= ~1.5 * 1.04/sqrt(m) over an N-sweep, p99 within ~3 sigma, error
 halving as p += 2. The exact-Set foil's memory grows O(distinct) while HLL stays a
 fixed m bytes (the space co-headline). Uniformity is STATISTICAL, not cryptographic.
+
+## CountMinSketch
+
+    new CountMinSketch(d, w, options?)
+    CountMinSketch.withAccuracy(epsilon, delta, options?) -> CountMinSketch
+
+- d: depth (hash rows); integer in [1, 32]. w: width (columns/row); integer in
+  [1, 2^25], ROUNDED UP to a power of two. A hard d*w <= 2^31 cap keeps every flat
+  counter index a SMI. Memory = d * w * 4 bytes.
+- options (object): { seed = <default uint32> (coerced |0), conservative = true }. An
+  unknown option key throws [lite-sketch] with a did-you-mean hint.
+- withAccuracy inverts the bound: w = ceil(e/epsilon) (rounded up to a power of two,
+  clamped to the cap), d = ceil(ln(1/delta)) (clamped to [1, 32]); epsilon in (0,1),
+  delta in (0,1). The achieved epsilon (= e/w) and delta (= e^-d) read back via getters.
+- Constructor throws [lite-sketch] typeof-first on a bad d / w / seed / conservative /
+  unknown option BEFORE the Uint32Array is allocated (nothing half-built escapes).
+
+Hot surface (add / addHashed / estimate are worst-case O(d), zero allocation):
+
+- add(key, count = 1) -> this     Hash a NUMERIC key + increment one cell per row (the
+                                  min-query answer is a one-sided over-estimate). count is a
+                                  positive integer in [1, 2^32-1]; counters SATURATE at
+                                  2^32-1 (never wrap). Fail closed: a non-number / NaN key or
+                                  out-of-range count throws [lite-sketch] (typeof-first).
+- addHashed(hi, lo, count = 1) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
+                                  hashed; skips the internal mix. Both lanes typeof-guarded uint32.
+- estimate(key) -> number         The estimated frequency: the MIN of the key's d cells. QUERY,
+                                  NEVER throws -- a non-number / NaN key returns 0.
+- estimateHashed(hi, lo) -> number  Query form of the pre-hashed path; a non-uint32 lane returns 0.
+- merge(other) -> this            Element-wise SATURATING ADD of other into this. Throws
+                                  [lite-sketch] on a non-CountMinSketch or mismatched d / w / seed.
+                                  EXACT for plain (conservative:false) sketches; a valid but looser
+                                  upper bound for conservative ones.
+- clear() -> this                 Zero the counters and the running total; reuse the allocation.
+- d / w / seed / conservative     Getters (the frozen shape + mode).
+- total (getter)                  The exact running sum N of all added counts.
+- epsilon (getter)                e / w -- the theoretical additive-error fraction.
+- delta (getter)                  e^-d -- the theoretical failure probability.
+
+Conservative update (default, Estan-Varghese): raise the d cells only to min(cells) + count
+instead of +count on every row -- never changes the min-query answer, provably tightens the
+over-estimate on skewed (Zipfian) streams. It is NOT linearly mergeable, so plain mode
+(conservative:false) is the choice when distributing then merging (plain merge is exact).
+
+Accuracy contract (the honesty anchor): the witness drives a Zipfian stream against an exact
+Map oracle, measures the over-estimate per key, and GATES the fraction exceeding epsilon*N at
+<= delta, plus one-sidedness (0 undercounts) and conservative <= plain. Space co-headline:
+d*w*4 bytes vs the exact Map's O(distinct) footprint. The over-estimate is ONE-SIDED (never
+under); the guarantee is probabilistic (delta), the hashing statistical not cryptographic.
 
 ## The hash (ADR 0001)
 

@@ -8,6 +8,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.2.0] - 2026-09-23
+
+The frequency member, pure-appended on the shipped hash + chassis.
+
+### Added
+
+- **`CountMinSketch` -- the frequency member: zero-GC point-query frequency estimation over an
+  unbounded stream in fixed space.** A dense `Uint32Array(d * w)` counter matrix of `d` rows x `w`
+  columns (`w` a power of two, so a column is a single `hash & (w - 1)` mask). `add(key, count = 1)`
+  and `addHashed(hi, lo, count = 1)` are WORST-CASE O(d), 0 B/op (one hash + one increment per row);
+  `estimate(key)` / `estimateHashed(hi, lo)` return the MINIMUM of the d cells -- the one-sided
+  over-estimate, `f_hat >= f_true` with `f_hat - f_true <= epsilon * N` at probability `>= 1 - delta`,
+  where `epsilon = e / w` and `delta = e^-d`. **Conservative update (Estan-Varghese) is the default**
+  (raise the d cells only to `min(cells) + count` -- provably tightens the over-estimate on skewed
+  streams without changing the min-query answer); `conservative: false` gives the classic plain-add
+  matrix, which is linearly mergeable (plain `merge` is exact; a conservative merge is a valid but
+  looser upper bound). Counters saturate at `2^32 - 1` (never wrap). `merge(other)` is element-wise
+  saturating add, equal-`d`/`w`/`seed`-or-throw; `clear()` zeroes the matrix and the running total;
+  getters `d` / `w` / `seed` / `conservative` / `total` / `epsilon` / `delta`.
+- **`CountMinSketch.withAccuracy(epsilon, delta, options?)`** -- the paper's interface: derives
+  `w = ceil(e/epsilon)` (rounded up to a power of two, clamped to the width cap) and
+  `d = ceil(ln(1/delta))` (clamped to `[1, 32]`), then delegates all validation to the ctor.
+- **Fail closed:** the ctor throws `[lite-sketch]` typeof-first on a bad `d` / `w` / `seed` /
+  `conservative` / unknown option (with a did-you-mean hint) BEFORE any allocation; `add` /
+  `addHashed` typeof-guard the key / lanes / count first (a Symbol / BigInt / NaN / non-uint32 lane /
+  out-of-range count throws, byte-identical no-op); `estimate` / `estimateHashed` / getters / a valid
+  `merge` never throw (a bad key estimates 0). A `d * w <= 2^31` cap keeps every flat index a SMI.
+  See [`decisions/0003`](./decisions/0003-countminsketch.md).
+- **Chassis extended:** the accuracy witness now also gates CountMinSketch (measured over-estimate vs
+  the `epsilon * N` bound on a Zipfian stream against an exact `Map` oracle, plus conservative <=
+  plain and the `d*w*4`-bytes-vs-`Map` space co-headline); the torture gate proves `add` (both modes),
+  `addHashed`, and `estimate` at 0 B/op; the perf gate adds the CountMinSketch hot-path scenarios.
+
+### Changed
+
+- `VERSION` -> `'0.2.0'` (three-site synced with `package.json` and `llms.txt`). `HyperLogLog` and the
+  shared hash are byte-identical -- CountMinSketch is a pure append.
+
 ## [0.1.0] - 2026-09-23
 
 The first release: the package, the shipped hash, and the reference member.

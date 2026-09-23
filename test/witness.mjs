@@ -17,7 +17,7 @@
 // The max |relerr| <= ~3.5 sigma (the ~3-sigma tail with a small-trial allowance). The
 // absolute error-halving ratio is REPORTED for the eye but not gated (sampling noise).
 
-import { HyperLogLog } from '../Sketch.js';
+import { HyperLogLog, CountMinSketch } from '../Sketch.js';
 
 const PS = [10, 12, 14];
 const NS = [1000, 10000, 100000];
@@ -103,4 +103,184 @@ if (relBig > 3.5 * hBig.standardError) ok = false;
 
 console.log('');
 console.log('WITNESS HyperLogLog ' + (ok ? 'ok' : 'FAIL'));
-if (!ok) process.exitCode = 1;
+const hllOk = ok;
+
+// ===========================================================================
+// CountMinSketch -- point-query frequency vs the exact Map oracle
+// ===========================================================================
+//
+// The oracle is an exact `Map<key, count>` fed the SAME Zipfian stream as the sketch.
+// The theoretical bound (Cormode-Muthukrishnan): a point query over-estimates by AT
+// MOST `epsilon * total` with probability >= `1 - delta`, `epsilon = e/w`, `delta =
+// e^-d`. We measure, over every DISTINCT key actually queried, the fraction whose
+// over-estimate exceeds `epsilon*total` and gate it against `delta` (with a small
+// safety slack -- see test/CountMinSketch.test.js for the derivation of the slack:
+// this is a single-stream per-query Markov bound, not a repeated-trial concentration
+// statement, so a bare `<= delta` at exactly the boundary would be too tight to be a
+// meaningful STATISTICAL gate at one draw). We ALSO print the honesty headline (max /
+// mean relative over-estimate vs the epsilon*N bound) and the space co-headline
+// (d*w*4 bytes for the sketch vs the exact Map's footprint), and gate that
+// conservative's measured error never exceeds plain's on the identical stream.
+
+function fmtInt(x) { return x.toLocaleString('en-US'); }
+
+function makeCmsRng(seed) {
+    let s = seed >>> 0;
+    return function rng() {
+        s = (s + 0x6d2b79f5) | 0;
+        let t = s;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+/** Zipfian sample generator over ranks [0, nKeys) with exponent `skew` (harmonic-CDF binary search). */
+function makeZipf(nKeys, skew, rng) {
+    const harm = new Float64Array(nKeys);
+    let sum = 0;
+    for (let i = 1; i <= nKeys; i++) {
+        sum += 1 / Math.pow(i, skew);
+        harm[i - 1] = sum;
+    }
+    const total = sum;
+    return function zipf() {
+        const target = rng() * total;
+        let lo = 0, hi = nKeys - 1;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (harm[mid] < target) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    };
+}
+
+/** Drive one Zipfian stream against ONE sketch + the exact Map oracle; return the measured stats. */
+function measureCms(sketch, N, nKeys, skew, seed) {
+    const rng = makeCmsRng(seed);
+    const zipf = makeZipf(nKeys, skew, rng);
+    const truth = new Map();
+    for (let i = 0; i < N; i++) {
+        const key = zipf();
+        sketch.add(key);
+        truth.set(key, (truth.get(key) || 0) + 1);
+    }
+    const bound = sketch.epsilon * sketch.total;
+    let violations = 0;
+    let maxOver = 0;
+    let sumOver = 0;
+    let underCount = 0;
+    for (const [key, trueCount] of truth) {
+        const est = sketch.estimate(key);
+        if (est < trueCount) underCount++;         // one-sidedness must NEVER break
+        const over = est - trueCount;
+        sumOver += over;
+        if (over > maxOver) maxOver = over;
+        if (over > bound) violations++;
+    }
+    return {
+        distinct: truth.size,
+        fraction: violations / truth.size,
+        maxOver,
+        meanOver: sumOver / truth.size,
+        bound,
+        underCount,
+    };
+}
+
+console.log('');
+console.log('ACCURACY Witness -- CountMinSketch point-query frequency vs the exact-Map oracle ' +
+    '(Zipfian stream, skew=1.1; theoretical: over-estimate <= epsilon*N w.p. >= 1-delta)');
+console.log('');
+console.log('  epsilon    delta      d   w        N        distinct  violFrac    <=slack*delta  ' +
+    'maxOver  meanOver  bound      underCount');
+console.log('  ---------  ---------  --  -------  -------  --------  ----------  --------------  ' +
+    '-------  --------  ---------  ----------');
+
+const CMS_N = 300000;      // a solid 3e5 stream (1e6 is also fine but slower for a repo-gated witness)
+const CMS_NKEYS = 20000;
+const CMS_SKEW = 1.1;
+const CMS_SLACK = 3;       // see test/CountMinSketch.test.js: a single-stream Markov bound needs slack
+const cmsSweep = [
+    { epsilon: 0.01, delta: 0.1 },
+    { epsilon: 0.001, delta: 0.01 },
+    { epsilon: 0.001, delta: 0.001 },
+];
+
+let cmsOk = true;
+for (let t = 0; t < cmsSweep.length; t++) {
+    const { epsilon, delta } = cmsSweep[t];
+    const c = CountMinSketch.withAccuracy(epsilon, delta);
+    const r = measureCms(c, CMS_N, CMS_NKEYS, CMS_SKEW, 0xA5A5A5A5 ^ (t * 0x9e3779b1));
+    const gateOk = r.underCount === 0 && r.fraction <= CMS_SLACK * c.delta;
+    if (!gateOk) cmsOk = false;
+    console.log('  ' + pct(c.epsilon).padStart(9) + '  ' + pct(c.delta).padStart(9) + '  ' +
+        String(c.d).padEnd(2) + '  ' + String(c.w).padEnd(7) + '  ' + nStr(CMS_N).padEnd(7) + '  ' +
+        String(r.distinct).padStart(8) + '  ' + pct(r.fraction).padStart(10) + '  ' +
+        pct(CMS_SLACK * c.delta).padStart(14) + '  ' + String(r.maxOver).padStart(7) + '  ' +
+        fmt(r.meanOver).padStart(8) + '  ' + fmt(r.bound).padStart(9) + '  ' +
+        String(r.underCount).padStart(10) + (gateOk ? '' : '  <- FAIL'));
+}
+
+// Conservative <= plain: identical Zipfian stream fed to both update modes, same d/w/seed.
+console.log('');
+const CONS_D = 5, CONS_W = 4096, CONS_SEED = 0x1234;
+const consSketch = new CountMinSketch(CONS_D, CONS_W, { seed: CONS_SEED, conservative: true });
+const plainSketch = new CountMinSketch(CONS_D, CONS_W, { seed: CONS_SEED, conservative: false });
+const consRng = makeCmsRng(0xC0DEC0DE);
+const consZipf = makeZipf(CMS_NKEYS, CMS_SKEW, consRng);
+const consKeys = [];
+for (let i = 0; i < CMS_N; i++) {
+    const key = consZipf();
+    consKeys.push(key);
+    consSketch.add(key);
+    plainSketch.add(key);
+}
+const distinctCons = new Set(consKeys);
+let consMaxOver = 0, plainMaxOver = 0, consSumOver = 0, plainSumOver = 0, consViol = 0;
+const truthCons = new Map();
+for (const k of consKeys) truthCons.set(k, (truthCons.get(k) || 0) + 1);
+for (const key of distinctCons) {
+    const ce = consSketch.estimate(key), pe = plainSketch.estimate(key);
+    const tc = truthCons.get(key);
+    if (ce > pe) consViol++;
+    consMaxOver = Math.max(consMaxOver, ce - tc);
+    plainMaxOver = Math.max(plainMaxOver, pe - tc);
+    consSumOver += (ce - tc);
+    plainSumOver += (pe - tc);
+}
+const consMeanOver = consSumOver / distinctCons.size;
+const plainMeanOver = plainSumOver / distinctCons.size;
+const consLooseOk = consViol === 0 && consMeanOver <= plainMeanOver;
+if (!consLooseOk) cmsOk = false;
+console.log('  conservative vs plain (same d=' + CONS_D + ' w=' + CONS_W + ' seed=' + CONS_SEED +
+    ' stream): conservative>plain violations=' + consViol + '/0  meanOver cons=' + fmt(consMeanOver) +
+    ' plain=' + fmt(plainMeanOver) + ' (cons<=plain: ' + (consMeanOver <= plainMeanOver ? 'ok' : 'FAIL') + ')' +
+    '  maxOver cons=' + consMaxOver + ' plain=' + plainMaxOver +
+    '  | ' + (consLooseOk ? 'ok' : 'FAIL'));
+
+// Space co-headline: the sketch is a fixed d*w*4 bytes; the exact Map grows O(distinct).
+console.log('');
+const spaceD = 5, spaceW = 4096;
+const spaceSketch = new CountMinSketch(spaceD, spaceW);
+const spaceRng = makeCmsRng(0xF00DF00D);
+const spaceZipf = makeZipf(CMS_NKEYS, CMS_SKEW, spaceRng);
+const spaceTruth = new Map();
+for (let i = 0; i < CMS_N; i++) {
+    const key = spaceZipf();
+    spaceSketch.add(key);
+    spaceTruth.set(key, (spaceTruth.get(key) || 0) + 1);
+}
+const cmsBytes = spaceD * spaceW * 4;
+const mapBytesLowerBound = spaceTruth.size * 32;   // a Map<number, number> entry: >= ~32 B/entry lower bound
+console.log('  space co-headline @ N=' + fmtInt(CMS_N) + ', distinct=' + fmtInt(spaceTruth.size) +
+    ':  CountMinSketch d=' + spaceD + ' w=' + spaceW + ' = ' + (cmsBytes / 1024).toFixed(1) +
+    ' KB (fixed)  vs  exact Map >= ' + (mapBytesLowerBound / 1024).toFixed(1) + ' KB (grows O(distinct))');
+
+console.log('');
+console.log('WITNESS CountMinSketch ' + (cmsOk ? 'ok' : 'FAIL'));
+
+const ok2 = hllOk && cmsOk;
+console.log('');
+console.log('WITNESS lite-sketch (all members) ' + (ok2 ? 'ok' : 'FAIL'));
+if (!ok2) process.exitCode = 1;

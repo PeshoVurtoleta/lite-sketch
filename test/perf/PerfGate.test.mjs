@@ -7,13 +7,16 @@
 // delta). A `mustFail` control that allocates per op MUST trip the gate, proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { HyperLogLog } from '../../Sketch.js';
+import { HyperLogLog, CountMinSketch } from '../../Sketch.js';
 
 const P = 14;
 const M = 1 << P;
 
 /** Zero-alloc counter: the single backing register bank's byte length -- fixed at construction. */
 function grows(s) { return s.h._reg.buffer.byteLength; }
+
+/** Zero-alloc counter: the CountMinSketch counter matrix's byte length -- fixed at construction. */
+function cmsGrows(s) { return s.c._counts.buffer.byteLength; }
 
 /** add-stream: hash a walking numeric key + one register max each op (the hot path). */
 const addStream = {
@@ -58,6 +61,71 @@ const addHashedStream = {
     statsOf(s) { return { grows: grows(s) }; },
 };
 
+/** CMS width (a power of two, matches the family default sizing at this depth). */
+const CW = 1 << 14;
+
+/** add-stream conservative: hash a numeric key + the two-pass conservative row update. */
+const cmsAddConsStream = {
+    name: 'CountMinSketch add-stream conservative (hash + 2-pass row update)',
+    setup() {
+        const c = new CountMinSketch(5, CW, { conservative: true });
+        for (let k = 0; k < 100000; k++) c.add(k);   // prime to steady state
+        return { c, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 0x9e3779b1) | 0;
+            c.add(v);
+            sink = (sink + c._counts[v & (CW - 1)]) | 0;
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: cmsGrows(s) }; },
+};
+
+/** add-stream plain: hash a numeric key + one saturating add per row. */
+const cmsAddPlainStream = {
+    name: 'CountMinSketch add-stream plain (hash + saturating row add)',
+    setup() {
+        const c = new CountMinSketch(5, CW, { conservative: false });
+        for (let k = 0; k < 100000; k++) c.add(k);
+        return { c, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 0x9e3779b1) | 0;
+            c.add(v);
+            sink = (sink + c._counts[v & (CW - 1)]) | 0;
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: cmsGrows(s) }; },
+};
+
+/** estimate-stream: the min-of-d point query, never throws, 0 B/op. */
+const cmsEstimateStream = {
+    name: 'CountMinSketch estimate-stream (min-of-d point query)',
+    setup() {
+        const c = new CountMinSketch(5, CW, { conservative: true });
+        for (let k = 0; k < 100000; k++) c.add(k);
+        return { c, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const c = s.c;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 0x9e3779b1) | 0;
+            sink = (sink + c.estimate(v)) | 0;
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: cmsGrows(s) }; },
+};
+
 /**
  * The teeth: a per-op call that builds a FRESH array each op -- it MUST trip the gate
  * (scavenges scale with n), proving the instrument catches a real allocation.
@@ -97,7 +165,10 @@ zgcSuite({
     maxOldGen: 0,
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
-    maxRetainedKB: 512,   // the HyperLogLog(14) register bank is ~16 KB; setup builds it twice + harness overhead. grows delta 0 is the leak invariant.
-    scenarios: [addStream, addHashedStream],
+    // the HyperLogLog(14) register bank is ~16 KB and the CountMinSketch(5, 16384) counter
+    // matrix is ~320 KB; setup builds each scenario's state twice + harness overhead. grows
+    // delta 0 (both counters below) is the leak invariant, not the retained-KB headline.
+    maxRetainedKB: 1024,
+    scenarios: [addStream, addHashedStream, cmsAddConsStream, cmsAddPlainStream, cmsEstimateStream],
     mustFail: [mustFailAlloc],
 });

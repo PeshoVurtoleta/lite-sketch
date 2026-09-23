@@ -76,3 +76,79 @@ export class HyperLogLog {
     /** Zero the registers; reuse the same allocation. */
     clear(): this;
 }
+
+/** Options accepted by the `CountMinSketch` constructor and `withAccuracy`. */
+export interface CountMinSketchOptions {
+    /** Uint32 hash seed (any integer, coerced with `| 0`). Default shared with HyperLogLog. */
+    seed?: number;
+    /** Conservative-update mode (Estan-Varghese). Default true. */
+    conservative?: boolean;
+}
+
+/**
+ * CountMinSketch -- a zero-GC point-query FREQUENCY sketch over a dense
+ * `Uint32Array(d * w)` counter matrix, `d` hash rows x `w` columns (`w` a power of
+ * two). `add(key, count?)` increments one cell per row (conservative or plain per the
+ * ctor flag), 0 B/op; `estimate(key)` returns the minimum of its `d` cells -- a
+ * ONE-SIDED over-estimate: `f_hat >= f_true` always, with `f_hat - f_true <=
+ * epsilon * total` w.p. `>= 1 - delta` (`epsilon = e/w`, `delta = e^-d`). Plain
+ * sketches merge EXACTLY (elementwise saturating add); conservative merge is a valid
+ * but looser upper bound. Dense-only; no crypto hashing.
+ */
+export class CountMinSketch {
+    /**
+     * @param d depth (hash rows), integer in [1, 32].
+     * @param w width (columns/row), integer in [1, 2^25], rounded UP to a power of two.
+     * @param options seed / conservative. Throws [lite-sketch] on any bad argument
+     *   BEFORE the counter matrix is allocated (incl. an unknown option key).
+     */
+    constructor(d: number, w: number, options?: CountMinSketchOptions);
+
+    /**
+     * Build a sketch sized to a target accuracy: `w = ceil(e/epsilon)` (rounded up to
+     * a power of two, clamped to the width cap), `d = ceil(ln(1/delta))` (clamped to
+     * [1, 32]). Delegates remaining validation to the constructor.
+     * @param epsilon relative error, in (0, 1).
+     * @param delta failure probability, in (0, 1).
+     */
+    static withAccuracy(epsilon: number, delta: number, options?: CountMinSketchOptions): CountMinSketch;
+
+    /** Depth d (hash rows). O(1). */
+    readonly d: number;
+
+    /** Width w (columns/row, a power of two). O(1). */
+    readonly w: number;
+
+    /** The uint32 hash seed. O(1). */
+    readonly seed: number;
+
+    /** Whether conservative update is on. O(1). */
+    readonly conservative: boolean;
+
+    /** Total count added (sum of all `count`s). O(1). */
+    readonly total: number;
+
+    /** The theoretical relative error, e / w. O(1). */
+    readonly epsilon: number;
+
+    /** The theoretical failure probability, e^-d. O(1). */
+    readonly delta: number;
+
+    /** Hash a numeric key and increment its row cells by `count` (default 1). HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-number / NaN key or an out-of-range count. */
+    add(key: number, count?: number): this;
+
+    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-uint32 lane or an out-of-range count. */
+    addHashed(hi: number, lo: number, count?: number): this;
+
+    /** The minimum over the key's d cells -- the tightest one-sided over-estimate. HOT, O(d), 0 B/op. Never throws (a bad key estimates 0). */
+    estimate(key: number): number;
+
+    /** Estimate from a pre-hashed key (two uint32 lanes). HOT, O(d), 0 B/op. Never throws (a bad lane estimates 0). */
+    estimateHashed(hi: number, lo: number): number;
+
+    /** Element-wise saturating add of `other` into this. Exact for plain sketches; a valid but looser upper bound for conservative ones. Throws [lite-sketch] on a non-CountMinSketch or a d / w / seed mismatch. */
+    merge(other: CountMinSketch): this;
+
+    /** Zero every counter and the running total; reuse the same allocation. */
+    clear(): this;
+}
