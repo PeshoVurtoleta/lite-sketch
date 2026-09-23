@@ -1,0 +1,76 @@
+{
+  "name": "@zakkster/lite-sketch",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.1.0",
+  "description": "Zero-dependency, zero-GC family of approximate streaming summaries that witnesses its ACCURACY against the paper's theoretical bound: HyperLogLog (cardinality / distinct-count in fixed space via a dense register array + full HLL++ bias correction) over a shipped two-lane 64-bit non-crypto hash. Tree-shakeable named exports.",
+  "type": "module",
+  "main": "./Sketch.js",
+  "module": "./Sketch.js",
+  "types": "./Sketch.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Sketch.d.ts",
+      "node": "./Sketch.js",
+      "import": "./Sketch.js",
+      "default": "./Sketch.js"
+    }
+  },
+  "files": [
+    "Sketch.js",
+    "Sketch.d.ts",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "torture": "node --expose-gc test/torture.mjs",
+    "witness": "node test/witness.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "bench": "node benchmark/Bench.mjs",
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run test:perf"
+  },
+  "keywords": [
+    "sketch",
+    "data-sketches",
+    "streaming",
+    "approximate",
+    "probabilistic",
+    "cardinality",
+    "distinct-count",
+    "count-distinct",
+    "hyperloglog",
+    "hll",
+    "hll-plus-plus",
+    "loglog",
+    "unique-count",
+    "estimation",
+    "hash",
+    "murmur3",
+    "xxhash",
+    "avalanche",
+    "zero-gc",
+    "gc",
+    "garbage-collection",
+    "typed-array",
+    "tree-shakeable",
+    "zero-dependency",
+    "witness"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-perf-gate": "^1.4.2",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}

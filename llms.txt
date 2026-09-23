@@ -1,0 +1,106 @@
+# @zakkster/lite-sketch
+
+Version: 0.1.0
+License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
+Node: >= 18.
+
+## What it is
+
+A zero-dependency, zero-GC family of APPROXIMATE streaming summaries (sketches)
+that WITNESSES its ACCURACY instead of only citing it: every member proves its
+MEASURED error against the paper's THEORETICAL bound, next to the memory it saves.
+It is the approximate-aggregate corner of the suite -- @zakkster/lite-filter is
+approximate MEMBERSHIP, @zakkster/lite-o1 is EXACT O(1), and lite-sketch is
+APPROXIMATE aggregates (count / frequency / quantile / top-k).
+
+v0.1.0 ships one member -- HyperLogLog (distinct-count / cardinality) -- over a
+shipped, avalanche-tested two-lane 64-bit hash. CountMinSketch (frequency),
+DDSketch (quantiles), and SpaceSaving (heavy hitters) follow one per release to a
+stable 1.0.0. Members share no mutable module state, so a bundler that imports one
+drops the others (tree-shakeable).
+
+## Exports (from the single main file Sketch.js)
+
+- `HyperLogLog` -- class. A zero-GC distinct-count (cardinality) sketch over a dense
+  `Uint8Array(m)` of one-byte registers, `m = 2^p`, `p in [4, 18]`. `add(key)` is
+  worst-case O(1), 0 B/op (hash the key over the two-lane mix, pick a register by the
+  top p bits, record `rho` = leftmost-1 of the remaining 64-p bits as a running max).
+  `addHashed(hi, lo)` is the pre-hashed fast path. `count()` is a cold O(m) estimator
+  (Ertl's improved estimator, 2017 -- a single table-free formula accurate across the
+  whole range, no empirical bias tables), a disclosed co-headline, NOT per-add. `merge(other)` is register-wise max (equal-m-or-throw); `clear()` reuses
+  the allocation. Standard error `1.04/sqrt(m)` (statistical, two-sided). Dense-only
+  (sparse deferred); no crypto hashing. Fail closed on a bad p (throws typeof-first
+  BEFORE allocation); `add` guards a non-number key; `count` / getters never throw.
+- `VERSION` -- string, '0.1.0'.
+
+(The canonical hash is used internally by `add`; a caller who brings their own good
+hash uses `addHashed(hi, lo)` with two uint32 lanes. ADR 0001 records the hash.)
+
+## HyperLogLog
+
+    new HyperLogLog(p = 14, seed = <default uint32>)
+
+- p: precision; integer in [4, 18]. Register count m = 2^p; memory = m bytes
+  (p=14 -> 16 KB). Standard error = 1.04/sqrt(m) (p=14 -> ~0.8%). Higher p halves
+  the error each +2 and quadruples the memory.
+- seed: per-instance uint32 (default a fixed constant), coerced via >>> 0; a bad
+  seed throws [lite-sketch] typeof-first.
+- Constructor throws [lite-sketch] on a non-integer / out-of-range p BEFORE the
+  Uint8Array is allocated (nothing half-built escapes).
+
+Hot surface (add / addHashed are worst-case O(1), zero allocation):
+
+- add(key) -> this          Hash a NUMERIC key over the two-lane mix and record its
+                            register (running max of rho). Fail closed: a non-number
+                            / NaN / Symbol / BigInt key throws [lite-sketch]
+                            (typeof-first, byte-identical no-op).
+- addHashed(hi, lo) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
+                            hashed with their own good hash; skips the internal mix.
+                            Both lanes typeof-guarded as uint32.
+- count() -> number         COLD, O(m): the estimated distinct count via Ertl's IMPROVED
+                            estimator (2017) -- a single TABLE-FREE formula
+                            (`alpha_inf * m^2 / z`, `alpha_inf = 1/(2 ln 2)`; z folds the
+                            register multiplicity vector through the self-terminating
+                            sigma/tau corrections) accurate across the WHOLE range: no
+                            range-switching, no HLL++ empirical bias tables. A disclosed
+                            co-headline (the O(m) scan), NOT a per-add cost. Never throws.
+- merge(other) -> this      Register-wise max of `other` into `this` (the union).
+                            Throws [lite-sketch] on a non-HyperLogLog or unequal m
+                            (equal-m-or-throw, the same-capacity discipline).
+- clear() -> this           Zero the registers; reuse the same allocation.
+- p (getter)                The precision p.
+- m (getter)                Register count, 2^p.
+- standardError (getter)    1.04 / sqrt(m) -- the theoretical relative standard error.
+
+Accuracy contract (the honesty anchor): the witness drives HLL on a stream with an
+exact Set oracle, measures the relative error, and GATES it against theory -- RMS
+relative error <= ~1.5 * 1.04/sqrt(m) over an N-sweep, p99 within ~3 sigma, error
+halving as p += 2. The exact-Set foil's memory grows O(distinct) while HLL stays a
+fixed m bytes (the space co-headline). Uniformity is STATISTICAL, not cryptographic.
+
+## The hash (ADR 0001)
+
+A shipped two-lane 64-bit-quality non-crypto mix (Math.imul finalizer, murmur3 /
+xxh32 style), realized as two uint32 lanes returned through module-scope slots (NO
+BigInt -- it allocates), so the hot path is 0 B/op. HLL reads BOTH lanes for rho
+(a single 32-bit hash would cap rho at 32-p bits and lose large-cardinality
+accuracy). A pre-hashed fast path (addHashed); seeded row-salting for future
+multi-row members (h_i = mix(h ^ i*ODD_CONST), per-instance seed); an optional
+alloc-free string-bytes hasher. Avalanche-tested: a 1-bit input flip flips ~half
+the output bits across both lanes.
+
+## Scripts
+
+- npm test          -- node:test behavioral + fail-closed suites + the hash avalanche test
+- npm run witness   -- the accuracy witness (measured error vs the theoretical bound)
+- npm run torture   -- the 0 B/op leak + GC-profiler gate on add (node --expose-gc)
+- npm run test:perf -- flat-throughput perf gate + a must-allocate control
+- npm run verify    -- test + test:types + torture + witness + test:perf (the release gate)
+
+## Roadmap
+
+HyperLogLog (0.1.0, cardinality) -> CountMinSketch (0.2.0, frequency) -> DDSketch
+(0.3.0, quantiles, HARD relative-error bound) -> SpaceSaving (0.4.0, heavy hitters)
+-> 1.0.0 (API declared stable at four members). Post-1.0: KMV/MinHash, CountSketch,
+HeavyKeeper, SlidingHLL -- one per release.
