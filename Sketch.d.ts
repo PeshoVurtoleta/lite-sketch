@@ -65,7 +65,7 @@ export class HyperLogLog {
     /** The uint32 hash seed. O(1). */
     readonly seed: number;
 
-    /** Hash a numeric key and record its register (running max of rho). HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-number / NaN key. */
+    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and record its register (running max of rho). HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key (a byte-identical no-op). */
     add(key: number): this;
 
     /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-uint32 lane. */
@@ -138,7 +138,7 @@ export class CountMinSketch {
     /** The theoretical failure probability, e^-d. O(1). */
     readonly delta: number;
 
-    /** Hash a numeric key and increment its row cells by `count` (default 1). HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-number / NaN key or an out-of-range count. */
+    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and increment its row cells by `count` (default 1). HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key or an out-of-range count (a byte-identical no-op). */
     add(key: number, count?: number): this;
 
     /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-uint32 lane or an out-of-range count. */
@@ -213,8 +213,26 @@ export class DDSketch {
     /** Whether any nonzero mass has ever been folded into the collapsed floor. O(1). */
     readonly collapsed: boolean;
 
+    /** Whether this is a STRICT fixed-range sketch (a `range` was given at construction; no collapse). O(1). */
+    readonly strict: boolean;
+
+    /** The smallest x > 0 `add` accepts at this alpha (EXCLUSIVE floor: `add` accepts finite `minIndexable < x <= maxIndexable`, plus exact 0). ~2.2e-308 at alpha=0.01. O(1), 0 B/op. */
+    readonly minIndexable: number;
+
+    /** The largest x `add` accepts at this alpha (INCLUSIVE ceiling: `add` accepts finite `minIndexable < x <= maxIndexable`). ~8.9e307 at alpha=0.01. O(1), 0 B/op. */
+    readonly maxIndexable: number;
+
+    /** STRICT mode: the configured range minimum passed at construction (NaN if not strict). O(1). */
+    readonly rangeMin: number;
+
+    /** STRICT mode: the configured range maximum passed at construction (NaN if not strict). O(1). */
+    readonly rangeMax: number;
+
     /** Add a value with a positive integer `count` (default 1). HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-finite / negative value, a non-positive-integer count, or (strict mode) a value outside the fixed range. */
     add(value: number, count?: number): this;
+
+    /** Add the value at `buf[i]` (count = 1) -- the ZERO-BOX entry point for a FRACTIONAL hot-path value: `add(fractionalDouble)` boxes its argument (~16 B/call) when not inlined, whereas `addFrom` reads `buf[i]` unboxed. Same validation / throws / binning as `add`. HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-Float64Array `buf`, an out-of-bounds / non-integer `i`, or a value `add` would reject. */
+    addFrom(buf: Float64Array, i: number): this;
 
     /** Estimate the value at quantile q in [0, 1] -- the alpha-approximate member. COLD, O(bins). NEVER throws; returns NaN for a bad q or an empty sketch. */
     quantile(q: number): number;

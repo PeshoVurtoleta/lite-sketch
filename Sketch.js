@@ -5,7 +5,7 @@
  * one axis over: measured error vs the theoretical error), while allocating ZERO
  * bytes on every hot op (the lite-o1 zero-GC discipline).
  *
- * v1.0.0 freezes a STABLE FOUR-member API -- HyperLogLog (cardinality / distinct-count over an
+ * v1.1.0 ships the STABLE FOUR-member API (frozen at 1.0.0; 1.1.0 adds DDSketch addFrom + getters, additive) -- HyperLogLog (cardinality / distinct-count over an
  * unbounded stream in fixed space, via a dense Uint8Array register bank),
  * CountMinSketch (point-query frequency estimation over a Uint32Array counter
  * matrix), both over the canonical two-lane 64-bit non-crypto hash, DDSketch
@@ -21,7 +21,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 // ===========================================================================
 // The canonical two-lane 64-bit hash (ADR 0001 -- LOCKED)
@@ -280,21 +280,25 @@ export class HyperLogLog {
     get seed() { return this._seed >>> 0; }
 
     /**
-     * Add a numeric key. HOT, 0 B/op. Hashes the key to two lanes, picks register j
+     * Add a SAFE-INTEGER key. HOT, 0 B/op. Hashes the key to two lanes, picks register j
      * from the top p bits, computes rho over the 64 - p bit suffix, stores the max.
-     * Fails closed: a non-number / NaN key throws `[lite-sketch]` (byte-identical
-     * no-op) -- the typeof guard runs FIRST.
+     * Fails closed: a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key
+     * throws `[lite-sketch]` (byte-identical no-op) -- the typeof guard runs FIRST. The hot
+     * body distinguishes the FULL magnitude (low word + high word + sign), so the accepted
+     * domain is every safe integer |key| <= 2^53 - 1, matching CountMinSketch / SpaceSaving;
+     * a non-integer or an Infinity would truncate/alias under `>>> 0`, so both fail closed.
      *
      * The two-lane murmur is INLINED here (identical math to mix64) so the lanes are
      * pure LOCALS (int32), which TurboFan keeps in registers -- it never writes the
      * module HASH_HI / HASH_LO slots on the hot path, so a uint32 >= 2^31 lane never
      * boxes a HeapNumber into a slot. That is what keeps add at a true 0 scavenges
      * (mix64 / hashHi / hashLo remain the standalone hash for external callers).
-     * @param {number} key
+     * @param {number} key a safe integer, |key| <= 2^53 - 1
      * @returns {HyperLogLog} this
      */
     add(key) {
-        if (typeof key !== 'number' || key !== key) return this._badKey(key);
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            Math.abs(key) > 9007199254740991) return this._badKey(key);
         let a = key;
         let neg = 0;
         if (a < 0) { a = -a; neg = 1; }
@@ -589,20 +593,25 @@ export class CountMinSketch {
     get delta() { return Math.exp(-this._d); }
 
     /**
-     * Add a numeric key with a positive integer `count` (default 1). HOT, 0 B/op.
+     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 B/op.
      * Hashes the key to a base lane, then increments one cell per row (conservative or
-     * plain per the ctor flag). Fails closed: a non-number / NaN key or an out-of-range
-     * count throws `[lite-sketch]` -- the typeof guards run FIRST.
+     * plain per the ctor flag). Fails closed: a non-number / NaN / +-Infinity / non-integer
+     * / out-of-safe-range key, or an out-of-range count, throws `[lite-sketch]` -- the typeof
+     * guards run FIRST. The hot body distinguishes the FULL magnitude (low word + high word +
+     * sign), so the accepted domain is every safe integer |key| <= 2^53 - 1, matching
+     * HyperLogLog / SpaceSaving; a non-integer or an Infinity would truncate/alias under
+     * `>>> 0`, so both fail closed.
      *
      * The two-lane murmur is INLINED (identical math to mix64) into int32 LOCALS so it
      * never writes the module HASH_HI / HASH_LO slots (a uint32 >= 2^31 lane never boxes
      * a HeapNumber on the hot path). base = (hi ^ lo) | 0 folds both lanes.
-     * @param {number} key
+     * @param {number} key a safe integer, |key| <= 2^53 - 1
      * @param {number} [count=1] a positive integer in [1, 2^32-1].
      * @returns {CountMinSketch} this
      */
     add(key, count = 1) {
-        if (typeof key !== 'number' || key !== key) return this._badKey(key);
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            Math.abs(key) > 9007199254740991) return this._badKey(key);
         if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT) {
             return this._badCount(count);
         }
@@ -860,7 +869,9 @@ const DD_KNOWN_OPTS = Object.freeze({ maxBins: true, range: true });
  * so large or so tiny that its bucket representative `2*gamma^K/(gamma+1)` would overflow
  * to Infinity or underflow to 0 is REJECTED at `add` time (a throw, byte-identical no-op)
  * -- so `quantile` is ALWAYS a finite, alpha-bounded value. At alpha=0.01 the door admits
- * roughly `[~1e-305, ~8.6e307]`; the window widens as alpha grows and narrows as it shrinks.
+ * roughly `(~2.2e-308, ~8.9e307]` (the low end is exclusive: `add` accepts x > the floor);
+ * the window widens as alpha grows and narrows as it shrinks. The EXACT runtime bounds are
+ * the `minIndexable` / `maxIndexable` getters (`minIndexable` is that low floor).
  *
  * Fail closed: a bad alpha / maxBins / range (incl. a range whose ends are not indexable) /
  * unknown option throws `[lite-sketch]` at the ctor door BEFORE any allocation (no half-built
@@ -959,6 +970,13 @@ export class DDSketch {
         this._maxKeyStrict = maxKeyStrict;  // strict: highest legal key
         this._maxKeyIndexable = maxKeyIndexable;  // key ceiling: representative stays finite
         this._minKeyIndexable = minKeyIndexable;  // key floor: representative stays positive
+        // The exact x bounds add() accepts at this alpha (0-alloc getters read these).
+        // add accepts a value iff minKeyIndexable <= ceil(log_gamma(value)) <= maxKeyIndexable,
+        // i.e. a finite x with _minIndexable < x <= _maxIndexable (plus exact 0 always).
+        this._minIndexable = Math.pow(gamma, minKeyIndexable - 1);  // EXCLUSIVE floor: add accepts x > this
+        this._maxIndexable = Math.pow(gamma, maxKeyIndexable);      // INCLUSIVE ceiling: add accepts x <= this
+        this._rangeMin = strict ? range[0] : NaN;                   // configured strict range (NaN if not strict)
+        this._rangeMax = strict ? range[1] : NaN;
         this._bins = new Float64Array(strict ? nb : maxBins);
         this._maxBins = this._bins.length;
         // physical index of key K is K - _offset; the array spans keys [_offset, _offset+maxBins-1].
@@ -997,6 +1015,26 @@ export class DDSketch {
     }
     /** Whether any nonzero mass has ever been folded into the collapsed floor (precision lost at the low end). O(1). */
     get collapsed() { return this._collapsed; }
+    /** Whether this is a STRICT fixed-range sketch (range given at construction; no collapse). O(1). */
+    get strict() { return this._strict; }
+    /**
+     * The smallest x > 0 that `add` accepts at this alpha (the EXCLUSIVE lower floor:
+     * `add` accepts a finite x with `minIndexable < x <= maxIndexable`, plus exact 0).
+     * Below it the bucket representative would fall denormal and lose the alpha guarantee.
+     * The exact runtime answer to the "low indexable bound" -- roughly 2.2e-308 at alpha=0.01,
+     * narrowing as alpha shrinks. O(1), 0 B/op, never throws. `null` is not zero.
+     */
+    get minIndexable() { return this._minIndexable; }
+    /**
+     * The largest x that `add` accepts at this alpha (INCLUSIVE): `add` accepts a finite x
+     * with `minIndexable < x <= maxIndexable`. Above it the representative would overflow to
+     * Infinity. Roughly 8.9e307 at alpha=0.01. O(1), 0 B/op, never throws.
+     */
+    get maxIndexable() { return this._maxIndexable; }
+    /** STRICT mode: the configured range minimum passed at construction (NaN if not strict). O(1). */
+    get rangeMin() { return this._rangeMin; }
+    /** STRICT mode: the configured range maximum passed at construction (NaN if not strict). O(1). */
+    get rangeMax() { return this._rangeMax; }
 
     /**
      * Add a value with a positive integer `count` (default 1). HOT, 0 B/op. Updates the
@@ -1048,6 +1086,63 @@ export class DDSketch {
             return this;
         }
         return this._addKey(k, count);                 // cold: first value / slide (strict already validated)
+    }
+
+    /**
+     * Add the value at `buf[i]` of a caller-owned `Float64Array` (count = 1). HOT, 0 B/op --
+     * the ZERO-BOX entry point for a FRACTIONAL hot-path value. Identical validation, throws,
+     * byte-identical-no-op-on-reject, and binning as `add(value)`; it differs ONLY in how the
+     * value crosses the call boundary: `add(fractionalDouble)` boxes its tagged argument into a
+     * ~16 B HeapNumber per call when V8 does not inline the call, whereas `addFrom(buf, i)`
+     * crosses as (object, Smi) and reads `buf[i]` as an UNBOXED double in a local. A consumer
+     * that computes a fractional value on its own hot path (e.g. a span duration `t - tOpen`)
+     * writes it into a length-1 scratch and calls `addFrom(scratch, 0)` to stay at 0 B/op.
+     * Integer-valued inputs box as Smi and cost nothing either way; the win is fractional values.
+     *
+     * Fails closed BEFORE any state write (typeof-first): a non-Float64Array `buf`, a non-integer
+     * or out-of-bounds `i`, then the same value rejects as `add` (non-number is impossible from a
+     * Float64Array read, but NaN / +-Infinity / negative / out-of-indexable / strict-out-of-range
+     * all still throw `[lite-sketch]`).
+     * @param {Float64Array} buf a caller-owned Float64Array holding the value.
+     * @param {number} i an in-bounds index into `buf`.
+     * @returns {DDSketch} this
+     */
+    addFrom(buf, i) {
+        // Validate the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
+        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
+            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        const value = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
+        // From here the body mirrors add(value, 1) exactly; count is a literal 1 (a Smi, never boxed).
+        if (value !== value || value === Infinity || value === -Infinity) return this._badValue(value);
+        if (value < 0) return this._badValue(value);
+        if (value === 0) {
+            this._count += 1;
+            if (value < this._min) this._min = value;
+            if (value > this._max) this._max = value;
+            this._zeroCount += 1;
+            return this;
+        }
+        const k = Math.ceil(Math.log(value) * this._multiplier);
+        if (k > this._maxKeyIndexable || k < this._minKeyIndexable) return this._badIndexable(value);
+        if (this._strict && (k < this._minKey || k > this._maxKeyStrict)) return this._badValue(value);
+        this._count += 1;
+        this._sum += value;
+        if (value < this._min) this._min = value;
+        if (value > this._max) this._max = value;
+        const idx = k - this._offset;
+        if (this._binCount !== 0 && idx >= 0 && idx < this._maxBins) {
+            this._bins[idx] += 1;                      // the HOT common path: one in-window increment
+            if (k > this._maxKeyPop) this._maxKeyPop = k;
+            return this;
+        }
+        return this._addKey(k, 1);                     // cold: first value / slide
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-sketch] DDSketch.addFrom(buf, i) needs a Float64Array and an in-bounds integer index, got ' +
+            String(buf) + ', ' + String(i));
     }
 
     /**

@@ -28,8 +28,8 @@ function expected(hi, lo, p) {
     return { j, rho };
 }
 
-test('VERSION is the frozen 1.0.0 string', () => {
-    assert.equal(VERSION, '1.0.0');
+test('VERSION is the frozen 1.1.0 string', () => {
+    assert.equal(VERSION, '1.1.0');
 });
 
 // --- ctor fail-closed ------------------------------------------------------
@@ -95,6 +95,33 @@ test('add typeof-guards the key: Symbol / BigInt / NaN / string / object throw',
 test('add returns this (chainable)', () => {
     const h = new HyperLogLog(8);
     assert.equal(h.add(1), h);
+});
+
+// F1/F2 (v1.1.0 hardening): the key domain is the SAFE INTEGER range. A +-Infinity would
+// hash identically to key 0 (fail-open) and a non-integer would truncate under >>> 0 and
+// collide; both now fail closed, matching CountMinSketch / SpaceSaving. Smoke coverage.
+test('F1: add rejects +-Infinity [lite-sketch] (was fail-open: Infinity aliased key 0)', () => {
+    const h = new HyperLogLog(14);
+    assert.throws(() => h.add(Infinity), liteSketch);
+    assert.throws(() => h.add(-Infinity), liteSketch);
+    // fail-closed is a byte-identical no-op: nothing was counted.
+    assert.ok(h.count() < 0.5);
+});
+
+test('F2: add rejects a non-integer / out-of-safe-range key [lite-sketch] (was truncated by >>> 0)', () => {
+    const h = new HyperLogLog(14);
+    for (const bad of [1.5, 1.9, 0.5, Math.PI, 2 ** 53, -(2 ** 53), 2 ** 60]) {
+        assert.throws(() => h.add(bad), liteSketch, 'key=' + bad);
+    }
+    // the whole SAFE-INTEGER range is still accepted (the hot body reads the high word + sign).
+    for (const ok of [0, -0, 1, -5, 2 ** 32 + 1, 2 ** 40, Number.MAX_SAFE_INTEGER, -(2 ** 40)]) {
+        assert.equal(h.add(ok), h, 'key=' + ok);
+    }
+    // 1.0, 1.5, 1.9 no longer collapse to one distinct: only the integer 1 was accepted.
+    const g = new HyperLogLog(14);
+    g.add(1.0);
+    assert.throws(() => g.add(1.5), liteSketch);
+    assert.throws(() => g.add(1.9), liteSketch);
 });
 
 test('register values stay within [0, 64 - p + 1] after a large add stream', () => {

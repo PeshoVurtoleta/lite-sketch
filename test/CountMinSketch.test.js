@@ -60,8 +60,8 @@ function makeZipf(nKeys, skew, rng) {
     };
 }
 
-test('VERSION is the frozen 1.0.0 string', () => {
-    assert.equal(VERSION, '1.0.0');
+test('VERSION is the frozen 1.1.0 string', () => {
+    assert.equal(VERSION, '1.1.0');
 });
 
 // --- ctor power-of-two round-up + getters -----------------------------------
@@ -361,6 +361,32 @@ test('add rejects a bad count [lite-sketch]: 0, -1, 1.5, 2^32, NaN', () => {
     for (const count of [0, -1, 1.5, 2 ** 32, NaN, Infinity, '1', null]) {
         assert.throws(() => c.add(1, count), liteSketch, 'count=' + String(count));
     }
+});
+
+// F1/F2 (v1.1.0 hardening): the key domain is the SAFE INTEGER range (matching HyperLogLog /
+// SpaceSaving). +-Infinity aliased key 0 (fail-open); non-integers truncated under >>> 0.
+test('F1: add rejects +-Infinity [lite-sketch] (was fail-open: Infinity aliased key 0)', () => {
+    const c = new CountMinSketch(5, 1 << 12);
+    c.add(0, 100);
+    assert.throws(() => c.add(Infinity), liteSketch);
+    assert.throws(() => c.add(-Infinity), liteSketch);
+    // fail-closed no-op: key 0's count was not perturbed by the rejected Infinity adds.
+    assert.equal(c.estimate(0), 100);
+});
+
+test('F2: add rejects a non-integer / out-of-safe-range key [lite-sketch] (was truncated by >>> 0)', () => {
+    const c = new CountMinSketch(5, 1 << 12);
+    for (const bad of [1.5, 1.9, 0.5, Math.PI, 2 ** 53, -(2 ** 53), 2 ** 60]) {
+        assert.throws(() => c.add(bad), liteSketch, 'key=' + bad);
+    }
+    // the whole SAFE-INTEGER range is still accepted (the hot body reads the high word + sign).
+    for (const ok of [0, -0, 1, -5, 2 ** 32 + 1, 2 ** 40, Number.MAX_SAFE_INTEGER, -(2 ** 40)]) {
+        assert.equal(c.add(ok), c, 'key=' + ok);
+    }
+    // add(1,50) then estimate(1.5) no longer aliases: 1.5 is not a countable key.
+    const d = new CountMinSketch(5, 1 << 12);
+    d.add(1, 50);
+    assert.throws(() => d.add(1.5), liteSketch);
 });
 
 test('add accepts count at the boundaries 1 and 0xffffffff', () => {

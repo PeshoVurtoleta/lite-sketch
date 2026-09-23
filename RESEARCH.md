@@ -287,3 +287,67 @@ commits/publishes, /release gate + card sync after -- identical to lite-o1.
 6. **Naming**: `HyperLogLog` vs `HLL`; `CountMinSketch` vs `CountMin`. Lean: full names (discoverable),
    as lite-o1 spells out `HierarchicalTimerWheel`.
 7. **Package scope / name**: `@zakkster/lite-sketch`, folder `LiteSketch`. Confirm before the GitHub wire-up.
+
+---
+
+## 12. The 2026-09-23 zero-GC audit (post-1.0, v1.0.0)
+
+Read-only adversarial audit (no repo files modified; probes in a scratchpad). Claim under test: "zero
+runtime deps, zero-GC, no allocation on any hot path, fully developed, fail closed." Plan: ROADMAP.md
+section 6 (H1, 1.0.1).
+
+### 12.1 Gate results at audit time
+- `npm test` 175 pass / 0 fail (HLL 34, CMS 43, DDSketch 42, SpaceSaving 42, Hash 10 + subtests).
+- torture: `GATE leak=size 0/0 findings=0 | gc major=0 minor=4 maxMs=0.07 | alloc=0 B/op x9 | ok`
+  (HLL add/addHashed; CMS add conservative/plain/addHashed/estimate; DD add; SS add evict/bump).
+- witness: HLL ok | CMS ok | DDSketch ok | SpaceSaving ok. Slacks (CMS_SLACK=3, DD_SLACK=1e-9, HLL
+  RMS/theory in [0.4, 1.5] + 3.5 sigma) are each disclosed and argued in-file.
+- perf: 9 pass / 0 fail; maxOldGen 0, arrayBuffer grows 0, `maxScavenges: 64` floor (see N6); the
+  mustFail control trips.
+- pack: 7 files, 49.7 kB; demo/ test/ absent. ASCII-clean, author/license correct, no stray tags.
+
+### 12.2 Allocation inventory
+- 0 B/op, measured: every torture path above + 13 audit probes -- DD slide, DD collapse, DD merge, DD
+  quantile, DD weighted add, SS weighted bump, SS weighted evict, SS forEach (hoisted callback),
+  SS estimate, SS errorOf, HLL count, HLL merge, CMS merge.
+- Allocating, DISCLOSED cold: `SpaceSaving.topK`, `SpaceSaving.heavyHitters` (arrays + result
+  objects + a sort closure), `SpaceSaving.merge`.
+- No undisclosed allocator found.
+
+### 12.3 Findings
+| ID | Sev | Finding | Evidence |
+|----|-----|---------|----------|
+| F1 | S2 | HLL/CMS `add` accept +-Infinity; it hashes identically to key 0 (fail-open). Guard is `typeof !== 'number' || key !== key` only. | `HLL.add(0); add(Infinity); count()` -> 1. `CMS.add(0,100); estimate(Infinity)` -> 101. Sketch.js:297, 605. |
+| F2 | S2 | HLL/CMS `add` truncate non-integer keys via `>>> 0`; distinct floats collide silently. | `add(1.0); add(1.5); add(1.9)` -> count 1; 10000 distinct x.5 floats -> 9955. `CMS.add(1,50); estimate(1.5)` -> 50. Sketch.js:301, 612. |
+| N1 | S3 | DDSketch exposes no `strict` flag and no indexable/range bounds; consumers must try/catch + sniff RangeError vs TypeError. | Sketch.d.ts:181-228 getters: alpha/count/sum/min/max/zeroCount/maxBins/numBins/collapsed only. |
+| N2 | S3 | SpaceSaving has no 0-alloc SORTED top-k (`forEach` is storage order; `topK` allocates). | Sketch.js:1538, 1565. |
+| N3 | S3 | No serialize/deserialize on any member. | Whole-file scan. |
+| N4 | S3 | The accuracy witness has no per-member negative control (only the perf gate has a mustFail). | test/witness.mjs. |
+| N5 | nit | DDSketch low indexable bound stated two ways: ~1e-305 (Sketch.js:863) vs ~2.2e-308 (README:141). | -- |
+| N6 | S3 | Perf gate tolerates 64 scavenges (disclosed V8 uint32-lane boxing). `measureAllocs` cannot see transient allocation (lite-hud M1 finding), so torture 0 B/op does not by itself cover that floor. | test/perf/PerfGate.test.mjs:215-226. |
+
+Fail-closed is otherwise solid: ctor door-checks (no half-built instance), merge mismatch
+(m/w/d/seed/gamma/capacity), unknown-option did-you-mean, null/undefined/Symbol/BigInt/string keys,
+bad counts, DDSketch out-of-indexable and strict-out-of-range, empty-query NaN; `-0` == `0`;
+SpaceSaving rejects Infinity and non-safe-integers.
+
+### 12.4 Consumer view (lite-hud v2.2+ injects these as optional peers)
+- M2 (DDSketch): needs N1 to drop error-class sniffing + the bisect bound probe.
+- M3 (SpaceSaving / HLL / CMS): needs N2 for a 0-alloc per-frame hot-spots panel, and F1/F2 so a
+  bad correlId/key is a throw the HUD pre-checks, not a silent collision.
+
+### 12.5 Consumer finding: fractional-argument boxing at `DDSketch.add` (from lite-hud M2, 2026-09-23)
+lite-hud's M2 review (REJECTED) measured that `DDSketch.add(value)` with a FRACTIONAL value
+allocates per call when the call site does not inline. That is the normal state of a real consumer:
+cross-module and polymorphic call sites. The box is a ~16 B V8 HeapNumber for the tagged argument; it
+is not a data-structure allocation, and lite-sketch's retained lane (measureAllocs) correctly shows
+0 B/op. Scaling lane (zgcSuite, 4 MB semi-space): it bites when the value is COMPUTED inside the
+consumer (lite-hud paired `t - tOpen`: 43 vs a 24 baseline); addFrom returns it to baseline (24).
+A value the caller already passed as a boxed argument costs nothing extra (complete/LEVEL: ON == OFF). Integer-valued doubles are Smis and read 0, and every current gate here feeds
+integer-valued or hash-lane values. So "DDSketch.add is 0 B/op" is true for the witnessed inputs, but
+not for fractional latencies, which are DDSketch's primary use. Remedy: ROADMAP.md section 6 task 7
+(N7, `addFrom(buf, i)`), plus a fractional-input scaling lane with an add(value) control. This is
+the same class of blind spot as N6: measureAllocs cannot see transient allocation.
+
+MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+

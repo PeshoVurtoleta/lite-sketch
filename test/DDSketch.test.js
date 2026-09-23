@@ -93,8 +93,8 @@ function assertWithinAlpha(measured, trueVal, alpha, label) {
         ' exceeds alpha*true=' + bound);
 }
 
-test('VERSION is the frozen 1.0.0 string', () => {
-    assert.equal(VERSION, '1.0.0');
+test('VERSION is the frozen 1.1.0 string', () => {
+    assert.equal(VERSION, '1.1.0');
 });
 
 // ===========================================================================
@@ -297,6 +297,70 @@ test('STRICT range: a range whose end is not indexable (e.g. [1, Number.MAX_VALU
     for (const range of [[1, Number.MAX_VALUE], [5e-324, 1000], [Number.MIN_VALUE, 1]]) {
         assert.throws(() => new DDSketch(0.01, { range }), liteSketch, 'range=' + JSON.stringify(range));
     }
+});
+
+// N1 (v1.1.0 hardening): O(1), 0-alloc getters so consumers stop RangeError-vs-TypeError
+// sniffing + bisect-probing the indexable bounds. Smoke coverage: values agree with add().
+test('N1: strict / minIndexable / maxIndexable / rangeMin / rangeMax getters agree with add()', () => {
+    const d = new DDSketch(0.01);
+    assert.equal(d.strict, false);
+    assert.ok(Number.isNaN(d.rangeMin) && Number.isNaN(d.rangeMax), 'non-strict range* is NaN, not 0');
+    // the exact bounds add() accepts: finite minIndexable < x <= maxIndexable.
+    assert.ok(d.minIndexable > 0 && d.minIndexable < 1e-307, 'minIndexable ~2.2e-308');
+    assert.ok(d.maxIndexable > 8e307 && Number.isFinite(d.maxIndexable), 'maxIndexable ~8.9e307');
+    assert.doesNotThrow(() => d.add(d.maxIndexable), 'maxIndexable is inclusive-accepted');
+    assert.throws(() => d.add(d.maxIndexable * 1.5), liteSketch, 'above maxIndexable (still finite) throws');
+    assert.throws(() => d.add(d.minIndexable), liteSketch, 'minIndexable is the EXCLUSIVE floor: itself rejected');
+    assert.doesNotThrow(() => d.add(d.minIndexable * 1.0001), 'just above minIndexable is accepted');
+
+    const s = new DDSketch(0.01, { range: [10, 1000] });
+    assert.equal(s.strict, true);
+    assert.equal(s.rangeMin, 10);
+    assert.equal(s.rangeMax, 1000);
+    // getters never throw and are cheap to read repeatedly.
+    assert.equal(s.minIndexable, s.minIndexable);
+    assert.equal(s.maxIndexable, s.maxIndexable);
+});
+
+test('N7: addFrom(buf, i) is exactly equivalent to add(buf[i]) (count=1) over a mixed stream', () => {
+    const viaAdd = new DDSketch(0.01);
+    const viaFrom = new DDSketch(0.01);
+    const buf = new Float64Array(1);
+    const vals = [0, 0.5, 1.5, Math.PI, 1e-100, 12345.678, 8.9e307 / 2, 1e-200];
+    for (const v of vals) {
+        viaAdd.add(v);
+        buf[0] = v;
+        viaFrom.addFrom(buf, 0);
+    }
+    assert.equal(viaFrom.count, viaAdd.count, 'same count');
+    assert.equal(viaFrom.zeroCount, viaAdd.zeroCount, 'same zeroCount');
+    assert.equal(viaFrom.sum, viaAdd.sum, 'same exact sum');
+    assert.equal(viaFrom.min, viaAdd.min, 'same exact min');
+    assert.equal(viaFrom.max, viaAdd.max, 'same exact max');
+    for (const q of [0, 0.5, 0.9, 0.99, 1]) {
+        assert.equal(viaFrom.quantile(q), viaAdd.quantile(q), 'same quantile ' + q);
+    }
+    assert.equal(viaFrom.addFrom(buf, 0), viaFrom, 'chainable');
+});
+
+test('N7: addFrom fails closed on a bad buffer / index (byte-identical no-op), and on a value add would reject', () => {
+    const d = new DDSketch(0.01);
+    const buf = new Float64Array([5, NaN, Infinity, -1]);
+    // bad handle: not a Float64Array, or a bad index
+    assert.throws(() => d.addFrom([5], 0), liteSketch, 'a plain Array is not a Float64Array');
+    assert.throws(() => d.addFrom(new Float32Array([5]), 0), liteSketch, 'a Float32Array is rejected');
+    assert.throws(() => d.addFrom(buf, -1), liteSketch, 'negative index');
+    assert.throws(() => d.addFrom(buf, 4), liteSketch, 'out-of-bounds index');
+    assert.throws(() => d.addFrom(buf, 1.5), liteSketch, 'non-integer index');
+    // bad value at buf[i]: same rejects as add(), no aggregate touched
+    const before = d.count;
+    assert.throws(() => d.addFrom(buf, 1), liteSketch, 'NaN value');
+    assert.throws(() => d.addFrom(buf, 2), liteSketch, '+Infinity value');
+    assert.throws(() => d.addFrom(buf, 3), liteSketch, 'negative value');
+    assert.equal(d.count, before, 'a rejected addFrom is a byte-identical no-op');
+    // the good slot still works after the rejects
+    assert.doesNotThrow(() => d.addFrom(buf, 0));
+    assert.equal(d.count, before + 1);
 });
 
 test('STRICT range: zero is always accepted regardless of range (routes to zeroCount, never checked)', () => {

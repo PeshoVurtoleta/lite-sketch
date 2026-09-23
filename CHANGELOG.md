@@ -8,6 +8,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.1.0] - 2026-09-23
+
+Post-1.0 hardening (H1) -- the close-out of the 2026-09-23 zero-GC audit (verdict: the
+zero-GC claim is honest; every hot and cold path measured 0 B/op). A MINOR release: it
+ADDS new backward-compatible API (the `DDSketch.addFrom` method and five DDSketch getters),
+so it is 1.1.0, not a patch. No member added and no API removed; the four-member roster is
+unchanged. It also closes two fail-closed input holes and gives the accuracy witness teeth.
+
+### Changed
+
+- **`HyperLogLog.add` / `CountMinSketch.add` now reject a NON-INTEGER or out-of-safe-range
+  key** (F2). Previously a non-integer key was truncated by `>>> 0` and distinct floats
+  collided silently (`add(1.0)`, `add(1.5)`, `add(1.9)` all counted as one). The accepted
+  domain is now every safe integer `|key| <= 2^53 - 1` -- exactly what the hot body
+  distinguishes (low word + high word + sign) -- matching `SpaceSaving` and `DDSketch`. A
+  non-integer key throws `[lite-sketch]` (typeof-first, byte-identical no-op). This is a
+  behavior change for any caller that relied on the old truncation; the hot body is unchanged.
+
+### Fixed
+
+- **`HyperLogLog.add` / `CountMinSketch.add` now reject `+-Infinity`** (F1). Previously
+  `Infinity` hashed identically to key `0` (fail-open: `add(0); add(Infinity); count()` was
+  `1`). It now throws `[lite-sketch]` on the cold branch; `Number.isInteger` covers it. Hot
+  body unchanged.
+- **DDSketch low-indexable-bound documentation reconciled** (N5) to a single interval
+  (`(~2.2e-308, ~8.9e307]` at alpha=0.01); `minIndexable` / `maxIndexable` are the exact
+  runtime answer.
+
+### Added
+
+- **`DDSketch.addFrom(buf, i)`** (N7) -- the ZERO-BOX entry point for a FRACTIONAL hot-path
+  value. Identical validation / throws / binning to `add(value)` (count = 1) but reads
+  `buf[i]` UNBOXED from a caller-owned `Float64Array`: a fractional double passed as an
+  argument to a non-inlined `add(value)` is boxed (~16 B HeapNumber/call), which `addFrom`
+  avoids. Unblocks `@zakkster/lite-hud` M2 (per-channel p99 with a 0 B/op write path).
+- **DDSketch getters `strict` / `minIndexable` / `maxIndexable` / `rangeMin` / `rangeMax`**
+  (N1), O(1) 0-alloc, never throw -- the exact bounds `add` accepts, so a consumer stops
+  sniffing `RangeError`-vs-`TypeError` and bisect-probing the bounds.
+- **Per-member negative controls in the accuracy witness** (N4): a deliberately broken
+  estimator per member (mis-sized HLL, under-counting CMS, biased-bucket DDSketch,
+  heavy-key-dropping SpaceSaving) is proven to be REJECTED -- the honesty anchor has teeth.
+- **A per-method scavenge lane in the torture gate** (N6), making the previously-disclosed
+  transient-boxing floor visible and gated per hot method, plus an `addFrom` fractional lane
+  proving it stays at the clean floor.
+
 ## [1.0.0] - 2026-09-23
 
 The four-member API is declared STABLE. No new member; this is the semver-stability

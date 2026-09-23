@@ -29,11 +29,12 @@ function pct(x) { return (x * 100).toFixed(2) + '%'; }
 function nStr(n) { return n >= 1e6 ? (n / 1e6) + 'M' : n >= 1e3 ? (n / 1e3) + 'k' : String(n); }
 
 // rmsRelErr: RMS of the relative error over TRIALS independent sketches at (p, N).
-function measure(p, N) {
+// Ctor is HyperLogLog by default; the N4 negative control passes a deliberately broken subclass.
+function measure(p, N, Ctor = HyperLogLog) {
     let sumSq = 0;
     let maxAbs = 0;
     for (let t = 0; t < TRIALS; t++) {
-        const h = new HyperLogLog(p, (SEED_BASE + t * 0x9e3779b1) >>> 0);
+        const h = new Ctor(p, (SEED_BASE + t * 0x9e3779b1) >>> 0);
         for (let i = 0; i < N; i++) h.add(i);
         const rel = (h.count() - N) / N;
         sumSq += rel * rel;
@@ -443,7 +444,85 @@ console.log('  space co-headline @ N=' + fmtInt(SS_N) + ', distinct=' + fmtInt(S
 console.log('');
 console.log('WITNESS SpaceSaving ' + (ssOk ? 'ok' : 'FAIL'));
 
-const ok2 = hllOk && cmsOk && ddOk && ssOk;
+// ===========================================================================
+// N4 -- NEGATIVE CONTROLS: the witness must have TEETH
+// ===========================================================================
+// A deliberately BROKEN estimator per member, fed to the SAME gate the real member
+// passes. Each control MUST be REJECTED -- if a broken sketch slips through, the
+// accuracy anchor is decorative. This mirrors the perf gate's `mustFail` control.
+// A control that is NOT rejected fails the witness (the gate has no teeth).
+
+// (1) HyperLogLog: a MIS-SIZED estimator -- count() is inflated 60% (way past 3.5 sigma).
+class MissizedHLL extends HyperLogLog {
+    count() { return super.count() * 1.6; }
+}
+// (2) CountMinSketch: an UNDER-COUNTING estimator -- shaves 5 off every point query,
+//     breaking the one-sided (never-underestimate) guarantee.
+class UndercountCMS extends CountMinSketch {
+    estimate(key) { const e = super.estimate(key); return e > 5 ? e - 5 : 0; }
+}
+// (3) DDSketch: a BIASED-BUCKET estimator -- every quantile is off by 10% (alpha is 1%).
+class BiasedDD extends DDSketch {
+    quantile(q) { return super.quantile(q) * 1.1; }
+}
+// (4) SpaceSaving: a HEAVY-KEY-DROPPING estimator -- silently drops rank 0 (the Zipf
+//     heaviest, always > N/k), so recall of the true top-k falls below 1.
+class DroppingSS extends SpaceSaving {
+    add(key, count = 1) { if (key === 0) return this; return super.add(key, count); }
+}
+
+console.log('');
+console.log('N4 NEGATIVE CONTROLS -- a broken estimator per member MUST be rejected (the gate has teeth):');
+
+// HLL control: same RMS/theo + 3.5-sigma gate, on the mis-sized estimator.
+const cP = 12, cN = 10000;
+const cTheo = 1.04 / Math.sqrt(1 << cP);
+const cHll = measure(cP, cN, MissizedHLL);
+const cHllRatio = cHll.rms / cTheo;
+const hllCtrlRejected = !(cHllRatio >= 0.4 && cHllRatio <= 1.5 && cHll.maxAbs <= 3.5 * cTheo);
+console.log('  HyperLogLog  mis-sized (count x1.6):     RMS/theo=' + fmt(cHllRatio) +
+    'x maxRel=' + pct(cHll.maxAbs) + ' -> ' + (hllCtrlRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+
+// CMS control: same one-sided + violation-fraction gate, on the under-counting estimator.
+const cCms = new UndercountCMS(5, 4096, { seed: 0x1234 });
+const cCmsR = measureCms(cCms, CMS_N, CMS_NKEYS, CMS_SKEW, 0xBADBAD);
+const cmsCtrlRejected = !(cCmsR.underCount === 0 && cCmsR.fraction <= CMS_SLACK * cCms.delta);
+console.log('  CountMinSketch under-counting (-5/query): underCount=' + cCmsR.underCount +
+    ' violFrac=' + pct(cCmsR.fraction) + ' -> ' + (cmsCtrlRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+
+// DD control: same hard alpha gate, on the biased-bucket estimator.
+const cRng = ddRng(0xDEAD);
+const cSample = ddDistributions[0].make(cRng);   // uniform
+const cDd = new BiasedDD(DD_ALPHA);
+const cVals = new Float64Array(DD_N);
+for (let i = 0; i < DD_N; i++) { const v = cSample(); cVals[i] = v; cDd.add(v); }
+const cSorted = Array.from(cVals).sort((a, b) => a - b);
+const cTrue = cSorted[Math.floor(0.5 * (DD_N - 1))];
+const cRelErr = Math.abs(cDd.quantile(0.5) - cTrue) / Math.abs(cTrue);
+const ddCtrlRejected = cRelErr > DD_ALPHA * (1 + DD_SLACK);
+console.log('  DDSketch     biased bucket (q x1.1):     relErr=' + pct(cRelErr) +
+    ' vs alpha=' + pct(DD_ALPHA) + ' -> ' + (ddCtrlRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+
+// SS control: same recall gate, on the heavy-key-dropping estimator.
+const cSsK = 512;
+const cSsRng = makeCmsRng(0x5A5A0000 ^ cSsK);
+const cSsZipf = makeZipf(SS_KEYS, SS_SKEW, cSsRng);
+const cSs = new DroppingSS(cSsK, { seed: 0x9e3779b1 });
+const cSsTruth = new Map();
+for (let i = 0; i < SS_N; i++) { const key = cSsZipf(); cSs.add(key); cSsTruth.set(key, (cSsTruth.get(key) || 0) + 1); }
+const cSsThresh = SS_N / cSsK;
+let cSsHH = 0, cSsFound = 0;
+for (const [key, c] of cSsTruth) { if (c > cSsThresh) { cSsHH++; if (cSs.estimate(key) > 0) cSsFound++; } }
+const cSsRecall = cSsHH === 0 ? 1 : cSsFound / cSsHH;
+const ssCtrlRejected = cSsRecall < 1;
+console.log('  SpaceSaving  heavy-key-dropping (rank 0): recall=' + pct(cSsRecall) +
+    ' (' + cSsFound + '/' + cSsHH + ' hitters) -> ' + (ssCtrlRejected ? 'REJECTED (ok)' : 'NOT rejected (FAIL)'));
+
+const controlsOk = hllCtrlRejected && cmsCtrlRejected && ddCtrlRejected && ssCtrlRejected;
+console.log('');
+console.log('WITNESS N4 negative controls (all rejected) ' + (controlsOk ? 'ok' : 'FAIL'));
+
+const ok2 = hllOk && cmsOk && ddOk && ssOk && controlsOk;
 console.log('');
 console.log('WITNESS lite-sketch (all members) ' + (ok2 ? 'ok' : 'FAIL'));
 if (!ok2) process.exitCode = 1;

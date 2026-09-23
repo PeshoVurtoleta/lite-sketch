@@ -1,6 +1,6 @@
 # @zakkster/lite-sketch
 
-Version: 1.0.0
+Version: 1.1.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,11 +14,14 @@ It is the approximate-aggregate corner of the suite -- @zakkster/lite-filter is
 approximate MEMBERSHIP, @zakkster/lite-o1 is EXACT O(1), and lite-sketch is
 APPROXIMATE aggregates (count / frequency / quantile / top-k).
 
-v1.0.0 freezes a STABLE FOUR-member API -- the complete roster: HyperLogLog (distinct-count /
+v1.1.0 ships the STABLE FOUR-member API -- the complete roster: HyperLogLog (distinct-count /
 cardinality), CountMinSketch (point-query frequency), and SpaceSaving (heavy hitters
 / top-k) over the shipped, avalanche-tested two-lane 64-bit hash, plus DDSketch
 (relative-error quantiles), which bins raw values on a log scale and does NOT use the
-hash. 1.0.0 adds no new member; it declares this four-member surface stable (semver).
+hash. 1.0.0 froze this four-member surface stable (semver). 1.1.0 is post-1.0 hardening:
+ADDITIVE new API -- DDSketch's `addFrom(buf, i)` zero-box entry point + the
+strict/minIndexable/maxIndexable/rangeMin/rangeMax getters -- plus fail-closed fixes
+(HLL/CMS reject non-integer / +-Infinity keys). No API removed; backward compatible.
 Members share no mutable module state, so a bundler that imports one drops the others
 (tree-shakeable). One member per question: distinct-count, frequency, quantiles, top-k.
 
@@ -68,7 +71,7 @@ Members share no mutable module state, so a bundler that imports one drops the o
   keeps the top-k. `SpaceSaving.withError(epsilon)` sizes k = ceil(1/epsilon). There is deliberately
   NO addHashed (it stores key identities, so there is no honest pre-hashed path). Fail closed on a
   bad ctor arg / key / count (typeof-first, byte-identical no-op); queries never throw.
-- `VERSION` -- string, '1.0.0'.
+- `VERSION` -- string, '1.1.0'.
 
 (The canonical hash is used internally by HyperLogLog / CountMinSketch `add`; a caller who
 brings their own good hash uses `addHashed(hi, lo)`. DDSketch bins raw values -- no hash.
@@ -88,10 +91,14 @@ ADR 0001 records the hash.)
 
 Hot surface (add / addHashed are worst-case O(1), zero allocation):
 
-- add(key) -> this          Hash a NUMERIC key over the two-lane mix and record its
-                            register (running max of rho). Fail closed: a non-number
-                            / NaN / Symbol / BigInt key throws [lite-sketch]
-                            (typeof-first, byte-identical no-op).
+- add(key) -> this          Hash a SAFE-INTEGER key (|key| <= 2^53 - 1) over the two-lane
+                            mix and record its register (running max of rho). The hot body
+                            distinguishes low word + high word + sign, so the whole safe-integer
+                            range is accepted (matching CountMinSketch / SpaceSaving). Fail
+                            closed: a non-number / NaN / Symbol / BigInt / +-Infinity /
+                            non-integer / out-of-safe-range key throws [lite-sketch]
+                            (typeof-first, byte-identical no-op) -- a non-integer or Infinity
+                            would truncate/alias under >>> 0.
 - addHashed(hi, lo) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
                             hashed with their own good hash; skips the internal mix.
                             Both lanes typeof-guarded as uint32.
@@ -134,11 +141,15 @@ fixed m bytes (the space co-headline). Uniformity is STATISTICAL, not cryptograp
 
 Hot surface (add / addHashed / estimate are worst-case O(d), zero allocation):
 
-- add(key, count = 1) -> this     Hash a NUMERIC key + increment one cell per row (the
-                                  min-query answer is a one-sided over-estimate). count is a
-                                  positive integer in [1, 2^32-1]; counters SATURATE at
-                                  2^32-1 (never wrap). Fail closed: a non-number / NaN key or
-                                  out-of-range count throws [lite-sketch] (typeof-first).
+- add(key, count = 1) -> this     Hash a SAFE-INTEGER key (|key| <= 2^53 - 1) + increment one
+                                  cell per row (the min-query answer is a one-sided over-estimate).
+                                  The hot body distinguishes low word + high word + sign, so the
+                                  whole safe-integer range is accepted (matching HyperLogLog /
+                                  SpaceSaving). count is a positive integer in [1, 2^32-1];
+                                  counters SATURATE at 2^32-1 (never wrap). Fail closed: a
+                                  non-number / NaN / +-Infinity / non-integer / out-of-safe-range
+                                  key or out-of-range count throws [lite-sketch] (typeof-first) --
+                                  a non-integer or Infinity would truncate/alias under >>> 0.
 - addHashed(hi, lo, count = 1) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
                                   hashed; skips the internal mix. Both lanes typeof-guarded uint32.
 - estimate(key) -> number         The estimated frequency: the MIN of the key's d cells. QUERY,
@@ -183,8 +194,9 @@ under); the guarantee is probabilistic (delta), the hashing statistical not cryp
     with x>0 whose key is outside the range THROWS [lite-sketch] (never collapsed). Requires 0 < min < max.
 - DOMAIN = positive + zero: x>0 is bucketed, x===0 increments a separate zero counter, x<0 THROWS
   [lite-sketch] (no negative mirror; deferred). Values outside the indexable double range (roughly
-  [~2.2e-308, ~8.6e307] at alpha=0.01; the window widens as alpha grows) THROW fail-closed so the
-  bucket representative can never overflow to Infinity or underflow to 0.
+  (~2.2e-308, ~8.9e307] at alpha=0.01, low end EXCLUSIVE; the window widens as alpha grows) THROW
+  fail-closed so the bucket representative can never overflow to Infinity or underflow to 0. The
+  EXACT runtime bounds are the minIndexable / maxIndexable getters.
 - Constructor throws [lite-sketch] typeof-first on a bad alpha / maxBins / range BEFORE allocation.
 
 Hot surface (add is worst-case O(1), zero allocation):
@@ -194,6 +206,14 @@ Hot surface (add is worst-case O(1), zero allocation):
                                   +-Infinity / negative / out-of-indexable-range value or a bad count
                                   throws [lite-sketch] (typeof-first, BYTE-IDENTICAL no-op -- no
                                   aggregate is touched on a rejected add).
+- addFrom(buf, i) -> this          Add buf[i] (count = 1), the ZERO-BOX entry point for a FRACTIONAL
+                                  hot-path value: add(fractionalDouble) boxes its tagged argument (~16 B
+                                  HeapNumber/call) when V8 does not inline the call; addFrom reads buf[i]
+                                  from a caller-owned Float64Array UNBOXED, so a fractional value stays
+                                  0 B/op. Same validation / throws / binning as add. Fail closed on a
+                                  non-Float64Array buf, an out-of-bounds / non-integer i, or a value add
+                                  would reject. Use it for a computed fractional value (e.g. a span
+                                  duration): write it into a length-1 scratch, then addFrom(scratch, 0).
 - quantile(q) -> number           The q-quantile (q in [0,1]) within alpha relative error. COLD,
                                   O(bins) cumulative walk; rank = floor(q*(count-1)); returns the
                                   bucket representative (or 0 if the rank falls in the zero bucket).
@@ -209,6 +229,11 @@ Hot surface (add is worst-case O(1), zero allocation):
                                   (populated) bin count.
 - collapsed (getter)              Whether any smallest-value collapse has occurred (the small-value
                                   guarantee was touched).
+- strict (getter)                 Whether this is a STRICT fixed-range sketch (a range was given).
+- minIndexable / maxIndexable     Getters: the EXACT x bounds add() accepts at this alpha -- add
+                                  accepts finite minIndexable < x <= maxIndexable (plus exact 0).
+                                  minIndexable is the exclusive low floor (~2.2e-308 at alpha=0.01).
+- rangeMin / rangeMax             Getters: STRICT mode -- the configured range ends (NaN if not strict).
 
 Accuracy contract (the honesty anchor -- the family's sharpest): the guarantee is a HARD PER-QUERY
 relative-error bound |v_returned - v_true| <= alpha * v_true, not a statistical (HLL) or additive (CMS)

@@ -63,7 +63,7 @@ import { HyperLogLog } from '@zakkster/lite-sketch';
 
 const a = new HyperLogLog(12);            // ~4 KB, ~1.6% std error
 const b = new HyperLogLog(12);
-for (const u of mondayUsers) a.add(u);    // numeric keys; pre-hash strings or use addHashed
+for (const u of mondayUsers) a.add(u);    // safe-integer keys; pre-hash strings or use addHashed
 for (const u of tuesdayUsers) b.add(u);
 
 a.merge(b);                               // register-wise max -- union of the two days, equal-m-or-throw
@@ -88,7 +88,7 @@ import { CountMinSketch } from '@zakkster/lite-sketch';
 // Size it to a target accuracy: within 0.1% of N, 99% of the time.
 const cms = CountMinSketch.withAccuracy(0.001, 0.01);   // -> d=5 rows, w=4096 cols (~80 KB)
 
-for (const ev of events) cms.add(ev.userId);            // numeric keys; 0 bytes/op
+for (const ev of events) cms.add(ev.userId);            // safe-integer keys; 0 bytes/op
 cms.estimate(someUser);                                 // >= the true count, over by <= epsilon*N w.p. 1-delta
 cms.epsilon;  // 0.00066  (e / w -- the achieved additive-error fraction)
 cms.total;    // N -- the exact number of adds
@@ -138,7 +138,7 @@ merged.quantile(0.99);                     // global p99 across every shard, wit
 <details>
 <summary><b>Why relative-error bucketing beats rank-error sketches for tails (deep dive)</b></summary>
 
-Rank-error quantile sketches (t-digest, GK) promise the returned value is near the value at rank `q +/- epsilon` -- but at the tail, a tiny rank error can be a huge *value* error, exactly where latencies matter most. DDSketch instead fixes the *relative value* error: bucket `i` covers `(gamma^(i-1), gamma^i]`, so the representative `2 * gamma^i / (gamma + 1)` is within `alpha` of every value in the bucket, at *every* quantile equally. The bins are a dense `Float64Array` (counts exact to 2^53 -- no saturation, because a quantile needs an exact cumulative count), allocated once at `maxBins` and never re-grown: "extending" the window and "collapsing the lowest buckets" both shift counts *within* the fixed array, so `add` stays 0 bytes/op. `count` and `sum` are exact; `min` and `max` are tracked exactly (not read from a bucket). Values outside the representable double range (roughly `[~2.2e-308, ~8.6e307]` at `alpha=0.01`) are rejected fail-closed so a bucket representative can never overflow to `Infinity`. The accuracy witness gates the measured relative error against `alpha` at p50/p90/p99/p999 on uniform, lognormal, and pareto streams on every release.
+Rank-error quantile sketches (t-digest, GK) promise the returned value is near the value at rank `q +/- epsilon` -- but at the tail, a tiny rank error can be a huge *value* error, exactly where latencies matter most. DDSketch instead fixes the *relative value* error: bucket `i` covers `(gamma^(i-1), gamma^i]`, so the representative `2 * gamma^i / (gamma + 1)` is within `alpha` of every value in the bucket, at *every* quantile equally. The bins are a dense `Float64Array` (counts exact to 2^53 -- no saturation, because a quantile needs an exact cumulative count), allocated once at `maxBins` and never re-grown: "extending" the window and "collapsing the lowest buckets" both shift counts *within* the fixed array, so `add` stays 0 bytes/op. `count` and `sum` are exact; `min` and `max` are tracked exactly (not read from a bucket). Values outside the representable double range (roughly `(~2.2e-308, ~8.9e307]` at `alpha=0.01`, the low end exclusive; the exact runtime bounds are the `minIndexable` / `maxIndexable` getters) are rejected fail-closed so a bucket representative can never overflow to `Infinity`. The accuracy witness gates the measured relative error against `alpha` at p50/p90/p99/p999 on uniform, lognormal, and pareto streams on every release.
 </details>
 
 ## SpaceSaving
@@ -176,7 +176,7 @@ An unmonitored key can only ever have been seen fewer times than the current min
 ```js
 new HyperLogLog(p = 14, seed?)   // p in [4, 18]; m = 2^p registers. Throws [lite-sketch] on a bad p BEFORE allocating.
 
-hll.add(key) -> this             // HOT, O(1), 0 B/op. Hash a numeric key + record its register. Throws on a non-number key.
+hll.add(key) -> this             // HOT, O(1), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + record its register. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key.
 hll.addHashed(hi, lo) -> this    // HOT, O(1), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
 hll.count() -> number            // COLD, O(m). Estimated distinct count (Ertl's improved estimator -- table-free, full-range).
 hll.merge(other) -> this         // Register-wise max into this. Throws [lite-sketch] on a non-HLL or unequal m OR seed.
@@ -201,7 +201,7 @@ new CountMinSketch(d, w, options?)                     // d in [1,32]; w rounds 
 CountMinSketch.withAccuracy(epsilon, delta, options?)  // w = ceil(e/epsilon) (pow2), d = ceil(ln 1/delta). epsilon, delta in (0,1).
 // options: { seed?, conservative = true }             // an unknown option key throws [lite-sketch] with a did-you-mean hint.
 
-cms.add(key, count = 1) -> this          // HOT, O(d), 0 B/op. Increment the d cells (conservative or plain). Throws on a bad key/count.
+cms.add(key, count = 1) -> this          // HOT, O(d), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + increment the d cells. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key or bad count.
 cms.addHashed(hi, lo, count = 1) -> this // HOT, O(d), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
 cms.estimate(key) -> number              // HOT, O(d), 0 B/op. The min of the d cells (one-sided over-estimate). NEVER throws (bad key -> 0).
 cms.estimateHashed(hi, lo) -> number     // HOT, O(d), 0 B/op. Query form of the pre-hashed path (bad lane -> 0).
@@ -229,6 +229,9 @@ new DDSketch(alpha, options?)            // alpha in (0,1) = relative accuracy. 
 
 dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite value (x=0 -> zero counter). Throws on x<0, non-finite,
                                          //   out-of-indexable-range, or a bad count -- a byte-identical no-op.
+dd.addFrom(buf, i) -> this               // HOT, O(1), 0 B/op. Add buf[i] (count=1) read UNBOXED from a Float64Array -- the zero-box entry
+                                         //   point for a FRACTIONAL value (add(fractionalDouble) boxes its argument ~16 B/call when not inlined).
+                                         //   Same validation as add; throws on a bad buf / index or a value add would reject.
 dd.quantile(q) -> number                 // COLD, O(bins). The q-quantile (q in [0,1]) within alpha relative error. NEVER throws (empty/bad q -> NaN).
 dd.merge(other) -> this                  // Fold other in (collapsing as needed). Throws [lite-sketch] on a non-DDSketch or unequal alpha.
 dd.clear() -> this                       // Zero the bins + all scalars; reuse the allocation.
@@ -240,6 +243,9 @@ dd.zeroCount -> number                   // exact count of zero values (getter)
 dd.maxBins -> number                     // the bin capacity (getter)
 dd.numBins -> number                     // the live (populated) bin count (getter)
 dd.collapsed -> boolean                  // whether any smallest-value collapse has happened (getter)
+dd.strict -> boolean                     // whether this is a STRICT fixed-range sketch (a range was given) (getter)
+dd.minIndexable / dd.maxIndexable        // the EXACT x bounds add() accepts: finite minIndexable < x <= maxIndexable (plus 0). ~2.2e-308 / ~8.9e307 at alpha=0.01 (getters)
+dd.rangeMin / dd.rangeMax                // STRICT mode: the configured range ends (NaN if not strict) (getters)
 ```
 
 | alpha | gamma = (1+a)/(1-a) | guarantee                 | memory (maxBins=2048) |
@@ -267,7 +273,7 @@ ss.epsilon -> number                     // 1 / capacity -- the theoretical erro
 ss.seed -> number                        // the uint32 hash seed (getter)
 // NOTE: SpaceSaving has NO addHashed -- it stores key identities, so there is no pre-hashed fast path.
 
-VERSION -> string                        // '1.0.0'
+VERSION -> string                        // '1.1.0'
 ```
 
 | capacity k | guaranteed to report | over-count bound | memory        |
@@ -329,9 +335,9 @@ SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the e
 - **Collapsing-lowest protects the tail (DDSketch).** When memory is tight the smallest-value buckets collapse, never the largest -- because p99, not p1, is what you page on. The degradation is disclosed (the smallest values may exceed `alpha`); strict fixed-range mode trades the unbounded range for a hard fail-closed door instead.
 - **Eviction is the algorithm, not a failure (SpaceSaving).** Unlike the fixed-capacity structures in `@zakkster/lite-o1`, SpaceSaving never throws at capacity -- it evicts the minimum, and that eviction is exactly what yields the no-false-negatives guarantee. It reports a *superset* (every true hitter, maybe a few extra) because that is the honest shape of the guarantee; the exact-subset filter is one subtraction away.
 - **Conservative update by default (CountMinSketch).** It cannot change the min-query answer, only tighten it, so it is a free accuracy win on skewed streams -- the default. The one cost is that it is not linearly mergeable, so plain mode stays available for exact map/reduce (an explicit `{ conservative: false }`).
-- **Numeric-key core.** `add` hashes a number; strings/objects are the caller's to hash (or use `addHashed` with two lanes). The zero-GC law forbids retaining references.
+- **Safe-integer key domain (fail closed on collisions).** `add` hashes a *safe integer* (`|key| <= 2^53 - 1`); strings/objects are the caller's to hash (or use `addHashed` with two lanes). The zero-GC law forbids retaining references. The hot body distinguishes the full magnitude -- the low 32-bit word, the high word, and the sign -- so the entire safe-integer range is accepted with no silent aliasing; every member (HyperLogLog, CountMinSketch, SpaceSaving) shares this domain. A non-integer, a `+-Infinity`, or an out-of-safe-range key would truncate or alias under the `>>> 0` step, so all three fail closed with a `[lite-sketch]` throw (a byte-identical no-op on the cold branch) rather than silently colliding.
 - **Dense registers only.** A sparse representation is more accurate at tiny cardinality but allocates; it is deferred. The dense `Uint8Array` is the zero-GC reference.
-- **Fail closed.** A bad `p` throws `[lite-sketch]` before the register array is allocated; `add` rejects a non-number key; queries never throw. Null is not zero.
+- **Fail closed.** A bad `p` throws `[lite-sketch]` before the register array is allocated; `add` rejects a non-number / `+-Infinity` / non-integer / out-of-safe-range key; queries never throw. Null is not zero.
 - **Distinct classes, not one surface.** Sketches answer different questions (count vs frequency vs quantile vs top-k), so each ships as its own class over a shared hash + witness harness.
 
 ## Testing

@@ -278,6 +278,84 @@ async function main() {
     const abDelta = abAfter - abBefore;
     const abOk = abDelta <= 0;
 
+    // ---- phase 2d: per-method SCAVENGE lane (N6) --------------------------------
+    // measureAllocs (phase 2a) reports net bytes/op and CANNOT see TRANSIENT young-gen
+    // churn (the lite-hud M1 finding); the perf gate discloses a maxScavenges floor as a
+    // V8 uint32-lane-boxing artifact. This lane makes that floor VISIBLE and GATED per
+    // method: force a full GC, then count minor GCs (scavenges) over a hot loop.
+    //
+    // Result (isolated + written reasons, measured stable over SCAV_HOT=2e6):
+    //   * The SIX int32-clean lanes -- CMS add cons/plain, CMS estimate, DD add, SS evict,
+    //     SS bump -- are driven to EXACTLY 0 scavenges: their hot bodies keep every hash
+    //     word an int32 SMI (base = (h ^ g) | 0), so nothing boxes.
+    //   * THREE lanes carry a small, pinned floor from a uint32 >= 2^31 boxed double:
+    //       - HyperLogLog add / addHashed: the register-suffix `hiSuf = (h << p) >>> 0` is a
+    //         uint32 local that is >= 2^31 about half the time -> a transient HeapNumber that
+    //         nets to 0 B/op (phase 2a) and never reaches old gen. This is IN the byte-identical
+    //         hot body (widening it would be a feature), so the floor is pinned, not removed.
+    //       - CountMinSketch addHashed: the caller passes uint32 lanes (hi/lo >= 2^31) as args,
+    //         boxed at the call boundary -- the disclosed caller-side artifact.
+    //     Floor 48 is ~3x the measured ~15 (HLL) / ~7 (CMS addHashed) over 2e6, well under the
+    //     perf gate's disclosed 64, and astronomically under a real per-op allocator (the
+    //     perf gate's mustFail control shows thousands). A regression trips this immediately.
+    const SCAV_HOT = 2000000;
+    const SCAV_CLEAN = 0;    // int32-clean lanes: exactly 0 (transient churn isolated away)
+    const SCAV_BOX = 48;     // uint32 >= 2^31 boxed-double lanes: pinned floor (see above)
+    async function scavLane(step) {
+        for (let i = 0; i < 50000; i++) step();       // JIT warm
+        globalThis.gc(); await sleep(30);
+        const g2 = new GcProfiler().start();
+        for (let i = 0; i < SCAV_HOT; i++) step();
+        await sleep(50);
+        const s2 = g2.summary(); g2.stop();
+        return s2.gc.minor | 0;
+    }
+    const scAdd = await scavLane(addStep);
+    const scAh = await scavLane(ahStep);
+    const scCc = await scavLane(ccStep);
+    const scCp = await scavLane(cpStep);
+    const scCh = await scavLane(chStep);
+    const scCe = await scavLane(ceStep);
+    const scDd = await scavLane(ddStep);
+    const scSsE = await scavLane(ssEStep);
+    const scSsB = await scavLane(ssBStep);
+
+    // ---- N7: FRACTIONAL-input lane -- DDSketch.addFrom(buf, i) vs add(value) ------
+    // WHY addFrom exists: a FRACTIONAL double passed as an ARGUMENT to add(value) is boxed
+    // (~16 B HeapNumber) at a NON-INLINED call boundary; addFrom reads it UNBOXED from a
+    // Float64Array. This lane feeds genuinely fractional values (v + 0.5) and GATES that
+    // addFrom stays at the clean floor (0). It also prints add(value) for visibility.
+    // HONEST LIMIT: in this ISOLATED tight loop V8 INLINES dd.add(x), so the argument box
+    // does NOT reproduce here (measured add=~0..1, addFrom=0) -- the box only manifests at a
+    // real non-inlined CONSUMER boundary (the lite-hud M2 review measured add=43 vs a 24
+    // baseline, addFrom=24). So the "add(value) MUST show the box" teeth-control lives in
+    // lite-hud M2's gate (its real write() boundary), per LiteHud/ROADMAP section 6.1; here we
+    // gate only the delta-0 half we can honestly reproduce: addFrom on fractional input = 0.
+    const ddFrac = new DDSketch(0.01);
+    for (let k = 1; k <= 100000; k++) ddFrac.add(k);   // warm the window
+    const ddFracBuf = new Float64Array(1);
+    let ddFracV = 0, ddFracSink = 0;
+    const ddFracFromStep = () => {
+        ddFracV++; if (ddFracV > 99999) ddFracV = 1;
+        ddFracBuf[0] = ddFracV + 0.5;                  // a genuine fractional double
+        ddFrac.addFrom(ddFracBuf, 0);
+        ddFracSink = (ddFracSink + ddFrac._maxKeyPop) | 0;
+    };
+    const ddFracAddStep = () => {
+        ddFracV++; if (ddFracV > 99999) ddFracV = 1;
+        ddFrac.add(ddFracV + 0.5);                     // same fractional value, as an argument
+        ddFracSink = (ddFracSink + ddFrac._maxKeyPop) | 0;
+    };
+    const scDdFrom = await scavLane(ddFracFromStep);
+    const scDdAdd = await scavLane(ddFracAddStep);
+    SINK = (SINK + ddFracSink) | 0;
+
+    const scavOk =
+        scAdd <= SCAV_BOX && scAh <= SCAV_BOX && scCh <= SCAV_BOX &&
+        scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&
+        scDd <= SCAV_CLEAN && scSsE <= SCAV_CLEAN && scSsB <= SCAV_CLEAN &&
+        scDdFrom <= SCAV_CLEAN;   // N7: addFrom on FRACTIONAL input stays at the clean floor (the delta-0 proof)
+
     // ---- verdict + GATE line ----
     const cmsAllocOk = ccOk && cpOk && chOk && ceOk;
     const ssAllocOk = ssEOk && ssBOk;
@@ -285,7 +363,7 @@ async function main() {
         cmsTrackedOk && cmsLive === 0 && cmsFindings.length === 0 &&
         ddTrackedOk && ddLive === 0 && ddFindings.length === 0 &&
         ssTrackedOk && ssLive === 0 && ssFindings.length === 0 &&
-        addOk && ahOk && cmsAllocOk && ddOk && ssAllocOk && report.ok && abOk;
+        addOk && ahOk && cmsAllocOk && ddOk && ssAllocOk && report.ok && abOk && scavOk;
     const gateLive = live + cmsLive + ddLive + ssLive;
     const gateFindings = findings.length + cmsFindings.length + ddFindings.length + ssFindings.length;
     console.log(
@@ -299,6 +377,16 @@ async function main() {
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + '/' + cmsTrackedMid + '/' + ddTrackedMid + '/' + ssTrackedMid +
         ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
+    console.log(
+        'SCAV/2e6 (minor GCs per hot method; clean floor=' + SCAV_CLEAN + ' box floor=' + SCAV_BOX + '): ' +
+        'HLL add=' + scAdd + ' HLL addHashed=' + scAh + ' | ' +
+        'CMS add cons=' + scCc + ' plain=' + scCp + ' addHashed=' + scCh + ' estimate=' + scCe + ' | ' +
+        'DD add=' + scDd + ' | SS evict=' + scSsE + ' bump=' + scSsB +
+        ' | ' + (scavOk ? 'ok' : 'FAIL'));
+    console.log(
+        'N7 DDSketch fractional lane (add(value) boxes at a non-inlined boundary; addFrom reads unboxed): ' +
+        'addFrom=' + scDdFrom + ' (gated <=' + SCAV_CLEAN + ') add(value)=' + scDdAdd +
+        ' (isolated -- V8 inlines it; the box teeth-control is lite-hud M2\'s at its real write() boundary)');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: HLL tracker held ' + trackedMid + ' (expected > 0)');
@@ -324,6 +412,9 @@ async function main() {
         if (!ssBOk) console.error('  alloc ' + ssBBytes + ' B/op SpaceSaving add bump (raw ' + ssBBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
+        if (!scavOk) console.error('  scavenge floor exceeded (clean<=' + SCAV_CLEAN + ' box<=' + SCAV_BOX +
+            '): HLL add=' + scAdd + ' addHashed=' + scAh + ' CMS cons=' + scCc + ' plain=' + scCp +
+            ' addHashed=' + scCh + ' estimate=' + scCe + ' DD=' + scDd + ' SS evict=' + scSsE + ' bump=' + scSsB);
         process.exitCode = 1;
     }
 }
