@@ -174,9 +174,10 @@
         .truth .primary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); }
         .truth .secondary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); }
         .truth canvas { width: 100%; display: block; background: var(--bg-0); border: 1px solid var(--line); }
-        #hll-jank-canvas { height: 46px; }
-        #hll-witness-canvas { height: 62px; }
-        #hll-space-canvas { height: 52px; }
+        #hll-jank-canvas, #cms-jank-canvas, #dd-jank-canvas, #ss-jank-canvas { height: 46px; }
+        #hll-witness-canvas, #cms-witness-canvas, #ss-witness-canvas { height: 62px; }
+        #dd-witness-canvas { height: 78px; }
+        #hll-space-canvas, #cms-space-canvas, #dd-space-canvas, #ss-space-canvas { height: 52px; }
         .jank-caption { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
         .alloc-pair { display: flex; gap: 18px; }
         .alloc-cell { flex: 1; }
@@ -370,44 +371,331 @@
             </aside>
         </section>
 
-        <!-- SCENE 02: COUNTMINSKETCH (stub) -->
+        <!-- SCENE 02: COUNTMINSKETCH -->
         <section class="scene" data-scene="cms">
-            <div class="placeholder">
-                <span class="ph-badge">scene 02 - coming next</span>
-                <h2>CountMinSketch - how many times key x?</h2>
-                <p class="ph-members">
-                    A Zipfian key stream feeds a d x w Uint32 counter matrix (heat grid) beside an
-                    exact <code>Map</code> oracle; the one-sided over-estimate gap stays under
-                    eps*N, and conservative update tightens it. Built in a follow-up on this same
-                    zero-GC chassis.
-                </p>
+            <div class="stage" id="cms-stage">
+                <canvas id="cms-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">CountMinSketch d x w counter matrix (live library instance)</span>
+                </div>
+                <div class="stage-overlay tr">
+                    <span class="label">est f_hat(key <b id="cms-qkey-big">0</b>)</span><br>
+                    <span class="big" id="cms-est-big">0</span>
+                </div>
             </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 02 - countminsketch (how many times key x?)</div>
+
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="cms-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact Map: <b id="cms-mode-label">running (allocates)</b></span>
+                    </div>
+                    <p class="help-line">
+                        Each <code>add(key)</code> lights ONE cell per row; the cycled query key
+                        lights the <code>d</code> probed cells and marks the <code>MIN-of-d</code> --
+                        the returned one-sided over-estimate. The exact <code>Map</code> grows one
+                        entry per distinct key; the matrix is a FIXED <code>d*w*4</code> bytes.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="cms-pause">pause</button>
+                    </div>
+                    <div class="toggle-row" style="margin-top: 12px;">
+                        <div class="toggle" id="cms-cons-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">update: <b id="cms-cons-label">conservative</b></span>
+                    </div>
+                    <p class="help-line">
+                        <code>conservative</code> update (Estan-Varghese) raises the d cells only to
+                        <code>min + count</code> -- it tightens the over-estimate gap on this skewed
+                        Zipfian stream. Toggle to <code>plain</code> to watch the gap widen (plain is
+                        the linearly-mergeable mode).
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>depth d (rows / hashes) <span class="field-value" id="cms-d-v">4</span></label>
+                        <input type="range" id="cms-d" min="2" max="8" step="1" value="4">
+                    </div>
+                    <div class="field">
+                        <label>width w (cols, 2^n) <span class="field-value" id="cms-w-v">256</span></label>
+                        <input type="range" id="cms-w" min="6" max="10" step="1" value="8">
+                    </div>
+                    <p class="help-line">
+                        A topology change rebuilds both matrices + refills the stream OFF the frame
+                        loop. Matrix memory is a FIXED <span class="field-value" id="cms-mem">4.0 KB</span>;
+                        <code>eps = e/w</code> shrinks as w grows.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="cms-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell">
+                                    <div class="alloc-big zero" id="cms-alloc-sketch">0</div>
+                                    <div class="alloc-sub">sketch path</div>
+                                </div>
+                                <div class="alloc-cell">
+                                    <div class="alloc-big climbing" id="cms-alloc-oracle">0</div>
+                                    <div class="alloc-sub">exact Map path</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - gap vs one-sided eps*N ceiling</div>
+                            <canvas id="cms-witness-canvas"></canvas>
+                            <div class="jank-caption">teal = true count; magenta = the over-estimate gap; the tick is the eps*N ceiling -- the gap must never pass it</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - space: matrix fixed vs Map O(distinct)</div>
+                            <canvas id="cms-space-canvas"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">estimate f_hat</span><span class="v accent" id="cms-est">0</span></div>
+                            <div class="stat-row"><span class="k">true count (Map)</span><span class="v" id="cms-true">0</span></div>
+                            <div class="stat-row"><span class="k">over-estimate gap</span><span class="v" id="cms-gap">0</span></div>
+                            <div class="stat-row"><span class="k">eps*N ceiling</span><span class="v" id="cms-bound">0</span></div>
+                            <div class="stat-row"><span class="k">gap / eps*N</span><span class="v inband" id="cms-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">epsilon (e/w)</span><span class="v" id="cms-eps">0.00%</span></div>
+                            <div class="stat-row"><span class="k">total N</span><span class="v" id="cms-n">0</span></div>
+                            <div class="stat-row"><span class="k">matrix bytes (fixed)</span><span class="v accent" id="cms-sketch-kb">4.0 KB</span></div>
+                            <div class="stat-row"><span class="k">Map bytes (climbing)</span><span class="v" id="cms-map-kb">0.0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="cms-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="cms-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
         </section>
 
-        <!-- SCENE 03: DDSKETCH (stub) -->
+        <!-- SCENE 03: DDSKETCH -->
         <section class="scene" data-scene="dd">
-            <div class="placeholder">
-                <span class="ph-badge">scene 03 - coming next</span>
-                <h2>DDSketch - p50 / p90 / p99?</h2>
-                <p class="ph-members">
-                    A latency stream fills log-scale bins (a live histogram); p50 / p90 / p99 markers
-                    track an exact sorted-array oracle within the HARD alpha bound, and the
-                    collapsing-lowest event animates when the bins fill. Built in a follow-up.
-                </p>
+            <div class="stage" id="dd-stage">
+                <canvas id="dd-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">DDSketch log-scale bins (live library instance) -- p99 is the headline</span>
+                </div>
+                <div class="stage-overlay tr">
+                    <span class="label">p99 latency</span><br>
+                    <span class="big" id="dd-p99-big">0</span>
+                </div>
             </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 03 - ddsketch (p50 / p90 / p99?)</div>
+
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="dd-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact sorted array: <b id="dd-mode-label">running (allocates)</b></span>
+                    </div>
+                    <p class="help-line">
+                        Each <code>add(value)</code> increments ONE log-scale bin. The exact oracle is
+                        a sorted <code>Float64Array</code> <b>capped at N=100000</b> to keep the tab
+                        alive -- the sketch would keep going in the SAME fixed memory. min/max stay
+                        EXACT; only the quantiles are alpha-approximate.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="dd-pause">pause</button>
+                    </div>
+                    <p class="help-line">
+                        When the bins fill, the SMALLEST values collapse into the floor bin
+                        (<code>collapsed = <b id="dd-collapsed">false</b></code>) -- the high tail
+                        (p90 / p99) stays alpha-accurate; only the smallest values degrade.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>alpha (relative accuracy) <span class="field-value" id="dd-alpha-v">0.020</span></label>
+                        <input type="range" id="dd-alpha" min="5" max="80" step="5" value="20">
+                    </div>
+                    <p class="help-line">
+                        alpha drives <code>gamma = (1+a)/(1-a)</code>, the bin count, the memory, and
+                        the HARD error band. Sketch memory is a FIXED
+                        <span class="field-value" id="dd-mem">16.0 KB</span> whatever N is.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="dd-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell">
+                                    <div class="alloc-big zero" id="dd-alloc-sketch">0</div>
+                                    <div class="alloc-sub">sketch path</div>
+                                </div>
+                                <div class="alloc-cell">
+                                    <div class="alloc-big climbing" id="dd-alloc-oracle">0</div>
+                                    <div class="alloc-sub">retained samples</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - relerr as a fraction of alpha (HARD cap <= 1)</div>
+                            <canvas id="dd-witness-canvas"></canvas>
+                            <div class="jank-caption">three gauges (p50 / p90 / p99); each cursor = relerr / alpha and must stay left of the 1.0 cap</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - space: bins fixed vs sorted array O(N)</div>
+                            <canvas id="dd-space-canvas"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">p50 (sketch)</span><span class="v" id="dd-p50">0</span></div>
+                            <div class="stat-row"><span class="k">p90 (sketch)</span><span class="v" id="dd-p90">0</span></div>
+                            <div class="stat-row"><span class="k">p99 (sketch)</span><span class="v accent" id="dd-p99">0</span></div>
+                            <div class="stat-row"><span class="k">p99 (exact)</span><span class="v" id="dd-p99-true">0</span></div>
+                            <div class="stat-row"><span class="k">p99 relerr / alpha</span><span class="v inband" id="dd-frac">0.00x</span></div>
+                            <div class="stat-row"><span class="k">alpha</span><span class="v" id="dd-alpha-stat">2.00%</span></div>
+                            <div class="stat-row"><span class="k">exact min / max</span><span class="v" id="dd-minmax">-- / --</span></div>
+                            <div class="stat-row"><span class="k">bins bytes (fixed)</span><span class="v accent" id="dd-sketch-kb">16.0 KB</span></div>
+                            <div class="stat-row"><span class="k">array bytes (climbing)</span><span class="v" id="dd-arr-kb">0.0 KB</span></div>
+                            <div class="stat-row"><span class="k">N / oracle N (capped)</span><span class="v" id="dd-n">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="dd-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="dd-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
         </section>
 
-        <!-- SCENE 04: SPACESAVING (stub) -->
+        <!-- SCENE 04: SPACESAVING -->
         <section class="scene" data-scene="ss">
-            <div class="placeholder">
-                <span class="ph-badge">scene 04 - coming next</span>
-                <h2>SpaceSaving - which few keys dominate?</h2>
-                <p class="ph-members">
-                    A Zipfian stream drives k monitored counters as a live top-k leaderboard; every
-                    true hitter above N/k stays monitored (100% recall) and its true count lands in
-                    the [count-error, count] bracket. Built in a follow-up.
-                </p>
+            <div class="stage" id="ss-stage">
+                <canvas id="ss-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">SpaceSaving k monitored counters -- live top-k leaderboard (library instance)</span>
+                </div>
+                <div class="stage-overlay tr">
+                    <span class="label">recall of hitters > N/k</span><br>
+                    <span class="big" id="ss-recall-big">100%</span>
+                </div>
             </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 04 - spacesaving (which few keys dominate?)</div>
+
+                <section>
+                    <h3>vs exact oracle</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="ss-mode-toggle" data-on="true" role="switch" aria-checked="true" tabindex="0"></div>
+                        <span class="toggle-label">exact Map: <b id="ss-mode-label">running (allocates)</b></span>
+                    </div>
+                    <p class="help-line">
+                        At capacity, each new key EVICTS the min-count key and reassigns its slot at
+                        <code>count = min + count</code>, <code>error = min</code> -- eviction never
+                        fails. Every true hitter above <code>N/k</code> stays monitored (100% recall,
+                        no false negatives).
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="ss-pause">pause</button>
+                    </div>
+                    <p class="help-line">
+                        Each row shows the <code>[count-error, count]</code> bracket; the true count
+                        (from the exact Map) lands INSIDE it, with <code>error &lt;= N/k</code>. The
+                        dashed line is the <code>N/k</code> heavy-hitter threshold.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>capacity k (monitored counters) <span class="field-value" id="ss-k-v">64</span></label>
+                        <input type="range" id="ss-k" min="16" max="512" step="16" value="64">
+                    </div>
+                    <p class="help-line">
+                        k sets the memory and the <code>N/k</code> threshold. Sketch memory is a FIXED
+                        <span class="field-value" id="ss-mem">1.5 KB</span>; the exact Map grows
+                        O(distinct).
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the two proofs</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="ss-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-pair">
+                                <div class="alloc-cell">
+                                    <div class="alloc-big zero" id="ss-alloc-sketch">0</div>
+                                    <div class="alloc-sub">sketch path</div>
+                                </div>
+                                <div class="alloc-cell">
+                                    <div class="alloc-big climbing" id="ss-alloc-oracle">0</div>
+                                    <div class="alloc-sub">exact Map path</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - recall of true hitters > N/k (target 100%)</div>
+                            <canvas id="ss-witness-canvas"></canvas>
+                            <div class="jank-caption">the bar is recall; full + green = every true hitter monitored (no false negatives)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">family witness - space: k counters fixed vs Map O(distinct)</div>
+                            <canvas id="ss-space-canvas"></canvas>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">recall (found / true HH)</span><span class="v inband" id="ss-recall">100%</span></div>
+                            <div class="stat-row"><span class="k">true hitters > N/k</span><span class="v" id="ss-truehh">0</span></div>
+                            <div class="stat-row"><span class="k">monitored / k</span><span class="v" id="ss-size">0 / 64</span></div>
+                            <div class="stat-row"><span class="k">N/k threshold</span><span class="v" id="ss-thresh">0</span></div>
+                            <div class="stat-row"><span class="k">max error</span><span class="v" id="ss-maxerr">0</span></div>
+                            <div class="stat-row"><span class="k">bracket holds</span><span class="v inband" id="ss-bracket">yes</span></div>
+                            <div class="stat-row"><span class="k">counters bytes (fixed)</span><span class="v accent" id="ss-sketch-kb">1.5 KB</span></div>
+                            <div class="stat-row"><span class="k">Map bytes (climbing)</span><span class="v" id="ss-map-kb">0.0 KB</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="ss-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="ss-heap">n/a</span></div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
         </section>
     </main>
 
@@ -433,6 +721,25 @@
         HLL_DEFAULT_P, HLL_DEFAULT_CARD,
         F_EST, F_TRUE, F_RELERR, F_STDERR, F_SKETCH_BYTES, F_SET_BYTES,
         F_M, F_RELERR_FRAC, F_MAXREG, F_SKETCH_ALLOC, F_ORACLE_ALLOC,
+        // scene 02 -- CountMinSketch
+        createCmsWorld, stepCmsSketch, stepCmsOracle, renderCmsPrep,
+        CMS_DEFAULT_D, CMS_DEFAULT_W,
+        CF_EST, CF_TRUE, CF_GAP, CF_BOUND, CF_GAPFRAC, CF_EPS, CF_N,
+        CF_SKETCH_BYTES, CF_MAP_BYTES, CF_D, CF_W, CF_MAXCELL, CF_QKEY,
+        CF_SKETCH_ALLOC, CF_ORACLE_ALLOC,
+        // scene 03 -- DDSketch
+        createDdWorld, stepDdSketch, stepDdOracle, renderDdPrep,
+        DD_DEFAULT_ALPHA,
+        DF_P50, DF_P90, DF_P99, DF_T99, DF_E99, DF_F50, DF_F90, DF_F99,
+        DF_ALPHA, DF_SKETCH_BYTES, DF_ARR_BYTES, DF_N, DF_ORACLEN,
+        DF_COLLAPSED, DF_MIN, DF_MAX, DF_MAXBINPOP, DF_M50, DF_M90, DF_M99,
+        DF_LOWBIN, DF_TOPBIN, DF_SKETCH_ALLOC, DF_ORACLE_ALLOC,
+        // scene 04 -- SpaceSaving
+        createSsWorld, stepSsSketch, stepSsOracle, renderSsPrep,
+        SS_DEFAULT_K, SS_ROWS,
+        SF_RECALL, SF_TRUEHH, SF_N, SF_K, SF_THRESH, SF_MAXERR, SF_BRACKETOK,
+        SF_SKETCH_BYTES, SF_MAP_BYTES, SF_SIZE, SF_ROWS, SF_MAXCOUNT, SF_MINCOUNT,
+        SF_SKETCH_ALLOC, SF_ORACLE_ALLOC,
     } from './kernels.mjs';
 
     const $ = (id) => document.getElementById(id);
@@ -471,6 +778,7 @@
     const RED_RGB = '248,113,113';
     const GREEN_RGB = '95,227,159';
     const AMBER_RGB = '245,185,66';
+    const CYAN_RGB = '125,211,252';
     const COL_FAINT = '#555960';
     const COL_DIM = '#8b8d94';
     const LABEL_FONT = '11px "JetBrains Mono", monospace';
@@ -511,7 +819,12 @@
         hllX = PAD; hllY = PAD + 24;
     }
 
-    window.addEventListener('resize', () => { if (activeScene === 'hll') { computeHllLayout(); sizeHllPanels(); } });
+    window.addEventListener('resize', () => {
+        if (activeScene === 'hll') { computeHllLayout(); sizeHllPanels(); }
+        else if (activeScene === 'cms') { computeCmsLayout(); sizeCmsPanels(); }
+        else if (activeScene === 'dd') { computeDdLayout(); sizeDdPanels(); }
+        else if (activeScene === 'ss') { computeSsLayout(); sizeSsPanels(); }
+    });
 
     // ---- Truth-Panel canvases (each sized on load / resize / tab activate) --------------
     const jankCanvas = $('hll-jank-canvas');
@@ -693,7 +1006,14 @@
 
     // ---- action buttons ----------------------------------------------------------------
     const btnPause = $('hll-pause');
-    function setPaused(p) { paused = p; btnPause.textContent = p ? 'resume' : 'pause'; }
+    function setPaused(p) {
+        paused = p;
+        const label = p ? 'resume' : 'pause';
+        btnPause.textContent = label;
+        const c = $('cms-pause'); if (c) c.textContent = label;
+        const d = $('dd-pause'); if (d) d.textContent = label;
+        const s = $('ss-pause'); if (s) s.textContent = label;
+    }
     btnPause.addEventListener('click', () => setPaused(!paused));
 
     const banner = $('hll-banner');
@@ -737,6 +1057,434 @@
         rebuildWorld();
     });
 
+    // ====================================================================================
+    // Shared scene helpers (used by scenes 02-04; scene 01 keeps its own above, untouched)
+    // ====================================================================================
+
+    // Space-bars: a fixed (teal) bar over a climbing (magenta) bar, shared scale. 0 alloc.
+    function drawSpaceBars(g, w, h, fixedB, climbB) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        let scale = Math.max(fixedB, climbB, 1);
+        const barX = 6, barW = w - 12, barH = 14;
+        const y0 = h * 0.5 - barH - 4;
+        const y1 = h * 0.5 + 4;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y0, barW, barH);
+        g.fillStyle = rgbaq(ACCENT_RGB, 0.9); g.fillRect(barX, y0, barW * (fixedB / scale), barH);
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y1, barW, barH);
+        g.fillStyle = rgbaq(MAGENTA_RGB, 0.9); g.fillRect(barX, y1, barW * (climbB / scale), barH);
+    }
+
+    // A single [0 .. FULL]-in-units-of-bound gauge with a green (<=1) / red (>1) band + cursor. 0 alloc.
+    function drawGauge(g, x, y, w, cy, frac) {
+        const halfFull = 1.3;                         // axis spans 0 .. 1.3x the cap
+        const oneX = x + (1 / halfFull) * w;
+        g.fillStyle = rgbaq(GREEN_RGB, 0.16); g.fillRect(x, cy - 7, oneX - x, 14);
+        g.fillStyle = rgbaq(RED_RGB, 0.12); g.fillRect(oneX, cy - 7, x + w - oneX, 14);
+        g.fillStyle = rgbaq(GREEN_RGB, 0.6); g.fillRect(oneX - 1, cy - 10, 1, 20);   // the 1.0 cap tick
+        let px = frac / halfFull; if (px > 1) px = 1;
+        const cxp = x + px * w;
+        g.fillStyle = frac <= 1 ? rgbaq(GREEN_RGB, 0.95) : rgbaq(RED_RGB, 0.95);
+        g.fillRect(cxp - 2, cy - 11, 4, 22);
+    }
+
+    // ====================================================================================
+    // SCENE 02 -- CountMinSketch
+    // ====================================================================================
+    let cmsWorld = createCmsWorld(CMS_DEFAULT_D, CMS_DEFAULT_W, 0x1a2b3c4d);
+    const cmsAlloc = createAllocState();
+    let cmsOracleOn = true;
+    const CMS_TITLE = 'CountMinSketch  -  d x w counter matrix   (heat = count; amber = probed cells; magenta = the returned MIN-of-d)';
+
+    const cmsCanvas = $('cms-canvas');
+    let cmsCtx = null, CMS_W = 0, CMS_H = 0, cmsGX = 0, cmsGY = 0, cmsCellW = 8, cmsCellH = 8;
+    function computeCmsLayout() {
+        const s = sizeCanvas(cmsCanvas);
+        cmsCtx = s.ctx; CMS_W = s.w; CMS_H = s.h;
+        const d = cmsWorld.cms.d, w = cmsWorld.cms.w;
+        const gridW = CMS_W - PAD * 2, gridH = CMS_H - PAD * 2 - 24;
+        cmsCellW = gridW / w; cmsCellH = gridH / d;
+        cmsGX = PAD; cmsGY = PAD + 24;
+    }
+    const cmsJank = $('cms-jank-canvas'); let cmsJankCtx = null, CMJW = 0, CMJH = 0;
+    const cmsWit = $('cms-witness-canvas'); let cmsWitCtx = null, CMWW = 0, CMWH = 0;
+    const cmsSpace = $('cms-space-canvas'); let cmsSpCtx = null, CMSW = 0, CMSH = 0;
+    function sizeCmsPanels() {
+        let s = sizeCanvas(cmsJank); cmsJankCtx = s.ctx; CMJW = s.w; CMJH = s.h;
+        s = sizeCanvas(cmsWit); cmsWitCtx = s.ctx; CMWW = s.w; CMWH = s.h;
+        s = sizeCanvas(cmsSpace); cmsSpCtx = s.ctx; CMSW = s.w; CMSH = s.h;
+    }
+
+    function stepCms() {
+        stepCmsSketch(cmsWorld);
+        if (cmsOracleOn) stepCmsOracle(cmsWorld, cmsAlloc);
+    }
+    function drawCms() {
+        const g = cmsCtx; if (!g) return;
+        g.clearRect(0, 0, CMS_W, CMS_H);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM; g.fillText(CMS_TITLE, cmsGX, cmsGY - 8);
+        const active = cmsWorld.active, counts = active._counts, d = active.d, w = active.w;
+        let norm = cmsWorld.flat[CF_MAXCELL]; if (norm < 1) norm = 1;
+        const cw = cmsCellW, ch = cmsCellH;
+        for (let i = 0; i < d; i++) {
+            const rowBase = i * w, y = cmsGY + i * ch;
+            for (let j = 0; j < w; j++) {
+                const v = counts[rowBase + j];
+                if (v === 0) g.fillStyle = rgbaq(STALE_RGB, 0.10);
+                else g.fillStyle = rgbaq(ACCENT_RGB, 0.16 + 0.80 * (v / norm));
+                g.fillRect(cmsGX + j * cw, y, cw > 1 ? cw - 0.5 : cw, ch - 0.5);
+            }
+        }
+        // probed cells for the query key + the MIN-of-d marker
+        const probe = cmsWorld.probe, minRow = cmsWorld.probeMin;
+        for (let i = 0; i < d; i++) {
+            const id = probe[i], col = id - i * w;
+            const x = cmsGX + col * cw, y = cmsGY + i * ch;
+            g.fillStyle = i === minRow ? rgbaq(MAGENTA_RGB, 0.95) : rgbaq(AMBER_RGB, 0.85);
+            g.fillRect(x, y, cw > 2 ? cw : 2, ch);
+        }
+    }
+    function drawCmsWitness(g, w, h) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const flat = cmsWorld.flat;
+        const trueC = flat[CF_TRUE], gap = flat[CF_GAP], bound = flat[CF_BOUND];
+        const est = trueC + gap, ceiling = trueC + bound;
+        const scale = Math.max(est, ceiling, 1);
+        const barX = 6, barW = w - 12, barH = 20, y = h * 0.5 - barH * 0.5;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y, barW, barH);
+        const trueW = barW * (trueC / scale), gapW = barW * (gap / scale);
+        g.fillStyle = rgbaq(ACCENT_RGB, 0.9); g.fillRect(barX, y, trueW, barH);
+        const over = est > ceiling + 1e-9;
+        g.fillStyle = over ? rgbaq(RED_RGB, 0.95) : rgbaq(MAGENTA_RGB, 0.9);
+        g.fillRect(barX + trueW, y, gapW, barH);
+        const cx = barX + barW * (ceiling / scale);
+        g.fillStyle = rgbaq(GREEN_RGB, 0.7); g.fillRect(cx - 1, y - 5, 2, barH + 10);
+    }
+
+    let cmsLastHeap = -1;
+    const cmsDom = {
+        estBig: $('cms-est-big'), qkeyBig: $('cms-qkey-big'),
+        allocSketch: $('cms-alloc-sketch'), allocOracle: $('cms-alloc-oracle'),
+        est: $('cms-est'), trueC: $('cms-true'), gap: $('cms-gap'), bound: $('cms-bound'),
+        frac: $('cms-frac'), eps: $('cms-eps'), n: $('cms-n'),
+        sketchKb: $('cms-sketch-kb'), mapKb: $('cms-map-kb'), fps: $('cms-fps'),
+        heap: $('cms-heap'), mem: $('cms-mem'),
+    };
+    function tickCms() {
+        renderCmsPrep(cmsWorld, cmsAlloc);
+        const flat = cmsWorld.flat;
+        const est = flat[CF_EST] | 0, trueC = flat[CF_TRUE] | 0, qkey = flat[CF_QKEY] | 0;
+        cmsDom.estBig.textContent = String(est);
+        cmsDom.qkeyBig.textContent = String(qkey);
+        cmsDom.est.textContent = String(est);
+        cmsDom.trueC.textContent = String(trueC);
+        cmsDom.gap.textContent = String(flat[CF_GAP] | 0);
+        cmsDom.bound.textContent = (flat[CF_BOUND]).toFixed(0);
+        const frac = flat[CF_GAPFRAC];
+        cmsDom.frac.textContent = frac.toFixed(2) + 'x';
+        cmsDom.frac.className = frac <= 1 ? 'v inband' : 'v outband';
+        cmsDom.eps.textContent = (flat[CF_EPS] * 100).toFixed(2) + '%';
+        cmsDom.n.textContent = String(flat[CF_N] | 0);
+        cmsDom.sketchKb.textContent = (flat[CF_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        cmsDom.mapKb.textContent = (flat[CF_MAP_BYTES] / 1024).toFixed(1) + ' KB';
+        cmsDom.allocSketch.textContent = String(flat[CF_SKETCH_ALLOC] | 0);
+        cmsDom.allocOracle.textContent = String(flat[CF_ORACLE_ALLOC]);
+        cmsDom.fps.textContent = String(fpsValue);
+        const mb = mem();
+        if (mb) { const t = Math.floor(mb / 104857.6); if (t !== cmsLastHeap) { cmsLastHeap = t; cmsDom.heap.textContent = Math.floor(t / 10) + '.' + (t % 10) + ' MB'; } }
+    }
+
+    const cmsModeToggle = $('cms-mode-toggle'), cmsModeLabel = $('cms-mode-label');
+    function setCmsOracle(on) {
+        cmsOracleOn = on;
+        cmsModeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        cmsModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        cmsModeLabel.textContent = on ? 'running (allocates)' : 'paused (sketch only)';
+    }
+    cmsModeToggle.addEventListener('click', () => setCmsOracle(!cmsOracleOn));
+    cmsModeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setCmsOracle(!cmsOracleOn); } });
+
+    const cmsConsToggle = $('cms-cons-toggle'), cmsConsLabel = $('cms-cons-label');
+    function setCmsCons(on) {
+        cmsWorld.conservative = on;
+        cmsConsToggle.setAttribute('data-on', on ? 'true' : 'false');
+        cmsConsToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        cmsConsLabel.textContent = on ? 'conservative' : 'plain';
+    }
+    cmsConsToggle.addEventListener('click', () => setCmsCons(!cmsWorld.conservative));
+    cmsConsToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setCmsCons(!cmsWorld.conservative); } });
+
+    $('cms-pause').addEventListener('click', () => setPaused(!paused));
+
+    const cmsDSlider = $('cms-d'), cmsDV = $('cms-d-v'), cmsWSlider = $('cms-w'), cmsWV = $('cms-w-v');
+    let CMS_D = CMS_DEFAULT_D, CMS_WW = CMS_DEFAULT_W;
+    function rebuildCms() {
+        const wasCons = cmsWorld.conservative;
+        cmsWorld = createCmsWorld(CMS_D, CMS_WW, 0x1a2b3c4d);
+        cmsWorld.conservative = wasCons;
+        cmsAlloc.sketchCount = 0; cmsAlloc.oracleCount = 0;
+        cmsDom.mem.textContent = (cmsWorld.cms.d * cmsWorld.cms.w * 4 / 1024).toFixed(1) + ' KB';
+        computeCmsLayout();
+    }
+    cmsDSlider.addEventListener('input', () => { CMS_D = +cmsDSlider.value; cmsDV.textContent = String(CMS_D); rebuildCms(); });
+    cmsWSlider.addEventListener('input', () => { CMS_WW = 1 << (+cmsWSlider.value); cmsWV.textContent = String(CMS_WW); rebuildCms(); });
+
+    // ====================================================================================
+    // SCENE 03 -- DDSketch
+    // ====================================================================================
+    let ddWorld = createDdWorld(DD_DEFAULT_ALPHA, 0x2b7e1516);
+    const ddAlloc = createAllocState();
+    let ddOracleOn = true;
+    const DD_TITLE = 'DDSketch  -  log-scale bins   (bar = bin count; markers: cyan p50, amber p90, magenta p99; bin 0 = collapsed floor)';
+
+    const ddCanvas = $('dd-canvas');
+    let ddCtx = null, DD_W = 0, DD_H = 0, ddGX = 0, ddGY = 0, ddGW = 0, ddGH = 0;
+    function computeDdLayout() {
+        const s = sizeCanvas(ddCanvas);
+        ddCtx = s.ctx; DD_W = s.w; DD_H = s.h;
+        ddGX = PAD; ddGY = PAD + 24; ddGW = DD_W - PAD * 2; ddGH = DD_H - PAD * 2 - 24;
+    }
+    const ddJank = $('dd-jank-canvas'); let ddJankCtx = null, DJW = 0, DJH = 0;
+    const ddWit = $('dd-witness-canvas'); let ddWitCtx = null, DWW = 0, DWH = 0;
+    const ddSpace = $('dd-space-canvas'); let ddSpCtx = null, DSW = 0, DSH = 0;
+    function sizeDdPanels() {
+        let s = sizeCanvas(ddJank); ddJankCtx = s.ctx; DJW = s.w; DJH = s.h;
+        s = sizeCanvas(ddWit); ddWitCtx = s.ctx; DWW = s.w; DWH = s.h;
+        s = sizeCanvas(ddSpace); ddSpCtx = s.ctx; DSW = s.w; DSH = s.h;
+    }
+
+    function stepDd() {
+        stepDdSketch(ddWorld);
+        if (ddOracleOn) stepDdOracle(ddWorld, ddAlloc);
+    }
+    function drawDd() {
+        const g = ddCtx; if (!g) return;
+        g.clearRect(0, 0, DD_W, DD_H);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM; g.fillText(DD_TITLE, ddGX, ddGY - 8);
+        const flat = ddWorld.flat, bins = ddWorld.dd._bins;
+        const low = flat[DF_LOWBIN] | 0, top = flat[DF_TOPBIN] | 0;
+        let maxPop = flat[DF_MAXBINPOP]; if (maxPop < 1) maxPop = 1;
+        const span = top - low + 1;
+        if (span < 1) return;
+        const barW = ddGW / span;
+        const collapsed = flat[DF_COLLAPSED] === 1;
+        for (let i = low; i <= top; i++) {
+            const v = bins[i];
+            const bh = (v / maxPop) * ddGH;
+            const x = ddGX + (i - low) * barW;
+            if (i === 0 && collapsed) g.fillStyle = rgbaq(RED_RGB, 0.55);   // the collapsed floor
+            else g.fillStyle = rgbaq(ACCENT_RGB, 0.75);
+            if (bh > 0) g.fillRect(x, ddGY + ddGH - bh, barW > 1 ? barW - 0.5 : barW, bh);
+        }
+        // quantile markers
+        drawDdMarker(g, flat[DF_M50] | 0, low, top, barW, CYAN_RGB);
+        drawDdMarker(g, flat[DF_M90] | 0, low, top, barW, AMBER_RGB);
+        drawDdMarker(g, flat[DF_M99] | 0, low, top, barW, MAGENTA_RGB);
+    }
+    function drawDdMarker(g, idx, low, top, barW, rgb) {
+        if (idx < low || idx > top) return;
+        const x = ddGX + (idx - low) * barW + barW * 0.5;
+        g.fillStyle = rgbaq(rgb, 0.95);
+        g.fillRect(x - 1, ddGY, 2, ddGH);
+    }
+    function drawDdWitness(g, w, h) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const flat = ddWorld.flat;
+        const x = 8, gw = w - 16;
+        drawGauge(g, x, h * 0.20, gw, h * 0.20, flat[DF_F50]);
+        drawGauge(g, x, h * 0.50, gw, h * 0.50, flat[DF_F90]);
+        drawGauge(g, x, h * 0.80, gw, h * 0.80, flat[DF_F99]);
+    }
+
+    let ddLastHeap = -1;
+    const ddDom = {
+        p99Big: $('dd-p99-big'), collapsed: $('dd-collapsed'),
+        allocSketch: $('dd-alloc-sketch'), allocOracle: $('dd-alloc-oracle'),
+        p50: $('dd-p50'), p90: $('dd-p90'), p99: $('dd-p99'), p99true: $('dd-p99-true'),
+        frac: $('dd-frac'), alpha: $('dd-alpha-stat'), minmax: $('dd-minmax'),
+        sketchKb: $('dd-sketch-kb'), arrKb: $('dd-arr-kb'), n: $('dd-n'),
+        fps: $('dd-fps'), heap: $('dd-heap'), mem: $('dd-mem'),
+    };
+    function tickDd() {
+        renderDdPrep(ddWorld, ddAlloc);
+        const flat = ddWorld.flat;
+        const p99 = flat[DF_P99];
+        ddDom.p99Big.textContent = p99 === p99 ? p99.toFixed(0) : '--';
+        ddDom.p50.textContent = flat[DF_P50].toFixed(1);
+        ddDom.p90.textContent = flat[DF_P90].toFixed(1);
+        ddDom.p99.textContent = p99.toFixed(1);
+        ddDom.p99true.textContent = flat[DF_T99].toFixed(1);
+        const frac = flat[DF_F99];
+        ddDom.frac.textContent = frac.toFixed(2) + 'x';
+        ddDom.frac.className = frac <= 1 ? 'v inband' : 'v outband';
+        ddDom.alpha.textContent = (flat[DF_ALPHA] * 100).toFixed(2) + '%';
+        const mn = flat[DF_MIN], mx = flat[DF_MAX];
+        ddDom.minmax.textContent = (mn === mn ? mn.toFixed(1) : '--') + ' / ' + (mx === mx ? mx.toFixed(1) : '--');
+        ddDom.sketchKb.textContent = (flat[DF_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        ddDom.arrKb.textContent = (flat[DF_ARR_BYTES] / 1024).toFixed(1) + ' KB';
+        ddDom.n.textContent = String(flat[DF_N] | 0) + ' / ' + String(flat[DF_ORACLEN] | 0);
+        ddDom.collapsed.textContent = flat[DF_COLLAPSED] === 1 ? 'true' : 'false';
+        ddDom.allocSketch.textContent = String(flat[DF_SKETCH_ALLOC] | 0);
+        ddDom.allocOracle.textContent = String(flat[DF_ORACLE_ALLOC]);
+        ddDom.fps.textContent = String(fpsValue);
+        const mb = mem();
+        if (mb) { const t = Math.floor(mb / 104857.6); if (t !== ddLastHeap) { ddLastHeap = t; ddDom.heap.textContent = Math.floor(t / 10) + '.' + (t % 10) + ' MB'; } }
+    }
+
+    const ddModeToggle = $('dd-mode-toggle'), ddModeLabel = $('dd-mode-label');
+    function setDdOracle(on) {
+        ddOracleOn = on;
+        ddModeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        ddModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        ddModeLabel.textContent = on ? 'running (allocates)' : 'paused (sketch only)';
+    }
+    ddModeToggle.addEventListener('click', () => setDdOracle(!ddOracleOn));
+    ddModeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setDdOracle(!ddOracleOn); } });
+    $('dd-pause').addEventListener('click', () => setPaused(!paused));
+
+    const ddAlphaSlider = $('dd-alpha'), ddAlphaV = $('dd-alpha-v');
+    let DD_ALPHA = DD_DEFAULT_ALPHA;
+    function rebuildDd() {
+        ddWorld = createDdWorld(DD_ALPHA, 0x2b7e1516);
+        ddAlloc.sketchCount = 0; ddAlloc.oracleCount = 0;
+        ddDom.mem.textContent = (ddWorld.dd.maxBins * 8 / 1024).toFixed(1) + ' KB';
+        computeDdLayout();
+    }
+    ddAlphaSlider.addEventListener('input', () => {
+        DD_ALPHA = (+ddAlphaSlider.value) / 1000;           // slider 5..80 -> alpha 0.005..0.080
+        ddAlphaV.textContent = DD_ALPHA.toFixed(3);
+        rebuildDd();
+    });
+
+    // ====================================================================================
+    // SCENE 04 -- SpaceSaving
+    // ====================================================================================
+    let ssWorld = createSsWorld(SS_DEFAULT_K, 0x3243f6a8);
+    const ssAlloc = createAllocState();
+    let ssOracleOn = true;
+    const SS_TITLE = 'SpaceSaving  -  top-k leaderboard   (teal = count; amber = [count-error] bracket; magenta = true count; red dashed = N/k)';
+    const RANK_LABELS = [];
+    for (let i = 0; i < SS_ROWS; i++) RANK_LABELS.push('#' + (i + 1));
+
+    const ssCanvas = $('ss-canvas');
+    let ssCtx = null, SS_W = 0, SS_H = 0, ssGX = 0, ssGY = 0, ssGW = 0, ssGH = 0;
+    function computeSsLayout() {
+        const s = sizeCanvas(ssCanvas);
+        ssCtx = s.ctx; SS_W = s.w; SS_H = s.h;
+        ssGX = PAD + 34; ssGY = PAD + 24; ssGW = SS_W - PAD * 2 - 34; ssGH = SS_H - PAD * 2 - 24;
+    }
+    const ssJank = $('ss-jank-canvas'); let ssJankCtx = null, SJW = 0, SJH = 0;
+    const ssWit = $('ss-witness-canvas'); let ssWitCtx = null, SWW = 0, SWH = 0;
+    const ssSpace = $('ss-space-canvas'); let ssSpCtx = null, SSW = 0, SSH = 0;
+    function sizeSsPanels() {
+        let s = sizeCanvas(ssJank); ssJankCtx = s.ctx; SJW = s.w; SJH = s.h;
+        s = sizeCanvas(ssWit); ssWitCtx = s.ctx; SWW = s.w; SWH = s.h;
+        s = sizeCanvas(ssSpace); ssSpCtx = s.ctx; SSW = s.w; SSH = s.h;
+    }
+
+    function stepSs() {
+        stepSsSketch(ssWorld);
+        if (ssOracleOn) stepSsOracle(ssWorld, ssAlloc);
+    }
+    function drawSs() {
+        const g = ssCtx; if (!g) return;
+        g.clearRect(0, 0, SS_W, SS_H);
+        g.font = LABEL_FONT; g.fillStyle = COL_DIM; g.fillText(SS_TITLE, PAD, ssGY - 8);
+        const flat = ssWorld.flat;
+        const rows = flat[SF_ROWS] | 0;
+        let maxCount = flat[SF_MAXCOUNT]; if (maxCount < 1) maxCount = 1;
+        const thresh = flat[SF_THRESH];
+        if (rows < 1) return;
+        const rowH = ssGH / rows, bh = rowH - 4;
+        const lbCount = ssWorld.lbCount, lbError = ssWorld.lbError, lbTrue = ssWorld.lbTrue;
+        for (let r = 0; r < rows; r++) {
+            const c = lbCount[r], e = lbError[r], t = lbTrue[r];
+            const y = ssGY + r * rowH + 2;
+            g.fillStyle = COL_FAINT; g.fillText(RANK_LABELS[r], PAD, y + bh * 0.5 + 3);
+            g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(ssGX, y, ssGW, bh);
+            const cW = ssGW * (c / maxCount);
+            g.fillStyle = rgbaq(ACCENT_RGB, 0.85); g.fillRect(ssGX, y, cW, bh);
+            // [count-error, count] bracket -> the error band in amber
+            const loW = ssGW * ((c - e) / maxCount);
+            g.fillStyle = rgbaq(AMBER_RGB, 0.55); g.fillRect(ssGX + loW, y, cW - loW, bh);
+            // true count marker (must land inside the bracket)
+            const tX = ssGX + ssGW * (t / maxCount);
+            g.fillStyle = rgbaq(MAGENTA_RGB, 0.95); g.fillRect(tX - 1, y - 1, 2, bh + 2);
+        }
+        // N/k threshold line
+        const thX = ssGX + ssGW * (thresh / maxCount);
+        if (thX >= ssGX && thX <= ssGX + ssGW) {
+            g.fillStyle = rgbaq(RED_RGB, 0.7);
+            for (let y = ssGY; y < ssGY + ssGH; y += 6) g.fillRect(thX - 1, y, 2, 3);
+        }
+    }
+    function drawSsWitness(g, w, h) {
+        if (!g) return;
+        g.clearRect(0, 0, w, h);
+        const recall = ssWorld.flat[SF_RECALL];
+        const barX = 6, barW = w - 12, barH = 22, y = h * 0.5 - barH * 0.5;
+        g.fillStyle = rgbaq(STALE_RGB, 0.10); g.fillRect(barX, y, barW, barH);
+        const full = recall >= 0.9999;
+        g.fillStyle = full ? rgbaq(GREEN_RGB, 0.9) : rgbaq(RED_RGB, 0.9);
+        g.fillRect(barX, y, barW * recall, barH);
+        g.fillStyle = rgbaq(GREEN_RGB, 0.7); g.fillRect(barX + barW - 1, y - 4, 2, barH + 8);  // 100% tick
+    }
+
+    let ssLastHeap = -1;
+    const ssDom = {
+        recallBig: $('ss-recall-big'),
+        allocSketch: $('ss-alloc-sketch'), allocOracle: $('ss-alloc-oracle'),
+        recall: $('ss-recall'), truehh: $('ss-truehh'), size: $('ss-size'),
+        thresh: $('ss-thresh'), maxerr: $('ss-maxerr'), bracket: $('ss-bracket'),
+        sketchKb: $('ss-sketch-kb'), mapKb: $('ss-map-kb'), fps: $('ss-fps'),
+        heap: $('ss-heap'), mem: $('ss-mem'),
+    };
+    function tickSs() {
+        renderSsPrep(ssWorld, ssAlloc);
+        const flat = ssWorld.flat;
+        const recall = flat[SF_RECALL];
+        ssDom.recallBig.textContent = (recall * 100).toFixed(0) + '%';
+        ssDom.recall.textContent = (recall * 100).toFixed(1) + '%';
+        ssDom.recall.className = recall >= 0.9999 ? 'v inband' : 'v outband';
+        ssDom.truehh.textContent = String(flat[SF_TRUEHH] | 0);
+        ssDom.size.textContent = String(flat[SF_SIZE] | 0) + ' / ' + String(flat[SF_K] | 0);
+        ssDom.thresh.textContent = (flat[SF_THRESH]).toFixed(1);
+        ssDom.maxerr.textContent = String(flat[SF_MAXERR] | 0);
+        const ok = flat[SF_BRACKETOK] === 1;
+        ssDom.bracket.textContent = ok ? 'yes' : 'NO';
+        ssDom.bracket.className = ok ? 'v inband' : 'v outband';
+        ssDom.sketchKb.textContent = (flat[SF_SKETCH_BYTES] / 1024).toFixed(1) + ' KB';
+        ssDom.mapKb.textContent = (flat[SF_MAP_BYTES] / 1024).toFixed(1) + ' KB';
+        ssDom.allocSketch.textContent = String(flat[SF_SKETCH_ALLOC] | 0);
+        ssDom.allocOracle.textContent = String(flat[SF_ORACLE_ALLOC]);
+        ssDom.fps.textContent = String(fpsValue);
+        const mb = mem();
+        if (mb) { const t = Math.floor(mb / 104857.6); if (t !== ssLastHeap) { ssLastHeap = t; ssDom.heap.textContent = Math.floor(t / 10) + '.' + (t % 10) + ' MB'; } }
+    }
+
+    const ssModeToggle = $('ss-mode-toggle'), ssModeLabel = $('ss-mode-label');
+    function setSsOracle(on) {
+        ssOracleOn = on;
+        ssModeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        ssModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        ssModeLabel.textContent = on ? 'running (allocates)' : 'paused (sketch only)';
+    }
+    ssModeToggle.addEventListener('click', () => setSsOracle(!ssOracleOn));
+    ssModeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setSsOracle(!ssOracleOn); } });
+    $('ss-pause').addEventListener('click', () => setPaused(!paused));
+
+    const ssKSlider = $('ss-k'), ssKV = $('ss-k-v');
+    let SS_K = SS_DEFAULT_K;
+    function rebuildSs() {
+        ssWorld = createSsWorld(SS_K, 0x3243f6a8);
+        ssAlloc.sketchCount = 0; ssAlloc.oracleCount = 0;
+        ssDom.mem.textContent = (SS_K * 24 / 1024).toFixed(1) + ' KB';
+        computeSsLayout();
+    }
+    ssKSlider.addEventListener('input', () => { SS_K = +ssKSlider.value; ssKV.textContent = String(SS_K); rebuildSs(); });
+
     // ---- main loop ---------------------------------------------------------------------
     function loop(now) {
         const dt = now - lastTs; lastTs = now;
@@ -754,10 +1502,33 @@
             drawJank(jankCtx, JW, JH);
             drawWitness(witCtx, WITW, WITH);
             drawSpace(spCtx, SPW, SPH);
+        } else if (activeScene === 'cms') {
+            if (!paused) stepCms();
+            drawCms();
+            drawJank(cmsJankCtx, CMJW, CMJH);
+            drawCmsWitness(cmsWitCtx, CMWW, CMWH);
+            drawSpaceBars(cmsSpCtx, CMSW, CMSH, cmsWorld.flat[CF_SKETCH_BYTES], cmsWorld.flat[CF_MAP_BYTES]);
+        } else if (activeScene === 'dd') {
+            if (!paused) stepDd();
+            drawDd();
+            drawJank(ddJankCtx, DJW, DJH);
+            drawDdWitness(ddWitCtx, DWW, DWH);
+            drawSpaceBars(ddSpCtx, DSW, DSH, ddWorld.flat[DF_SKETCH_BYTES], ddWorld.flat[DF_ARR_BYTES]);
+        } else if (activeScene === 'ss') {
+            if (!paused) stepSs();
+            drawSs();
+            drawJank(ssJankCtx, SJW, SJH);
+            drawSsWitness(ssWitCtx, SWW, SWH);
+            drawSpaceBars(ssSpCtx, SSW, SSH, ssWorld.flat[SF_SKETCH_BYTES], ssWorld.flat[SF_MAP_BYTES]);
         }
 
         frameN++;
-        if ((frameN & 7) === 0 && activeScene === 'hll') tick10();
+        if ((frameN & 7) === 0) {
+            if (activeScene === 'hll') tick10();
+            else if (activeScene === 'cms') tickCms();
+            else if (activeScene === 'dd') tickDd();
+            else if (activeScene === 'ss') tickSs();
+        }
         requestAnimationFrame(loop);
     }
 
@@ -776,6 +1547,9 @@
         }
         activeScene = tab;
         if (tab === 'hll') { computeHllLayout(); sizeHllPanels(); }
+        else if (tab === 'cms') { computeCmsLayout(); sizeCmsPanels(); }
+        else if (tab === 'dd') { computeDdLayout(); sizeDdPanels(); }
+        else if (tab === 'ss') { computeSsLayout(); sizeSsPanels(); }
     }
     for (let i = 0; i < tabButtons.length; i++) {
         tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
@@ -795,6 +1569,15 @@
     dom.mem.textContent = (hllWorld.hll.m / 1024).toFixed(1) + ' KB';
     computeHllLayout();
     sizeHllPanels();
+
+    // scene 02-04 initial UI hooked from the built worlds (never hardcoded in HTML text)
+    setCmsOracle(true); setCmsCons(true);
+    cmsDom.mem.textContent = (cmsWorld.cms.d * cmsWorld.cms.w * 4 / 1024).toFixed(1) + ' KB';
+    setDdOracle(true);
+    ddDom.mem.textContent = (ddWorld.dd.maxBins * 8 / 1024).toFixed(1) + ' KB';
+    setSsOracle(true);
+    ssDom.mem.textContent = (SS_K * 24 / 1024).toFixed(1) + ' KB';
+
     requestAnimationFrame(loop);
 </script>
 </body>
