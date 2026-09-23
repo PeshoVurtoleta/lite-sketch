@@ -221,3 +221,87 @@ export class DDSketch {
     /** Reset the sketch to empty. O(maxBins). */
     clear(): this;
 }
+
+/** Options accepted by the `SpaceSaving` constructor. */
+export interface SpaceSavingOptions {
+    /** Per-instance uint32 hash seed (any integer, coerced with `| 0`); default shared with the family. */
+    seed?: number;
+}
+
+/** A monitored entry returned by `SpaceSaving.topK` / `heavyHitters`. */
+export interface SpaceSavingEntry {
+    /** The monitored key. */
+    key: number;
+    /** Its estimated frequency (an upper bound on the true count). */
+    count: number;
+    /** The maximum over-estimate: the true count lies in `[count - error, count]`. */
+    error: number;
+}
+
+/**
+ * SpaceSaving -- a zero-GC HEAVY-HITTERS / TOP-K sketch (Metwally, Agrawal, El
+ * Abbadi -- "Efficient Computation of Frequent and Top-k Elements in Data
+ * Streams"). Monitors a fixed `capacity` (k) counters over an intrusive
+ * frequency-bucket forest + a fixed open-addressing key map. `add(key)`
+ * increments a monitored key, inserts a free slot, or -- when full -- EVICTS the
+ * minimum-count key and reassigns its slot to the newcomer at `count = min + 1`,
+ * `error = min` (eviction IS the algorithm; it never fails at capacity).
+ * Guarantee: every key with true frequency > N/k is monitored (NO false
+ * negatives), a monitored key's true count lies in `[count - error, count]`, and
+ * `error <= N/k`. There is deliberately NO `addHashed`: a heavy-hitters sketch
+ * must retain each key's identity, so there is no honest pre-hashed fast path.
+ */
+export class SpaceSaving {
+    /**
+     * @param capacity the number of monitored counters k, an integer in [1, 2^24].
+     * @param options seed. Throws [lite-sketch] on any bad argument (incl. an
+     *   unknown option key) BEFORE the pools are allocated.
+     */
+    constructor(capacity: number, options?: SpaceSavingOptions);
+
+    /**
+     * Build a summary sized to a target error: `k = ceil(1 / epsilon)` (clamped to
+     * 2^24). A monitored key's over-estimate is then bounded by `epsilon * N`.
+     * @param epsilon the target error fraction, a number in (0, 1).
+     */
+    static withError(epsilon: number, options?: SpaceSavingOptions): SpaceSaving;
+
+    /** The monitored-counter capacity k. O(1). */
+    readonly capacity: number;
+
+    /** The number of keys currently monitored (<= capacity). O(1). */
+    readonly size: number;
+
+    /** Total weight added (the exact running sum N of all counts). O(1). */
+    readonly total: number;
+
+    /** The theoretical error fraction 1 / capacity. O(1). */
+    readonly epsilon: number;
+
+    /** The uint32 hash seed. O(1). */
+    readonly seed: number;
+
+    /** Add a safe-integer `key` with a positive integer `count` (default 1). HOT, O(1) amortized, 0 B/op. Increments, inserts, or evicts the min. Throws [lite-sketch] on a non-safe-integer key or a non-positive-integer count (a byte-identical no-op). */
+    add(key: number, count?: number): this;
+
+    /** The estimated frequency of `key` (an upper bound), or 0 if not monitored. HOT, O(1). NEVER throws. */
+    estimate(key: number): number;
+
+    /** The over-estimate bound for `key` (true count is in `[estimate - errorOf, estimate]`), or 0 if not monitored. HOT, O(1). NEVER throws. */
+    errorOf(key: number): number;
+
+    /** Iterate the monitored entries alloc-free (storage order, NOT sorted): `fn(key, count, error, this)`. NEVER throws. */
+    forEach(fn: (key: number, count: number, error: number, ss: SpaceSaving) => void): void;
+
+    /** The top `n` monitored keys by count, DESCENDING (default n = size). COLD; ALLOCATES the result array. NEVER throws. */
+    topK(n?: number): SpaceSavingEntry[];
+
+    /** Every monitored key with `count > threshold * total` -- a SUPERSET with NO false negatives (every true heavy hitter is included; a few false positives may be too). Filter the result by `(count - error) > threshold * total` for the guaranteed-frequent subset. COLD; ALLOCATES. NEVER throws. */
+    heavyHitters(threshold: number): SpaceSavingEntry[];
+
+    /** Merge `other` into this (min-imputation for absent keys, keep the top-k). O(k). Throws [lite-sketch] on a non-SpaceSaving or an unequal capacity/seed. */
+    merge(other: SpaceSaving): this;
+
+    /** Reset the summary to empty. O(capacity). */
+    clear(): this;
+}

@@ -7,7 +7,7 @@
 // delta). A `mustFail` control that allocates per op MUST trip the gate, proving teeth.
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { HyperLogLog, CountMinSketch, DDSketch } from '../../Sketch.js';
+import { HyperLogLog, CountMinSketch, DDSketch, SpaceSaving } from '../../Sketch.js';
 
 const P = 14;
 const M = 1 << P;
@@ -20,6 +20,12 @@ function cmsGrows(s) { return s.c._counts.buffer.byteLength; }
 
 /** Zero-alloc counter: the DDSketch bin array's byte length -- fixed at construction. */
 function ddGrows(s) { return s.d._bins.buffer.byteLength; }
+
+/** Zero-alloc counter: a SpaceSaving counter pool's byte length -- fixed at construction. */
+function ssGrows(s) { return s.s._count.buffer.byteLength; }
+
+/** SpaceSaving capacity for the perf scenario (a realistic top-k size). */
+const SS_K = 1024;
 
 /** add-stream: hash a walking numeric key + one register max each op (the hot path). */
 const addStream = {
@@ -156,6 +162,33 @@ const ddAddStream = {
 };
 
 /**
+ * add-stream at STEADY-STATE FULL: prime k distinct keys so the summary is at capacity,
+ * then feed a walk of FRESH (never-seen) keys so every op takes the EVICT path -- delete
+ * the min key from the map (backshift), reassign its slot, and re-file it in the forest.
+ * This is SpaceSaving's important 0-alloc case (eviction IS the algorithm). The counter
+ * pools are fixed at construction, so `grows` (a pool's byte length) shows a 0 delta.
+ */
+const ssEvictStream = {
+    name: 'SpaceSaving add-stream steady-state-full (evict every op: map backshift + forest re-file)',
+    setup() {
+        const s = new SpaceSaving(SS_K, { seed: 0x9e3779b1 });
+        for (let k = 0; k < SS_K; k++) s.add(k);      // prime to capacity (full)
+        return { s, v: SS_K, sink: 0 };
+    },
+    hot(s, n) {
+        const ss = s.s;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 0x9e3779b1) | 0;                  // a fresh, unmonitored key every op -> forces evict
+            ss.add(v >>> 0);
+            sink = (sink + ss.size) | 0;               // observe state (defeat DCE)
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: ssGrows(s) }; },
+};
+
+/**
  * The teeth: a per-op call that builds a FRESH array each op -- it MUST trip the gate
  * (scavenges scale with n), proving the instrument catches a real allocation.
  */
@@ -195,10 +228,11 @@ zgcSuite({
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
     // the HyperLogLog(14) register bank is ~16 KB, the CountMinSketch(5, 16384) counter
-    // matrix is ~320 KB, and the default DDSketch(0.01) bin array (maxBins=2048) is ~16 KB;
-    // setup builds each scenario's state twice + harness overhead. grows delta 0 (all three
-    // counters below) is the leak invariant, not the retained-KB headline.
-    maxRetainedKB: 1024,
-    scenarios: [addStream, addHashedStream, cmsAddConsStream, cmsAddPlainStream, cmsEstimateStream, ddAddStream],
+    // matrix is ~320 KB, the default DDSketch(0.01) bin array (maxBins=2048) is ~16 KB, and
+    // the SpaceSaving(1024) fixed pools (key/count/error + forest + map) are ~90 KB; setup
+    // builds each scenario's state twice + harness overhead. grows delta 0 (all four
+    // counters) is the leak invariant, not the retained-KB headline.
+    maxRetainedKB: 2048,
+    scenarios: [addStream, addHashedStream, cmsAddConsStream, cmsAddPlainStream, cmsEstimateStream, ddAddStream, ssEvictStream],
     mustFail: [mustFailAlloc],
 });

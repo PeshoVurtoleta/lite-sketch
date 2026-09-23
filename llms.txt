@@ -1,6 +1,6 @@
 # @zakkster/lite-sketch
 
-Version: 0.3.0
+Version: 0.4.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -14,12 +14,13 @@ It is the approximate-aggregate corner of the suite -- @zakkster/lite-filter is
 approximate MEMBERSHIP, @zakkster/lite-o1 is EXACT O(1), and lite-sketch is
 APPROXIMATE aggregates (count / frequency / quantile / top-k).
 
-v0.3.0 ships three members -- HyperLogLog (distinct-count / cardinality) and
-CountMinSketch (point-query frequency) over the shipped, avalanche-tested two-lane
-64-bit hash, plus DDSketch (relative-error quantiles), which bins raw values on a
-log scale and does NOT use the hash. SpaceSaving (heavy hitters) follows to a stable
-1.0.0. Members share no mutable module state, so a bundler that imports one drops the
-others (tree-shakeable).
+v0.4.0 ships FOUR members -- the complete roster: HyperLogLog (distinct-count /
+cardinality), CountMinSketch (point-query frequency), and SpaceSaving (heavy hitters
+/ top-k) over the shipped, avalanche-tested two-lane 64-bit hash, plus DDSketch
+(relative-error quantiles), which bins raw values on a log scale and does NOT use the
+hash. A 1.0.0 milestone (no new member) will declare this four-member API stable.
+Members share no mutable module state, so a bundler that imports one drops the others
+(tree-shakeable). One member per question: distinct-count, frequency, quantiles, top-k.
 
 ## Exports (from the single main file Sketch.js)
 
@@ -55,7 +56,19 @@ others (tree-shakeable).
   (not bucketed). Fail closed on a bad alpha / value / out-of-indexable-range / count (throws
   typeof-first BEFORE allocation); `quantile` / getters never throw (a bad q -> NaN). Does
   NOT use the two-lane hash.
-- `VERSION` -- string, '0.3.0'.
+- `SpaceSaving` -- class. A zero-GC HEAVY-HITTERS / TOP-K sketch (Metwally et al.) over a
+  fixed `capacity` (k) counters: an intrusive frequency-bucket forest (O(1) increment + find-min)
+  plus a fixed open-addressing key map, over the two-lane hash. `add(key, count = 1)` is
+  amortized O(1), 0 B/op -- increment a monitored key, insert a free slot, or (when full) EVICT
+  the min-count key and reassign its slot at `count = min + count`, `error = min` (eviction IS the
+  algorithm; it NEVER fails at capacity). Guarantee: every key with true freq > N/k is monitored
+  (NO false negatives); a monitored key's true count is in `[count - error, count]`; error <= N/k.
+  `estimate(key)` / `errorOf(key)` are O(1) (0 if not monitored); `topK(n)` / `heavyHitters(threshold)`
+  return sorted entries (COLD, ALLOCATE); `forEach` is alloc-free; `merge(other)` (same-capacity/seed)
+  keeps the top-k. `SpaceSaving.withError(epsilon)` sizes k = ceil(1/epsilon). There is deliberately
+  NO addHashed (it stores key identities, so there is no honest pre-hashed path). Fail closed on a
+  bad ctor arg / key / count (typeof-first, byte-identical no-op); queries never throw.
+- `VERSION` -- string, '0.4.0'.
 
 (The canonical hash is used internally by HyperLogLog / CountMinSketch `add`; a caller who
 brings their own good hash uses `addHashed(hi, lo)`. DDSketch bins raw values -- no hash.
@@ -203,6 +216,56 @@ one. The witness drives uniform + lognormal + pareto positive streams against an
 oracle and GATES the measured relative error at q in {0.5, 0.9, 0.99, 0.999} against alpha. Space
 co-headline: maxBins*8 bytes (fixed) vs the exact sorted array's 8*N bytes. Uniformity is not a factor
 (no hashing); the only approximation is the log-bucket width, bounded by alpha.
+
+## SpaceSaving
+
+    new SpaceSaving(capacity, options?)
+    SpaceSaving.withError(epsilon, options?) -> SpaceSaving
+
+- capacity: k, the number of monitored counters; integer in [1, 2^24]. options { seed = <default
+  uint32> }; an unknown option key throws [lite-sketch] (did-you-mean). Memory is fixed at k counters.
+- withError inverts the guarantee: k = ceil(1/epsilon), epsilon in (0,1); the achieved epsilon (= 1/k)
+  reads back via a getter.
+- Constructor throws [lite-sketch] typeof-first on a bad capacity / seed / option BEFORE allocation.
+
+The algorithm: monitor k (key -> count, error) triples. add(key): if monitored -> increment; if a slot
+is free (< k tracked) -> insert (count, error 0); if FULL -> EVICT the MIN-count monitored key, reassign
+its slot to the newcomer at count = min + count and error = min (the evicted count is the newcomer's max
+over-count). It NEVER fails at capacity -- eviction IS the algorithm. Guarantee: every element with true
+frequency > N/k is monitored (NO false negatives); a monitored key's true count lies in [count - error,
+count]; error <= the current min counter <= N/k.
+
+Hot surface (add is amortized O(1), zero allocation):
+
+- add(key, count = 1) -> this      Add a SAFE-INTEGER key (|key| <= 2^53; 0 is legal) with a positive
+                                  integer count. Increment / insert / evict-min per the state. Fail
+                                  closed: a non-safe-integer key or non-positive-integer count throws
+                                  [lite-sketch] (typeof-first, BYTE-IDENTICAL no-op).
+                                  (There is NO addHashed -- SpaceSaving stores key identities.)
+- estimate(key) -> number         The estimated frequency (an upper bound), or 0 if not monitored. O(1),
+                                  never throws.
+- errorOf(key) -> number          The over-estimate bound (true count in [estimate - errorOf, estimate]),
+                                  or 0 if not monitored. O(1), never throws.
+- forEach(fn) -> void             Alloc-free walk of monitored entries (storage order, NOT sorted):
+                                  fn(key, count, error, ss).
+- topK(n = size) -> Array<{key,count,error}>   The top n by count, DESC. COLD, ALLOCATES. Never throws.
+- heavyHitters(threshold) -> Array<{key,count,error}>   Every monitored key with count > threshold*total
+                                  -- a SUPERSET with NO false negatives (may include false positives);
+                                  filter by (count - error) > threshold*total for the guaranteed subset.
+                                  COLD, ALLOCATES. Never throws.
+- merge(other) -> this            Union two summaries (min-imputation for absent keys), keep the top-k.
+                                  Throws [lite-sketch] on a non-SpaceSaving or unequal capacity/seed;
+                                  the bracket guarantee survives (looser). O(k), a bounded cold scratch.
+- clear() -> this                 Drop all monitored keys; reuse the pools.
+- capacity / size / total         Getters: k; the monitored count (<= k); the exact running sum N.
+- epsilon (getter)                1 / capacity -- the theoretical error fraction.
+- seed (getter)                   The uint32 hash seed.
+
+Accuracy contract (the honesty anchor): the witness drives a Zipfian stream against an exact Map oracle
+and GATES that recall of the true hitters above N/k is 100% (NO false negatives), the bracket
+count - error <= true <= count holds for every monitored key, and error <= N/k. Space co-headline: k
+counters (fixed) vs the exact Map's O(distinct). The over-estimate is one-sided (never undercounts a
+monitored key); uniformity is statistical (the hash), not cryptographic.
 
 ## The hash (ADR 0001)
 

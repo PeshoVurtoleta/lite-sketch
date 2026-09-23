@@ -6,9 +6,11 @@
  */
 
 import {
-    HyperLogLog, CountMinSketch, DDSketch, mix64, hashHi, hashLo, hashString, saltRow, VERSION,
+    HyperLogLog, CountMinSketch, DDSketch, SpaceSaving, mix64, hashHi, hashLo, hashString, saltRow, VERSION,
 } from '../../Sketch.js';
-import type { CountMinSketchOptions, DDSketchOptions } from '../../Sketch.js';
+import type {
+    CountMinSketchOptions, DDSketchOptions, SpaceSavingOptions, SpaceSavingEntry,
+} from '../../Sketch.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -184,3 +186,77 @@ dd.add(1, '5');
 dd.quantile('0.5');
 // @ts-expect-error -- merge takes a DDSketch.
 dd.merge(42);
+
+// --- SpaceSaving -------------------------------------------------------------
+
+const ss: SpaceSaving = new SpaceSaving(1024);
+const ssSeeded: SpaceSaving = new SpaceSaving(1024, { seed: 42 });
+const ssOpts: SpaceSavingOptions = { seed: 1 };
+const ssFull: SpaceSaving = new SpaceSaving(1024, ssOpts);
+void ssSeeded; void ssFull;
+
+// withError is static, returns a SpaceSaving, takes optional options.
+const ssErr: SpaceSaving = SpaceSaving.withError(0.001);
+const ssErrOpts: SpaceSaving = SpaceSaving.withError(0.001, { seed: 7 });
+void ssErr; void ssErrOpts;
+
+// getters are readonly.
+const ssCap: number = ss.capacity;
+const ssSize: number = ss.size;
+const ssTotal: number = ss.total;
+const ssEps: number = ss.epsilon;
+const ssSeed: number = ss.seed;
+void ssCap; void ssSize; void ssTotal; void ssEps; void ssSeed;
+
+// @ts-expect-error -- capacity is readonly.
+ss.capacity = 8;
+// @ts-expect-error -- size is readonly.
+ss.size = 0;
+// @ts-expect-error -- total is readonly.
+ss.total = 0;
+// @ts-expect-error -- epsilon is readonly.
+ss.epsilon = 0.1;
+
+// add -> this (chainable, count optional); estimate / errorOf -> number; merge -> this; clear -> this.
+const ssChained: SpaceSaving = ss.add(1).add(2, 5);
+const ssEst: number = ss.estimate(1);
+const ssErrOf: number = ss.errorOf(1);
+const ssMerged: SpaceSaving = ss.merge(new SpaceSaving(1024));
+const ssCleared: SpaceSaving = ss.clear();
+void ssChained; void ssEst; void ssErrOf; void ssMerged; void ssCleared;
+
+// forEach is alloc-free with a (key, count, error, ss) callback.
+ss.forEach((key: number, count: number, error: number, self: SpaceSaving) => {
+    void key; void count; void error; void self;
+});
+
+// topK / heavyHitters return SpaceSavingEntry[].
+const ssTop: SpaceSavingEntry[] = ss.topK(3);
+const ssTopAll: SpaceSavingEntry[] = ss.topK();
+const ssHH: SpaceSavingEntry[] = ss.heavyHitters(0.01);
+const ssEntry: SpaceSavingEntry = ssTop[0];
+const ek: number = ssEntry.key;
+const ec: number = ssEntry.count;
+const ee: number = ssEntry.error;
+void ssTopAll; void ssHH; void ek; void ec; void ee;
+
+// @ts-expect-error -- capacity must be a number.
+new SpaceSaving('1024');
+// @ts-expect-error -- options.seed must be a number.
+new SpaceSaving(1024, { seed: 'x' });
+// @ts-expect-error -- unknown options are rejected at the type level too.
+new SpaceSaving(1024, { bogus: true });
+// @ts-expect-error -- add key must be a number.
+ss.add('1');
+// @ts-expect-error -- add count must be a number.
+ss.add(1, '5');
+// @ts-expect-error -- estimate key must be a number.
+ss.estimate('1');
+// @ts-expect-error -- errorOf key must be a number.
+ss.errorOf('1');
+// @ts-expect-error -- merge takes a SpaceSaving.
+ss.merge(42);
+// @ts-expect-error -- withError epsilon must be a number.
+SpaceSaving.withError('0.001');
+// @ts-expect-error -- SpaceSaving has no addHashed (it stores key identities).
+ss.addHashed(1, 2);

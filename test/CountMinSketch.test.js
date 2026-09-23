@@ -60,8 +60,8 @@ function makeZipf(nKeys, skew, rng) {
     };
 }
 
-test('VERSION is the frozen 0.3.0 string', () => {
-    assert.equal(VERSION, '0.3.0');
+test('VERSION is the frozen 0.4.0 string', () => {
+    assert.equal(VERSION, '0.4.0');
 });
 
 // --- ctor power-of-two round-up + getters -----------------------------------

@@ -17,7 +17,7 @@
 // The max |relerr| <= ~3.5 sigma (the ~3-sigma tail with a small-trial allowance). The
 // absolute error-halving ratio is REPORTED for the eye but not gated (sampling noise).
 
-import { HyperLogLog, CountMinSketch, DDSketch } from '../Sketch.js';
+import { HyperLogLog, CountMinSketch, DDSketch, SpaceSaving } from '../Sketch.js';
 
 const PS = [10, 12, 14];
 const NS = [1000, 10000, 100000];
@@ -372,7 +372,78 @@ console.log('  space co-headline @ N=' + fmtInt(DD_N) + ':  DDSketch maxBins=' +
 console.log('');
 console.log('WITNESS DDSketch ' + (ddOk ? 'ok' : 'FAIL'));
 
-const ok2 = hllOk && cmsOk && ddOk;
+// ---------------------------------------------------------------------------
+// SpaceSaving -- heavy hitters / top-k vs the exact Map oracle
+// ---------------------------------------------------------------------------
+// The defining guarantee: every element with true frequency > N/k is monitored
+// (NO false negatives), a monitored key's true count lies in [count-error, count]
+// (the interval brackets truth), and error <= N/k. We drive a Zipfian stream against
+// an exact Map oracle over a capacity sweep and GATE: recall of the true hitters
+// above N/k is 100% (0 misses), the bracket holds for every monitored key, and the
+// max error <= N/k. The FOIL is the exact Map, whose memory grows O(distinct) while
+// SpaceSaving stays a fixed k counters.
+const SS_N = 200000;
+const SS_KEYS = 20000;
+const SS_SKEW = 1.2;
+const SS_CAPS = [128, 512, 2048];
+
+console.log('');
+console.log('ACCURACY Witness -- SpaceSaving heavy-hitters vs the exact-Map oracle ' +
+    '(Zipfian stream, skew=' + SS_SKEW + '; guarantee: freq > N/k => monitored, count-error <= true <= count, error <= N/k)');
+console.log('');
+console.log('  k      N        distinct  trueHH>N/k  recall    bracketOK  maxErr  N/k bound  err<=N/k');
+console.log('  -----  -------  --------  ----------  --------  ---------  ------  ---------  --------');
+
+let ssOk = true;
+for (const k of SS_CAPS) {
+    const rng = makeCmsRng(0x5A5A0000 ^ k);
+    const zipf = makeZipf(SS_KEYS, SS_SKEW, rng);
+    const ss = new SpaceSaving(k, { seed: 0x9e3779b1 });
+    const truth = new Map();
+    for (let i = 0; i < SS_N; i++) {
+        const key = zipf();
+        ss.add(key);
+        truth.set(key, (truth.get(key) || 0) + 1);
+    }
+    const threshold = SS_N / k;
+    // recall: every true hitter above N/k must be monitored (estimate > 0)
+    let trueHH = 0, found = 0;
+    for (const [key, c] of truth) {
+        if (c > threshold) { trueHH++; if (ss.estimate(key) > 0) found++; }
+    }
+    const recall = trueHH === 0 ? 1 : found / trueHH;
+    // bracket + max error over every monitored key
+    let bracketOk = true, maxErr = 0;
+    ss.forEach((key, count, error) => {
+        const t = truth.get(key) || 0;
+        if (!(count - error <= t && t <= count)) bracketOk = false;
+        if (error > maxErr) maxErr = error;
+    });
+    const errOk = maxErr <= threshold;
+    const cellOk = recall === 1 && bracketOk && errOk;
+    if (!cellOk) ssOk = false;
+    console.log('  ' + String(k).padEnd(5) + '  ' + nStr(SS_N).padEnd(7) + '  ' +
+        String(truth.size).padStart(8) + '  ' + String(trueHH).padStart(10) + '  ' +
+        (pct(recall) + (recall === 1 ? '' : ' !')).padStart(8) + '  ' +
+        (bracketOk ? 'ok' : 'FAIL').padStart(9) + '  ' + String(maxErr).padStart(6) + '  ' +
+        threshold.toFixed(1).padStart(9) + '  ' + (errOk ? 'ok' : 'FAIL').padStart(8) +
+        (cellOk ? '' : '   <- FAIL'));
+}
+
+// Space co-headline: SpaceSaving is a fixed k counters; the exact Map grows O(distinct).
+console.log('');
+const ssSpaceK = 512;
+const ssBytesPerCounter = 8 + 8 + 8;   // key + count + error, Float64 each (plus the fixed map/forest pools)
+const ssSpaceBytes = ssSpaceK * ssBytesPerCounter;
+const mapBytes = SS_KEYS * (8 + 8);    // a Map of distinct keys, >= key + count per entry (references/slots are more)
+console.log('  space co-headline @ N=' + fmtInt(SS_N) + ', distinct=' + fmtInt(SS_KEYS) + ':  SpaceSaving k=' +
+    ssSpaceK + ' = ' + (ssSpaceBytes / 1024).toFixed(1) + ' KB (fixed)  vs  exact Map >= ' +
+    (mapBytes / 1024).toFixed(1) + ' KB (grows O(distinct))');
+
+console.log('');
+console.log('WITNESS SpaceSaving ' + (ssOk ? 'ok' : 'FAIL'));
+
+const ok2 = hllOk && cmsOk && ddOk && ssOk;
 console.log('');
 console.log('WITNESS lite-sketch (all members) ' + (ok2 ? 'ok' : 'FAIL'));
 if (!ok2) process.exitCode = 1;

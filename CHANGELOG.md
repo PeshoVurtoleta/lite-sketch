@@ -8,6 +8,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.4.0] - 2026-09-23
+
+The heavy-hitters member, pure-appended -- the roster is complete (four members).
+
+### Added
+
+- **`SpaceSaving` -- the heavy-hitters / top-k member: zero-GC frequent-item tracking over an
+  unbounded stream in `k` fixed counters** (Metwally, Agrawal & El Abbadi, "Efficient Computation of
+  Frequent and Top-k Elements in Data Streams"). `add(key, count = 1)` is amortized O(1), 0 B/op:
+  increment a monitored key, insert a free slot, or -- when full -- EVICT the minimum-count key and
+  reassign its slot to the newcomer at `count = min + count`, `error = min` (eviction IS the
+  algorithm; it never fails at capacity). Guarantee: every element with true frequency > N/k is
+  monitored (NO false negatives), a monitored key's true count lies in `[count - error, count]`, and
+  `error <= N/k`. `estimate(key)` / `errorOf(key)` are O(1) (0 if not monitored, never throw);
+  `topK(n)` and `heavyHitters(threshold)` return `{key, count, error}` entries sorted by count
+  (COLD, allocate); `forEach` is alloc-free; `merge(other)` (same-capacity-and-seed) keeps the top-k.
+  `SpaceSaving.withError(epsilon)` sizes `k = ceil(1/epsilon)`. Getters: `capacity` / `size` /
+  `total` / `epsilon` (= 1/capacity) / `seed`. Uses the shared two-lane hash. See
+  [`decisions/0005`](./decisions/0005-spacesaving.md).
+- **The substrate synthesizes the suite** (by design-parity, never a runtime dep): an intrusive
+  frequency-bucket forest (the `@zakkster/lite-o1` `FreqO1` pattern) gives O(1) increment + find-min;
+  a fixed open-addressing key map with backshift deletion (the `CuckooMap` idiom) maps keys to
+  counters. All pools are allocated once at construction -- the hot path, INCLUDING eviction (map
+  backshift + forest re-file), is 0 B/op (torture-gated at steady-state-full where every op evicts).
+- **`heavyHitters` returns a SUPERSET** (`count > threshold * total`): every true heavy hitter is
+  included (no false negatives -- SpaceSaving's defining property), possibly with a few false
+  positives. Each entry carries `error`, so `(count - error) > threshold * total` recovers the
+  guaranteed-frequent subset. There is deliberately **no `addHashed`**: a heavy-hitters sketch must
+  retain each key's identity, so there is no honest pre-hashed fast path.
+- **Fail closed:** the ctor throws `[lite-sketch]` typeof-first on a bad `capacity` / `seed` /
+  unknown option (did-you-mean) BEFORE any allocation; `add` typeof-guards a safe-integer key
+  (0 is a legal key) and a positive-integer count (a rejected add is a byte-identical no-op);
+  `merge` fails closed on a non-SpaceSaving or an unequal capacity/seed; queries never throw.
+- **Chassis extended:** the accuracy witness gates 100% recall of true hitters above N/k (zero false
+  negatives), the `[count - error, count]` bracket, and `error <= N/k` on a Zipfian stream vs an
+  exact `Map` oracle; the torture gate proves `add` at 0 B/op including the eviction path; the perf
+  gate adds a steady-state-full evict-every-op scenario.
+
+### Changed
+
+- `VERSION` -> `'0.4.0'` (three-site synced with `package.json` and `llms.txt`). `HyperLogLog`,
+  `CountMinSketch`, `DDSketch`, and the shared hash are byte-identical -- SpaceSaving is a pure
+  append. This completes the four-member roster; a `1.0.0` milestone will declare the API stable.
+
 ## [0.3.0] - 2026-09-23
 
 The quantile member, pure-appended -- the family's first hard per-query bound.

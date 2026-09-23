@@ -18,7 +18,7 @@ async function main() {
     }
     const { GcProfiler, checkNoGc, measureAllocs } = await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { HyperLogLog, CountMinSketch, DDSketch } = await import('../Sketch.js');
+    const { HyperLogLog, CountMinSketch, DDSketch, SpaceSaving } = await import('../Sketch.js');
 
     const noop = () => {};
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -76,6 +76,25 @@ async function main() {
     let ddLive = ddTracker.size();
     for (let g = 0; g < 20 && ddLive > 0; g++) { globalThis.gc(); await sleep(25); ddLive = ddTracker.size(); }
     const ddFindings = ddTracker.audit();
+
+    // ---- phase 1d: SpaceSaving retention (build/fill-past-capacity/clear cycles reclaim fully?) ----
+    const ssTracker = createLeakTracker();
+    function fillSsTracker() {
+        for (let i = 0; i < 256; i++) {
+            const ss = new SpaceSaving(256, { seed: (0x9e3779b1 ^ i) >>> 0 });
+            for (let k = 0; k < 4096; k++) ss.add(((k * 2654435761) ^ i) | 0);  // fill PAST capacity -> evictions
+            ss.estimate(0);            // exercise the query path
+            ss.topK(3);                // exercise the cold ALLOCATING path (its garbage must reclaim too)
+            ss.clear();
+            ssTracker.track(ss, noop, 'spacesaving', { audit: true });
+        }
+        return ssTracker.size();
+    }
+    const ssTrackedMid = fillSsTracker();
+    const ssTrackedOk = ssTrackedMid > 0;
+    let ssLive = ssTracker.size();
+    for (let g = 0; g < 20 && ssLive > 0; g++) { globalThis.gc(); await sleep(25); ssLive = ssTracker.size(); }
+    const ssFindings = ssTracker.audit();
 
     // ---- phase 2a: 0 B/op on the hot path ----
     // add(key): hash a numeric key + one register max. Built/primed OUTSIDE the window.
@@ -185,12 +204,51 @@ async function main() {
     const ddBytes = Math.max(0, Math.round(ddBpc));
     const ddOk = ddBytes === 0;
 
+    // ---- phase 2a-ss: 0 B/op on the SpaceSaving hot path ----
+    const SSK = 4096;
+    // ss.add EVICT: prime k distinct keys (FULL / at capacity), then a walking NEW key each op
+    // forces the eviction path (map backshift-delete + slot reassign + bucket-forest move) EVERY
+    // op -- the important 0-B/op case.
+    const ssE = new SpaceSaving(SSK, { seed: 0x9e3779b1 });
+    for (let k = 0; k < SSK; k++) ssE.add(k);        // fill to capacity (steady-state FULL)
+    // Push _total past 2^31 BEFORE measuring so `_total += count` runs against a DOUBLE field
+    // during the window -- proves the running total does not box a HeapNumber per op (a per-op
+    // box would show as > 0 B/op below). key 0 becomes a high counter, never the evicted min.
+    ssE.add(0, 0xffffffff);
+    ssE.add(0, 0xffffffff);
+    let ssEKey = SSK, ssESink = 0;
+    const ssEStep = () => {
+        ssEKey++;                                    // a FRESH key each op -> forces eviction
+        ssE.add(ssEKey);
+        ssESink = (ssESink + ssE.size) | 0;          // observe (defeat DCE)
+    };
+    const ssERes = measureAllocs(ssEStep, { iterations: 100000, batches: 8 });
+    const ssEBpc = ssERes.bytesPerCall === null ? 0 : ssERes.bytesPerCall;
+    const ssEBytes = Math.max(0, Math.round(ssEBpc));
+    const ssEOk = ssEBytes === 0;
+
+    // ss.add BUMP: re-add already-monitored keys (present -> pure bucket-forest bump, no evict).
+    const ssB = new SpaceSaving(SSK, { seed: 0x1234 });
+    for (let k = 0; k < SSK; k++) ssB.add(k);        // fill to capacity; every key is monitored
+    ssB.add(0, 0xffffffff);                          // push _total past 2^31 (see above)
+    ssB.add(0, 0xffffffff);
+    let ssBi = 0, ssBSink = 0;
+    const ssBStep = () => {
+        ssBi++; if (ssBi >= SSK) ssBi = 0;           // rotate over the monitored keys
+        ssB.add(ssBi);                               // present -> bump, no eviction
+        ssBSink = (ssBSink + ssB.size) | 0;          // observe (defeat DCE)
+    };
+    const ssBRes = measureAllocs(ssBStep, { iterations: 100000, batches: 8 });
+    const ssBBpc = ssBRes.bytesPerCall === null ? 0 : ssBRes.bytesPerCall;
+    const ssBBytes = Math.max(0, Math.round(ssBBpc));
+    const ssBOk = ssBBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run ----
     const gc = new GcProfiler().start();
     const HOT = 2000000;
     let SINK = 0;
-    for (let i = 0; i < HOT; i++) { addStep(); ccStep(); ceStep(); ddStep(); }   // HLL + CMS + DD hot ops
-    SINK += addSink + ahSink + ccSink + cpSink + chSink + ceSink + ddSink;
+    for (let i = 0; i < HOT; i++) { addStep(); ccStep(); ceStep(); ddStep(); ssEStep(); ssBStep(); }   // HLL + CMS + DD + SpaceSaving hot ops
+    SINK += addSink + ahSink + ccSink + cpSink + chSink + ceSink + ddSink + ssESink + ssBSink;
     await sleep(50);
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
@@ -200,6 +258,7 @@ async function main() {
     const reuse = new HyperLogLog(14, 0x1234);
     const cmsReuse = new CountMinSketch(6, 1 << 13, { seed: 0x1234 });
     const ddReuse = new DDSketch(0.01);
+    const ssReuse = new SpaceSaving(1024, { seed: 0x1234 });
     for (let c = 0; c < 200; c++) {
         for (let k = 0; k < M; k++) reuse.add((k ^ c) | 0);
         reuse.count();
@@ -210,6 +269,9 @@ async function main() {
         for (let k = 1; k <= 8192; k++) ddReuse.add(((k ^ c) & 0x3fffffff) | 1);
         ddReuse.quantile(0.9);
         ddReuse.clear();              // O(maxBins) fill(0), no new store
+        for (let k = 0; k < 8192; k++) ssReuse.add(((k * 2654435761) ^ c) | 0);   // fill past capacity -> evictions
+        ssReuse.estimate(c);
+        ssReuse.clear();             // O(M) occ fill + O(k) free-list, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -218,32 +280,39 @@ async function main() {
 
     // ---- verdict + GATE line ----
     const cmsAllocOk = ccOk && cpOk && chOk && ceOk;
+    const ssAllocOk = ssEOk && ssBOk;
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         cmsTrackedOk && cmsLive === 0 && cmsFindings.length === 0 &&
         ddTrackedOk && ddLive === 0 && ddFindings.length === 0 &&
-        addOk && ahOk && cmsAllocOk && ddOk && report.ok && abOk;
-    const gateLive = live + cmsLive + ddLive;
-    const gateFindings = findings.length + cmsFindings.length + ddFindings.length;
+        ssTrackedOk && ssLive === 0 && ssFindings.length === 0 &&
+        addOk && ahOk && cmsAllocOk && ddOk && ssAllocOk && report.ok && abOk;
+    const gateLive = live + cmsLive + ddLive + ssLive;
+    const gateFindings = findings.length + cmsFindings.length + ddFindings.length + ssFindings.length;
     console.log(
         'GATE leak=size ' + gateLive + '/0 findings=' + gateFindings +
         ' | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) +
         ' | alloc=' + addBytes + ' B/op (HyperLogLog add) ' + ahBytes + ' B/op (HyperLogLog addHashed) ' +
         ccBytes + ' B/op (CountMinSketch add cons) ' + cpBytes + ' B/op (CountMinSketch add plain) ' +
         chBytes + ' B/op (CountMinSketch addHashed) ' + ceBytes + ' B/op (CountMinSketch estimate) ' +
-        ddBytes + ' B/op (DDSketch add)' +
+        ddBytes + ' B/op (DDSketch add) ' +
+        ssEBytes + ' B/op (SpaceSaving add evict) ' + ssBBytes + ' B/op (SpaceSaving add bump)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + '/' + cmsTrackedMid + '/' + ddTrackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + '/' + cmsTrackedMid + '/' + ddTrackedMid + '/' + ssTrackedMid +
+        ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: HLL tracker held ' + trackedMid + ' (expected > 0)');
         if (!cmsTrackedOk) console.error('  vacuous: CMS tracker held ' + cmsTrackedMid + ' (expected > 0)');
         if (!ddTrackedOk) console.error('  vacuous: DD tracker held ' + ddTrackedMid + ' (expected > 0)');
+        if (!ssTrackedOk) console.error('  vacuous: SS tracker held ' + ssTrackedMid + ' (expected > 0)');
         if (live !== 0) console.error('  retain: ' + live + ' HyperLogLog instances survived');
         if (cmsLive !== 0) console.error('  retain: ' + cmsLive + ' CountMinSketch instances survived');
         if (ddLive !== 0) console.error('  retain: ' + ddLive + ' DDSketch instances survived');
+        if (ssLive !== 0) console.error('  retain: ' + ssLive + ' SpaceSaving instances survived');
         for (const f of findings) console.error('  finding ' + f.kind + ':' + f.reason);
         for (const f of cmsFindings) console.error('  cms finding ' + f.kind + ':' + f.reason);
         for (const f of ddFindings) console.error('  dd finding ' + f.kind + ':' + f.reason);
+        for (const f of ssFindings) console.error('  ss finding ' + f.kind + ':' + f.reason);
         if (!addOk) console.error('  alloc ' + addBytes + ' B/op HyperLogLog add (raw ' + addBpc + ')');
         if (!ahOk) console.error('  alloc ' + ahBytes + ' B/op HyperLogLog addHashed (raw ' + ahBpc + ')');
         if (!ccOk) console.error('  alloc ' + ccBytes + ' B/op CountMinSketch add cons (raw ' + ccBpc + ')');
@@ -251,6 +320,8 @@ async function main() {
         if (!chOk) console.error('  alloc ' + chBytes + ' B/op CountMinSketch addHashed (raw ' + chBpc + ')');
         if (!ceOk) console.error('  alloc ' + ceBytes + ' B/op CountMinSketch estimate (raw ' + ceBpc + ')');
         if (!ddOk) console.error('  alloc ' + ddBytes + ' B/op DDSketch add (raw ' + ddBpc + ')');
+        if (!ssEOk) console.error('  alloc ' + ssEBytes + ' B/op SpaceSaving add evict (raw ' + ssEBpc + ')');
+        if (!ssBOk) console.error('  alloc ' + ssBBytes + ' B/op SpaceSaving add bump (raw ' + ssBBpc + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

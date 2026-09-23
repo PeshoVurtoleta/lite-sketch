@@ -5,14 +5,15 @@
  * one axis over: measured error vs the theoretical error), while allocating ZERO
  * bytes on every hot op (the lite-o1 zero-GC discipline).
  *
- * v0.3.0 ships THREE members -- HyperLogLog (cardinality / distinct-count over an
+ * v0.4.0 ships FOUR members -- HyperLogLog (cardinality / distinct-count over an
  * unbounded stream in fixed space, via a dense Uint8Array register bank),
  * CountMinSketch (point-query frequency estimation over a Uint32Array counter
- * matrix), both over the canonical two-lane 64-bit non-crypto hash, and DDSketch
+ * matrix), both over the canonical two-lane 64-bit non-crypto hash, DDSketch
  * (relative-error quantiles over a Float64Array of log-scale bins -- NOT hashed,
- * it bins raw values). Future members (SpaceSaving, ...) are PURE-APPENDED below
- * the shared hash + these classes; prior members stay byte-identical, only this
- * header + VERSION change.
+ * it bins raw values), and SpaceSaving (heavy-hitters / top-k over a fixed
+ * counter set with an intrusive count-bucket forest + open-addressing key map).
+ * Future members are PURE-APPENDED below the shared hash + these classes; prior
+ * members stay byte-identical, only this header + VERSION change.
  *
  * ASCII-only source (no Unicode). Zero runtime deps; node:test only.
  *
@@ -20,7 +21,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 // ===========================================================================
 // The canonical two-lane 64-bit hash (ADR 0001 -- LOCKED)
@@ -1235,5 +1236,606 @@ export class DDSketch {
         throw new TypeError(
             '[lite-sketch] DDSketch unknown option "' + String(key) +
             '"; known options: ' + Object.keys(DD_KNOWN_OPTS).join(', '));
+    }
+}
+
+// === SpaceSaving (ADR 0005) -- the heavy-hitters / top-k member ===
+
+/** Highest legal counter capacity k. A TYPE bound (k typed arrays + a 2k map), not a size any host materializes. */
+const SS_CAP_MAX = 1 << 24;
+/** Frozen marker of the known option keys -- an unknown key is a throw with a did-you-mean. */
+const SS_KNOWN_OPTS = Object.freeze({ seed: true });
+/** Default per-instance seed (shared with the other members so a default-seeded SpaceSaving hashes identically). */
+const SS_DEFAULT_SEED = HLL_DEFAULT_SEED;
+
+/**
+ * SpaceSaving -- HEAVY-HITTERS / TOP-K estimation over an unbounded stream in FIXED
+ * space (Metwally, Agrawal, El Abbadi -- "Efficient Computation of Frequent and Top-k
+ * Elements in Data Streams", ICDT 2005). Monitor at most k counters; every stream
+ * element either bumps a monitored counter, fills a free slot, or -- when full -- EVICTS
+ * the MIN-count key and reassigns its slot to the newcomer at `count = min + count` with
+ * `error = min`. It NEVER fails at capacity (eviction IS the algorithm).
+ *
+ * Headline (the guarantee): any key with true frequency `> N / k` (N = the total mass) is
+ * GUARANTEED monitored; a monitored key's true count is bracketed in `[count - error,
+ * count]`; and `error <= min counter <= N / k`. So `epsilon = 1 / k` is the relative error
+ * on the reported count. `heavyHitters(threshold)` returns every monitored key with
+ * `count > threshold * total` -- a SUPERSET with NO FALSE NEGATIVES (a true hitter is never
+ * missed); it may include false positives. For the guaranteed-frequent subset, filter the
+ * results by `(count - error) > threshold * total`.
+ *
+ * Substrate (all typed arrays allocated ONCE in the ctor; every hot op is 0-alloc):
+ *   - k COUNTER SLOTS: `_key` / `_count` / `_error` (Float64Array; safe-int keys exact to
+ *     2^53). Each slot links into an intrusive COUNT-BUCKET FOREST: `_cNext` / `_cPrev`
+ *     (its sibling list within a bucket) + `_cBucket` (its owning bucket id).
+ *   - a BUCKET POOL of at most k distinct count-values: `_bVal` (the count a bucket
+ *     represents), `_bNext` / `_bPrev` (a doubly-linked list of buckets sorted ASCENDING by
+ *     `_bVal`), `_bHead` (the head counter-slot of the bucket's sibling list; -1 = empty), a
+ *     free-list `_bFree` + `_bFreeTop`, and `_minBucket` (the lowest-value bucket, -1 when
+ *     empty). The min-count key is therefore `O(1)`: the head of the min bucket.
+ *   - an OPEN-ADDRESSING key map (`M = next pow2 >= 2k`, load <= 0.5): `_mapKey`
+ *     (Float64Array), `_mapOcc` (Uint8Array so key 0 is a legal, distinguishable key --
+ *     "null is not zero"), `_mapSlot` (Int32Array), `_mask = M - 1`. Linear probe with
+ *     Knuth BACKSHIFT deletion (no tombstones), so an eviction's map-delete keeps the probe
+ *     invariants exact. The map's canonical home is `_hash(storedKey) & _mask` for EVERY
+ *     entry, so the backshift can recompute a home from a stored key with one consistent
+ *     function.
+ *
+ * Hot path (`add`, 0 B/op amortized): the HI-lane murmur is INLINED into int32 LOCALS exactly
+ * like `HyperLogLog.add` -- it never writes the module HASH_HI / HASH_LO slots, so a uint32
+ * >= 2^31 home never boxes a HeapNumber. A `add` is one of three O(1)-amortized cases:
+ * monitored -> bump (detach + re-attach one slot, the target bucket is the immediate next in
+ * sorted order for a unit add); free slot -> insert at count with error 0; full -> evict the
+ * min key (map-delete via backshift, reassign the slot, move it from bucket `min` to bucket
+ * `min + count`). A WEIGHTED add (count > 1) walks forward across the distinct bucket-values
+ * it crosses (documented: unit adds amortize O(1); a weighted add is O(bucket-values crossed)).
+ *
+ * NO addHashed: unlike HyperLogLog / CountMinSketch (which keep only aggregate counters),
+ * SpaceSaving must RETAIN each key's identity -- to return it from topK / forEach and to
+ * re-probe it on eviction -- so there is no honest pre-hashed fast path (a hash alone is not
+ * an identity). `add(key)` is the only ingest; it stores the key and hashes it internally.
+ *
+ * Exact vs approximate (disclosed): `total` (N), `size`, `capacity`, `epsilon` are EXACT;
+ * `estimate` / `errorOf` are the bracketed approximate counts. `topK` / `heavyHitters` /
+ * `merge` are COLD and ALLOCATE (disclosed, the lite-o1 iterator precedent) -- they build
+ * and sort result arrays; keep them off the hot path. `forEach` is alloc-free (storage
+ * order, NOT sorted).
+ *
+ * merge (Cormode / Hadjieleftheriou): merges another same-(capacity, seed) summary. Over the
+ * UNION of monitored keys, `mergedCount(key) = countThis(key) + countOther(key)` where a key
+ * ABSENT from a summary is credited that summary's MIN counter (its unmonitored-mass upper
+ * bound; 0 if that summary is not yet full), and `mergedError = errorThis + errorOther` with
+ * an absent summary contributing its min as error too. The k highest merged counts are kept
+ * and this's map + forest are rebuilt. The `[count - error, count]` bracket is PRESERVED
+ * (still sound) but LOOSER after a merge. COLD, with a bounded scratch allocation (disclosed).
+ * Fails closed on an incompatible (capacity / seed) other.
+ *
+ * Fail closed: a bad capacity / seed / unknown option throws `[lite-sketch]` at the ctor door
+ * BEFORE any allocation (no half-built instance); `add` typeof-guards the key (a safe integer)
+ * + count FIRST (a Symbol / BigInt / NaN / non-integer / out-of-range key or count is a
+ * throw, never a silent miss); `estimate` / `errorOf` / `topK` / `heavyHitters` / getters /
+ * a valid `merge` never throw (a bad key estimates 0, an incompatible merge throws). null is
+ * not zero.
+ */
+export class SpaceSaving {
+    /**
+     * @param {number} capacity  counter count k; an integer in [1, 2^24]. epsilon = 1 / k.
+     * @param {{seed?: number}} [options]  seed: uint32 hash seed (any integer, coerced with `| 0`).
+     */
+    constructor(capacity, options) {
+        // typeof guard FIRST, BEFORE any allocation (Number.isInteger never coerces; false on
+        // a Symbol / BigInt), and String(x) in the cold message is Symbol / BigInt-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > SS_CAP_MAX) {
+            return this._badCapacity(capacity);
+        }
+        let seed = SS_DEFAULT_SEED;
+        if (options !== undefined) {
+            if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+                throw new TypeError(
+                    '[lite-sketch] SpaceSaving options must be a plain object, got ' + String(options));
+            }
+            const keys = Object.keys(options);
+            for (let i = 0; i < keys.length; i++) {
+                if (!(keys[i] in SS_KNOWN_OPTS)) this._badOption(keys[i]);
+            }
+            if (options.seed !== undefined) {
+                seed = options.seed;
+                if (typeof seed !== 'number' || !Number.isInteger(seed)) {
+                    throw new RangeError(
+                        '[lite-sketch] SpaceSaving seed must be an integer, got ' + String(seed));
+                }
+            }
+        }
+        const k = capacity;
+        // Map capacity: next power of two >= 2k (load <= 0.5, so probing stays short).
+        let M = 1;
+        while (M < 2 * k) M <<= 1;
+        // Allocate LAST (no half-built instance on any thrown path above).
+        this._capacity = k;
+        this._seed = seed | 0;          // SMI-safe (signed int32); murmur uses it as `s | 0` either way
+        // counter slots
+        this._key = new Float64Array(k);
+        this._count = new Float64Array(k);
+        this._error = new Float64Array(k);
+        // intrusive count-bucket forest (per-slot links)
+        this._cNext = new Int32Array(k);
+        this._cPrev = new Int32Array(k);
+        this._cBucket = new Int32Array(k);
+        // bucket pool (at most k distinct count-values), sorted ascending by _bVal
+        this._bVal = new Float64Array(k);
+        this._bNext = new Int32Array(k);
+        this._bPrev = new Int32Array(k);
+        this._bHead = new Int32Array(k);
+        this._bFree = new Int32Array(k);
+        for (let i = 0; i < k; i++) this._bFree[i] = i;   // free-list: all k bucket ids
+        this._bFreeTop = k;
+        this._minBucket = -1;
+        // open-addressing key -> slot map
+        this._mapKey = new Float64Array(M);
+        this._mapOcc = new Uint8Array(M);
+        this._mapSlot = new Int32Array(M);
+        this._mask = M - 1;
+        // scalars
+        this._size = 0;
+        this._total = 0;
+    }
+
+    /** Counter capacity k. O(1). */
+    get capacity() { return this._capacity; }
+    /** Number of monitored keys (<= capacity). O(1). */
+    get size() { return this._size; }
+    /** Total mass N added (sum of every `count`). O(1). */
+    get total() { return this._total; }
+    /** The relative-error target 1 / k. O(1). */
+    get epsilon() { return 1 / this._capacity; }
+    /** The uint32 hash seed. O(1). */
+    get seed() { return this._seed >>> 0; }
+
+    /**
+     * Build a SpaceSaving sized to a target relative error: `k = min(ceil(1/epsilon),
+     * 2^24)`. Delegates all remaining validation to the ctor.
+     * @param {number} epsilon relative error, in (0, 1). epsilon = 1 / k.
+     * @param {{seed?: number}} [options]
+     * @returns {SpaceSaving}
+     */
+    static withError(epsilon, options) {
+        if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
+            throw new RangeError(
+                '[lite-sketch] SpaceSaving.withError epsilon must be in (0, 1), got ' + String(epsilon));
+        }
+        const k = Math.min(Math.ceil(1 / epsilon), SS_CAP_MAX);
+        return new SpaceSaving(k, options);
+    }
+
+    /**
+     * Add a numeric key with a positive integer `count` (default 1). HOT, 0 B/op amortized.
+     * Hashes the key to one lane, probes the map, then dispatches: monitored -> bump; free
+     * slot -> insert (count, error 0); full -> evict the min-count key and reassign its slot
+     * to the newcomer at `count = min + count`, `error = min`. NEVER fails at capacity.
+     *
+     * The HI-lane murmur is INLINED (identical math to mix64) into int32 LOCALS so it never
+     * writes the module HASH_HI / HASH_LO slots (a uint32 >= 2^31 home never boxes a
+     * HeapNumber on the hot path).
+     *
+     * Fails closed: a non-number / NaN / non-integer / out-of-safe-range key or a
+     * non-positive-integer count throws `[lite-sketch]` -- the typeof guards run FIRST.
+     * @param {number} key   a safe integer, |key| <= 2^53 - 1
+     * @param {number} [count=1] a positive integer
+     * @returns {SpaceSaving} this
+     */
+    add(key, count = 1) {
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            Math.abs(key) > 9007199254740991) return this._badKey(key);
+        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+            return this._badCount(count);
+        }
+        // inline HI-lane murmur into an int32 local (the map needs one lane).
+        let a = key;
+        let neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const s = this._seed;
+        let h = s;
+        h = _m3round(h, lo);
+        h = _m3round(h, hiw ^ neg);
+        h = _m3final(h ^ 8);                        // HI lane (int32 local); == _hash(key)
+        const i = this._probe(key, h);
+        if (this._mapOcc[i] === 1) {                // monitored -> bump
+            this._bump(this._mapSlot[i], count);
+            this._total += count;
+            return this;
+        }
+        if (this._size < this._capacity) {          // free slot -> insert
+            const sl = this._size++;
+            this._key[sl] = key;
+            this._count[sl] = count;
+            this._error[sl] = 0;
+            this._mapOcc[i] = 1;
+            this._mapKey[i] = key;
+            this._mapSlot[i] = sl;
+            this._attach(sl, count, -1);
+            this._total += count;
+            return this;
+        }
+        // FULL -> evict the min-count key, reassign its slot to the newcomer.
+        const minB = this._minBucket;
+        const sl = this._bHead[minB];
+        const m = this._bVal[minB];
+        this._mapDeleteKey(this._key[sl]);          // remove the evicted key from the map
+        this._key[sl] = key;
+        this._error[sl] = m;
+        const nv = m + count;
+        this._count[sl] = nv;
+        const prevB = this._bPrev[minB];            // value < m < nv (a valid lower hint)
+        this._detach(sl);
+        this._attach(sl, nv, prevB);
+        const j = this._probe(key, h);              // re-probe: the map shifted during delete
+        this._mapOcc[j] = 1;
+        this._mapKey[j] = key;
+        this._mapSlot[j] = sl;
+        this._total += count;
+        return this;
+    }
+
+    /**
+     * The estimated (upper-bound) count of a key: `_count[slot]` if monitored, else 0. HOT,
+     * 0 B/op. NEVER throws -- an un-addable key is not monitored, so its estimate is 0.
+     * @param {number} key
+     * @returns {number}
+     */
+    estimate(key) {
+        if (typeof key !== 'number' || key !== key) return 0;
+        const h = this._hash(key);
+        const i = this._probe(key, h);
+        return this._mapOcc[i] === 1 ? this._count[this._mapSlot[i]] : 0;
+    }
+
+    /**
+     * The over-estimation error of a key: `_error[slot]` if monitored, else 0. The true count
+     * is in `[estimate(key) - errorOf(key), estimate(key)]`. HOT, 0 B/op. NEVER throws.
+     * @param {number} key
+     * @returns {number}
+     */
+    errorOf(key) {
+        if (typeof key !== 'number' || key !== key) return 0;
+        const h = this._hash(key);
+        const i = this._probe(key, h);
+        return this._mapOcc[i] === 1 ? this._error[this._mapSlot[i]] : 0;
+    }
+
+    /**
+     * Iterate the monitored entries in STORAGE order (NOT sorted), alloc-free, calling
+     * `fn(key, count, error, this)`. O(size). A HOISTED callback keeps this a 0-alloc scan.
+     * @param {(key:number, count:number, error:number, ss:SpaceSaving)=>void} fn
+     * @returns {void}
+     */
+    forEach(fn) {
+        const n = this._size;
+        const keys = this._key, counts = this._count, errors = this._error;
+        for (let i = 0; i < n; i++) fn(keys[i], counts[i], errors[i], this);
+    }
+
+    /**
+     * The top-n monitored entries by count, DESCENDING. COLD, ALLOCATES (disclosed): builds
+     * and sorts a result array of `{key, count, error}`. `n` defaults to `size`; it is
+     * clamped to `[0, size]`. NEVER throws.
+     * @param {number} [n=size]
+     * @returns {Array<{key:number, count:number, error:number}>}
+     */
+    topK(n) {
+        const size = this._size;
+        if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) n = size;
+        const take = n < size ? n : size;
+        const idx = [];
+        for (let i = 0; i < size; i++) idx.push(i);
+        const counts = this._count;
+        idx.sort((a, b) => counts[b] - counts[a]);
+        const out = [];
+        for (let i = 0; i < take; i++) {
+            const sl = idx[i];
+            out.push({ key: this._key[sl], count: this._count[sl], error: this._error[sl] });
+        }
+        return out;
+    }
+
+    /**
+     * Every monitored key with `count > threshold * N` (N = total), DESCENDING by count -- a
+     * SUPERSET with NO FALSE NEGATIVES: a key whose TRUE frequency exceeds the threshold is
+     * never missed (Space-Saving's defining guarantee), since its reported `count` is an upper
+     * bound. The result MAY include false positives. For the GUARANTEED-frequent SUBSET (no
+     * false positives), a caller filters the returned entries by `(count - error) > threshold
+     * * N` -- each entry carries `error` for exactly that. COLD, ALLOCATES (disclosed).
+     * `threshold` is a fraction in [0, 1]. NEVER throws -- a bad threshold returns an empty array.
+     * @param {number} threshold a fraction in [0, 1]
+     * @returns {Array<{key:number, count:number, error:number}>}
+     */
+    heavyHitters(threshold) {
+        const out = [];
+        if (typeof threshold !== 'number' || threshold !== threshold ||
+            threshold < 0 || threshold > 1) return out;
+        const cut = threshold * this._total;
+        const size = this._size;
+        for (let i = 0; i < size; i++) {
+            if (this._count[i] > cut) {            // upper bound -> SUPERSET, no false negatives
+                out.push({ key: this._key[i], count: this._count[i], error: this._error[i] });
+            }
+        }
+        out.sort((a, b) => b.count - a.count);
+        return out;
+    }
+
+    /**
+     * Merge `other` into this (Cormode / Hadjieleftheriou). Over the union of monitored keys,
+     * `mergedCount = countThis + countOther` (an absent summary contributes its MIN counter,
+     * 0 if not yet full), `mergedError = errorThis + errorOther` (an absent summary
+     * contributes its min as error). Keeps the k highest merged counts, rebuilds this's map +
+     * forest, and adds `other._total`. The bracket is preserved but LOOSER after a merge.
+     * COLD, with a bounded scratch allocation (disclosed). Fails closed `[lite-sketch]` if
+     * `other` is not a SpaceSaving or differs in capacity / seed.
+     * @param {SpaceSaving} other
+     * @returns {SpaceSaving} this
+     */
+    merge(other) {
+        if (!(other instanceof SpaceSaving) ||
+            other._capacity !== this._capacity || other._seed !== this._seed) {
+            return this._badMerge(other);
+        }
+        // Imputation floors: each summary's min counter, or 0 if it is not yet full.
+        const minThis = this._size < this._capacity ? 0 : this._minCount();
+        const minOther = other._size < other._capacity ? 0 : other._minCount();
+        // Build the union with merged (count, error). COLD scratch (disclosed).
+        const merged = new Map();
+        for (let i = 0; i < this._size; i++) {
+            merged.set(this._key[i], { c: this._count[i], e: this._error[i], both: false });
+        }
+        for (let i = 0; i < other._size; i++) {
+            const key = other._key[i];
+            const cur = merged.get(key);
+            if (cur === undefined) {
+                merged.set(key, { c: other._count[i] + minThis, e: other._error[i] + minThis, both: true });
+            } else {
+                cur.c += other._count[i];
+                cur.e += other._error[i];
+                cur.both = true;
+            }
+        }
+        merged.forEach((v) => { if (!v.both) { v.c += minOther; v.e += minOther; } });
+        const arr = [];
+        merged.forEach((v, key) => arr.push({ key: key, count: v.c, error: v.e }));
+        arr.sort((a, b) => b.count - a.count);           // DESCENDING
+        const keep = Math.min(this._capacity, arr.length);
+        const otherTotal = other._total;
+        const oldTotal = this._total;
+        // Reset this (forest + map + slots), then rebuild from the top-keep entries.
+        this._size = 0;
+        this._minBucket = -1;
+        this._mapOcc.fill(0);
+        for (let i = 0; i < this._capacity; i++) this._bFree[i] = i;
+        this._bFreeTop = this._capacity;
+        // Inserting in DESCENDING count order makes each _attach an O(1) new-min splice.
+        for (let i = 0; i < keep; i++) {
+            const it = arr[i];
+            const sl = this._size++;
+            this._key[sl] = it.key;
+            this._count[sl] = it.count;
+            this._error[sl] = it.error;
+            const h = this._hash(it.key);
+            const idx = this._probe(it.key, h);
+            this._mapOcc[idx] = 1;
+            this._mapKey[idx] = it.key;
+            this._mapSlot[idx] = sl;
+            this._attach(sl, it.count, -1);
+        }
+        this._total = oldTotal + otherTotal;
+        return this;
+    }
+
+    /**
+     * Reset the sketch to empty. O(M) (the map occupancy fill) + O(k) (the free-list re-init);
+     * the numeric pools are left untouched -- occupancy / size gate them. @returns {SpaceSaving} this
+     */
+    clear() {
+        this._size = 0;
+        this._total = 0;
+        this._minBucket = -1;
+        this._mapOcc.fill(0);
+        for (let i = 0; i < this._capacity; i++) this._bFree[i] = i;
+        this._bFreeTop = this._capacity;
+        return this;
+    }
+
+    /**
+     * @private HI-lane murmur of a numeric key (identical math to `add`'s inline mix and to
+     * mix64's HI lane). Returns a SIGNED int32 (SMI) -- callers take `& _mask`, so the sign
+     * never matters. 0-alloc, monomorphic (keys are always numbers). This is the map's ONE
+     * canonical home function (used by placement, probing, and backshift alike).
+     * @param {number} key
+     * @returns {number} int32 HI lane
+     */
+    _hash(key) {
+        let a = key;
+        let neg = 0;
+        if (a < 0) { a = -a; neg = 1; }
+        const lo = a >>> 0;
+        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const s = this._seed;
+        let h = s;
+        h = _m3round(h, lo);
+        h = _m3round(h, hiw ^ neg);
+        h = _m3final(h ^ 8);
+        return h | 0;
+    }
+
+    /**
+     * @private Linear-probe the map for `key` (h = its `_hash`). Returns the matching index
+     * (if present) or the first empty index (if absent). 0-alloc.
+     * @param {number} key
+     * @param {number} h the key's `_hash` (int32)
+     * @returns {number} map index
+     */
+    _probe(key, h) {
+        const occ = this._mapOcc, mkey = this._mapKey, mask = this._mask;
+        let i = h & mask;
+        while (occ[i] === 1) {
+            if (mkey[i] === key) return i;
+            i = (i + 1) & mask;
+        }
+        return i;
+    }
+
+    /**
+     * @private Remove `key` from the map by probing to its index then Knuth backshift-deleting
+     * (no tombstones -- the probe invariants stay exact). 0-alloc. `key` must be present.
+     * @param {number} key
+     */
+    _mapDeleteKey(key) {
+        this._mapDelete(this._probe(key, this._hash(key)));
+    }
+
+    /**
+     * @private Knuth backshift deletion at map index `i` (open addressing, no tombstones).
+     * Walk forward from the hole; an entry `j` moves into the hole iff its home lies cyclically
+     * outside `(i, j]`. Recomputes each home via the canonical `_hash` of the stored key
+     * (numbers -- cheap, 0-alloc). Runs on every eviction, so it must be correct + 0-alloc.
+     * @param {number} i the (occupied) index to delete
+     */
+    _mapDelete(i) {
+        const occ = this._mapOcc, mkey = this._mapKey, mslot = this._mapSlot, mask = this._mask;
+        occ[i] = 0;
+        let j = (i + 1) & mask;
+        while (occ[j] === 1) {
+            const home = this._hash(mkey[j]) & mask;
+            const a = (home - i) & mask;             // steps from the hole i to the entry's home
+            const d = (j - i) & mask;                // steps from the hole i to the entry j
+            if (a === 0 || a > d) {                   // home NOT in (i, j] -> j can fill the hole
+                mkey[i] = mkey[j];
+                mslot[i] = mslot[j];
+                occ[i] = 1;
+                occ[j] = 0;
+                i = j;
+            }
+            j = (j + 1) & mask;
+        }
+    }
+
+    /**
+     * @private The min monitored count (the min bucket's value), or 0 if empty. O(1).
+     * @returns {number}
+     */
+    _minCount() {
+        return this._minBucket >= 0 ? this._bVal[this._minBucket] : 0;
+    }
+
+    /**
+     * @private Bump slot `slot`'s count by `delta`: detach it from its bucket and re-attach at
+     * the new value. `prevB` (the bucket below the current one, value < old count < new value)
+     * is a valid lower hint for the forward-walking attach; for a unit add the target is the
+     * immediate next bucket (O(1)). 0-alloc.
+     * @param {number} slot
+     * @param {number} delta positive
+     */
+    _bump(slot, delta) {
+        const b = this._cBucket[slot];
+        const nv = this._count[slot] + delta;
+        this._count[slot] = nv;
+        const prevB = this._bPrev[b];
+        this._detach(slot);
+        this._attach(slot, nv, prevB);
+    }
+
+    /**
+     * @private Attach `slot` to the bucket of value `val`, birthing it (from the free-list) and
+     * splicing it into the ascending bucket list if none exists. `hint` is a bucket with value
+     * <= val to begin the forward walk (or -1 to start at `_minBucket`). Pushes `slot` at the
+     * HEAD of the target bucket's sibling list. Keeps `_minBucket` correct. 0-alloc.
+     * @param {number} slot
+     * @param {number} val the target count-value
+     * @param {number} hint a bucket id with value <= val, or -1
+     */
+    _attach(slot, val, hint) {
+        const bVal = this._bVal, bNext = this._bNext, bPrev = this._bPrev, bHead = this._bHead;
+        let prev = -1;
+        let b = hint >= 0 ? hint : this._minBucket;
+        while (b >= 0 && bVal[b] < val) { prev = b; b = bNext[b]; }
+        if (b >= 0 && bVal[b] === val) {             // bucket exists -> push at its head (FIFO head)
+            const head = bHead[b];
+            this._cPrev[slot] = -1;
+            this._cNext[slot] = head;
+            if (head >= 0) this._cPrev[head] = slot;
+            bHead[b] = slot;
+            this._cBucket[slot] = b;
+            return;
+        }
+        // Birth a new bucket for `val`, spliced between `prev` and `b`.
+        const nb = this._bFree[--this._bFreeTop];
+        bVal[nb] = val;
+        bPrev[nb] = prev;
+        bNext[nb] = b;
+        if (prev >= 0) bNext[prev] = nb; else this._minBucket = nb;
+        if (b >= 0) bPrev[b] = nb;
+        this._cPrev[slot] = -1;
+        this._cNext[slot] = -1;
+        bHead[nb] = slot;
+        this._cBucket[slot] = nb;
+    }
+
+    /**
+     * @private Detach `slot` from its bucket's sibling list; if the bucket empties, unlink it
+     * from the ascending bucket list (fixing `_minBucket`) and return it to the free-list.
+     * 0-alloc.
+     * @param {number} slot
+     */
+    _detach(slot) {
+        const b = this._cBucket[slot];
+        const p = this._cPrev[slot];
+        const n = this._cNext[slot];
+        if (p >= 0) this._cNext[p] = n; else this._bHead[b] = n;
+        if (n >= 0) this._cPrev[n] = p;
+        if (this._bHead[b] < 0) {                    // bucket now empty -> unlink + free
+            const bp = this._bPrev[b];
+            const bn = this._bNext[b];
+            if (bp >= 0) this._bNext[bp] = bn; else this._minBucket = bn;
+            if (bn >= 0) this._bPrev[bn] = bp;
+            this._bFree[this._bFreeTop++] = b;
+        }
+    }
+
+    /** @private Cold thrower for a bad key (String is Symbol / BigInt-safe). */
+    _badKey(key) {
+        throw new TypeError(
+            '[lite-sketch] SpaceSaving.add key must be a safe integer, got ' + String(key));
+    }
+
+    /** @private Cold thrower for a bad count. */
+    _badCount(count) {
+        throw new RangeError(
+            '[lite-sketch] SpaceSaving count must be a positive integer, got ' + String(count));
+    }
+
+    /** @private Cold thrower for a bad capacity. */
+    _badCapacity(capacity) {
+        throw new RangeError(
+            '[lite-sketch] SpaceSaving capacity must be an integer in [1, ' + SS_CAP_MAX +
+            '], got ' + String(capacity));
+    }
+
+    /** @private Cold thrower for an incompatible merge (non-instance vs capacity/seed mismatch). */
+    _badMerge(other) {
+        if (!(other instanceof SpaceSaving)) {
+            throw new TypeError('[lite-sketch] SpaceSaving.merge expects a SpaceSaving');
+        }
+        throw new RangeError(
+            '[lite-sketch] SpaceSaving.merge requires equal capacity/seed: this capacity=' +
+            this._capacity + ' seed=' + (this._seed >>> 0) +
+            ', other capacity=' + other._capacity + ' seed=' + (other._seed >>> 0));
+    }
+
+    /** @private Cold thrower for an unknown option key (did-you-mean listing known keys). */
+    _badOption(key) {
+        throw new TypeError(
+            '[lite-sketch] SpaceSaving unknown option "' + String(key) +
+            '"; known options: ' + Object.keys(SS_KNOWN_OPTS).join(', '));
     }
 }
