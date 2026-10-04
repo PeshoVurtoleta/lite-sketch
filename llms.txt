@@ -59,6 +59,8 @@ Members share no mutable module state, so a bundler that imports one drops the o
   (not bucketed). Fail closed on a bad alpha / value / out-of-indexable-range / count (throws
   typeof-first BEFORE allocation); `quantile` / getters never throw (a bad q -> NaN). Does
   NOT use the two-lane hash.
+- `DD_ALPHA_MIN` -- number, 1e-6. The smallest `alpha` the `DDSketch` ctor accepts
+  (`DD_ALPHA_MIN <= alpha < 1`); a smaller alpha throws [lite-sketch] at the ctor door.
 - `SpaceSaving` -- class. A zero-GC HEAVY-HITTERS / TOP-K sketch (Metwally et al.) over a
   fixed `capacity` (k) counters: an intrusive frequency-bucket forest (O(1) increment + find-min)
   plus a fixed open-addressing key map, over the two-lane hash. `add(key, count = 1)` is
@@ -180,9 +182,12 @@ under); the guarantee is probabilistic (delta), the hashing statistical not cryp
 
     new DDSketch(alpha, options?)
 
-- alpha: relative accuracy, in (0, 1) -- the guarantee knob (e.g. 0.01 = 1% relative error).
-  gamma = (1+alpha)/(1-alpha); a value x>0 lands in bucket key(x) = ceil(ln(x)/ln(gamma)), and
-  the representative 2*gamma^key/(gamma+1) is within alpha relative error of every x in the bucket.
+- alpha: relative accuracy, in [1e-6, 1) -- the guarantee knob (e.g. 0.01 = 1% relative error).
+  The floor is the exported DD_ALPHA_MIN (1e-6); a smaller alpha throws [lite-sketch] at the ctor
+  door (at the 2^20-bin cap it spans only ~8x of value range, and smaller alphas once hung the
+  bound search for seconds). gamma = (1+alpha)/(1-alpha); a value x>0 lands in bucket
+  key(x) = ceil(ln(x)/ln(gamma)), and the representative 2*gamma^key/(gamma+1) is within alpha
+  relative error of every x in the bucket.
 - options (object): { maxBins = 2048, range?: [min, max] }. An unknown option key throws
   [lite-sketch] (did-you-mean).
   - DEFAULT (no range) = COLLAPSING-LOWEST: a dense Float64Array(maxBins); when the value range
@@ -196,7 +201,8 @@ under); the guarantee is probabilistic (delta), the hashing statistical not cryp
   [lite-sketch] (no negative mirror; deferred). Values outside the indexable double range (roughly
   (~2.2e-308, ~8.9e307] at alpha=0.01, low end EXCLUSIVE; the window widens as alpha grows) THROW
   fail-closed so the bucket representative can never overflow to Infinity or underflow to 0. The
-  EXACT runtime bounds are the minIndexable / maxIndexable getters.
+  EXACT runtime bounds are the minIndexable / maxIndexable getters -- the exact acceptance edges of
+  add's own key expression (bit-level bisected in the ctor), not an off-by-ulps pow(gamma, K+-1).
 - Constructor throws [lite-sketch] typeof-first on a bad alpha / maxBins / range BEFORE allocation.
 
 Hot surface (add is worst-case O(1), zero allocation):
@@ -219,8 +225,10 @@ Hot surface (add is worst-case O(1), zero allocation):
                                   bucket representative (or 0 if the rank falls in the zero bucket).
                                   NEVER throws -- an empty sketch or a bad q returns NaN.
 - merge(other) -> this            Fold other's bins/zeroCount/count/sum into this (collapsing as
-                                  needed). Same-alpha (same gamma)-or-throw; a strict `this` throws if
-                                  an incoming key is out of range. min/max combined exactly. O(other bins).
+                                  needed), carrying other.collapsed forward (collapsed mass makes this
+                                  collapsed). Same-alpha (same gamma)-or-throw; a strict `this` throws if
+                                  an incoming key is out of range OR if `other` is collapsed (its low-end
+                                  mass has already folded). min/max combined exactly. O(other bins).
 - clear() -> this                 Zero the bins + all scalars; reuse the allocation.
 - alpha / count / sum             Getters: the accuracy knob; the exact element count N; the exact sum.
 - min / max                       Getters: the EXACT tracked min / max (NOT bucketed -- exact while
@@ -230,9 +238,11 @@ Hot surface (add is worst-case O(1), zero allocation):
 - collapsed (getter)              Whether any smallest-value collapse has occurred (the small-value
                                   guarantee was touched).
 - strict (getter)                 Whether this is a STRICT fixed-range sketch (a range was given).
-- minIndexable / maxIndexable     Getters: the EXACT x bounds add() accepts at this alpha -- add
-                                  accepts finite minIndexable < x <= maxIndexable (plus exact 0).
-                                  minIndexable is the exclusive low floor (~2.2e-308 at alpha=0.01).
+- minIndexable / maxIndexable     Getters: the EXACT x bounds add() accepts at this alpha, the
+                                  bit-level bisected edges of add's own key expression -- add accepts
+                                  finite minIndexable < x <= maxIndexable (plus exact 0). minIndexable is
+                                  the exclusive low floor (~2.2e-308 at alpha=0.01); maxIndexable is the
+                                  inclusive ceiling (~8.9e307 at alpha=0.01, always below Number.MAX_VALUE).
 - rangeMin / rangeMax             Getters: STRICT mode -- the configured range ends (NaN if not strict).
 
 Accuracy contract (the honesty anchor -- the family's sharpest): the guarantee is a HARD PER-QUERY

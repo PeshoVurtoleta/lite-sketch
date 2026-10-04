@@ -253,12 +253,20 @@ async function main() {
     const s = gc.summary();
     const report = checkNoGc(s, { maxMajor: 0, maxPauseMs: 4 });
 
-    // ---- phase 2c: arrayBuffers growth (the reused banks grow no store, HLL + CMS) ----
-    const abBefore = process.memoryUsage().arrayBuffers;
+    // ---- phase 2c: arrayBuffers growth (the reused banks grow no store, all four members) ----
+    // The banks are built, then gc() + a settle (ArrayBuffer backing stores are freed
+    // CONCURRENTLY after gc, so a bare gc() still lets old frees land inside the window)
+    // retires earlier phases' garbage, and ONLY THEN is the baseline read, so the window
+    // holds nothing but the reuse cycles. The same settle runs before the after-read. (Before H2.2 the
+    // baseline was read BEFORE the ~310 KB of banks were built: the gate passed only when
+    // older garbage happened to be freed inside the window -- a GC-timing flake that also
+    // hid any growth smaller than that garbage.)
     const reuse = new HyperLogLog(14, 0x1234);
     const cmsReuse = new CountMinSketch(6, 1 << 13, { seed: 0x1234 });
     const ddReuse = new DDSketch(0.01);
     const ssReuse = new SpaceSaving(1024, { seed: 0x1234 });
+    globalThis.gc(); await sleep(50); globalThis.gc(); await sleep(50);
+    const abBefore = process.memoryUsage().arrayBuffers;
     for (let c = 0; c < 200; c++) {
         for (let k = 0; k < M; k++) reuse.add((k ^ c) | 0);
         reuse.count();
@@ -273,8 +281,12 @@ async function main() {
         ssReuse.estimate(c);
         ssReuse.clear();             // O(M) occ fill + O(k) free-list, no new store
     }
-    globalThis.gc();
+    globalThis.gc(); await sleep(50); globalThis.gc(); await sleep(50);
     const abAfter = process.memoryUsage().arrayBuffers;
+    // Keep the banks LIVE past the after-read: a dead bank is collected by the gc() above and
+    // its free (~310 KB) would mask any growth it retained (measured: delta -317648 and a
+    // per-clear() re-allocating mutant passing when this line is absent).
+    SINK = (SINK + reuse._reg[0] + cmsReuse._counts[0] + ddReuse._bins[0] + ssReuse._size) | 0;
     const abDelta = abAfter - abBefore;
     const abOk = abDelta <= 0;
 

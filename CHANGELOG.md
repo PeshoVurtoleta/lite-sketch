@@ -24,15 +24,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the murmur). Output is **bit-identical** --
   the `_reg[]` registers and `count()` match the prior release exactly at p = 4, 12, 18
   over 600k mixed (positive, negative, `> 2^32`) keys plus the `addHashed` lanes.
+- **`DDSketch` constructor no longer hangs for a small `alpha`.** The max-key closed form
+  added `ln((gamma+1)/2)` instead of subtracting `ln 2`, overshooting the key ceiling by
+  about `0.3466/alpha`; a decrement loop then walked that back one key at a time -- ~2.4 ms at
+  `alpha=1e-6`, 35 ms at `1e-7`, ~1 s at `2e-9`, and an unbounded hang at `<= 1e-10` (killed
+  at 3 s). The correct closed form `K = floor((ln MAX_VALUE - ln 2) / ln gamma)` lands on the
+  exact bound with 0 fix-up steps (bit-identical key bounds to the prior release at every
+  alpha; the `1e-6` build drops from ~2.4 ms to a constant few microseconds). Both bound
+  fix-ups are now bidirectional and capped at 4 steps, then throw `[lite-sketch]`.
+- **`DDSketch.merge` now carries `collapsed`.** It never propagated `other._collapsed`, so a
+  merged sketch claimed the hard `alpha` while holding already-folded low-end mass. Example: a
+  16-bin shard over `[1, 1000]` merged into an empty sketch reported `collapsed === false` and
+  `quantile(0) === 742.6` (true value 1); it now reports `collapsed === true` (bins/quantiles
+  unchanged).
+- **`DDSketch.minIndexable` / `maxIndexable` are now the EXACT acceptance edges.** They were
+  `pow(gamma, K+-1)`, off by up to ~4e-13 relative, so a consumer pre-check against them could
+  BOTH pass a value `add` then throws on AND reject a value `add` accepts: on HEAD, `add` threw
+  on `nextUp(minIndexable)` -- a value above the documented floor -- at 2428 of 3000 alphas, and
+  `add` accepted `nextUp(maxIndexable)` -- a value above the documented ceiling -- at 2465. The
+  ctor now bisects add's own key expression over adjacent doubles: `minIndexable` is the
+  EXCLUSIVE floor (last rejected double), `maxIndexable` the INCLUSIVE ceiling (last accepted
+  double, always below `Number.MAX_VALUE`).
 
 ### Added
 
+- **`DD_ALPHA_MIN`** -- a named export (`1e-6`), the smallest `alpha` the `DDSketch`
+  constructor accepts (`DD_ALPHA_MIN <= alpha < 1`).
 - **`npm run lanes`** -- a child-process scavenge/deopt lane harness
   (`test/lanes.mjs` + `test/lanes/lane.mjs`), now part of `npm run verify`. One child
   per lane under `--max-semi-space-size=4` (default and no-inline) gates HyperLogLog
   `add` at `<= 2` scavenges, the `--trace-deopt` audit shape at `<= 3` `not int32`
   deopts, and a no-op teeth control at `>= 12`. `--lib <path>` runs the lanes against
   another build for a revert-check.
+
+### Changed
+
+- **`DDSketch` now throws `[lite-sketch]` for `alpha < 1e-6`** (the new `DD_ALPHA_MIN` floor).
+  Such an alpha was accepted before -- slowly, and with an unbounded hang below about `1e-10`.
+- **A STRICT `DDSketch` now throws `[lite-sketch]` when merging a COLLAPSED `other`.** Its
+  low-end mass has already folded, so a fixed-range sketch cannot absorb it without breaking
+  its range guarantee. The rejection is a byte-identical no-op.
 
 ## [1.1.2] - 2026-09-23
 

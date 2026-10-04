@@ -82,6 +82,46 @@ the 1% bound). Space is the co-headline: `maxBins * 8` bytes (fixed) vs the exac
 `8 * N` bytes. Uniformity is not a factor (no hashing); the only approximation is the log-bucket
 width, bounded by alpha.
 
+## H2.2 amendment (2026-10-04) -- fail-closed ctor + merge (F10, F11, F17; S2, S3)
+
+The final-sweep audit of 1.1.2 found three cold DDSketch defects. The hot path (`add`,
+`addFrom`, `_addKey`, `quantile`) is unchanged and byte-identical to the pre-H2.2 code; only
+the ctor constants/math, `merge`, and one new cold thrower moved.
+
+1. **`DD_ALPHA_MIN = 1e-6`, an exported constant; the ctor accepts `[1e-6, 1)` (S2, F10).**
+   The pre-H2.2 max-key closed form added `ln((gamma+1)/2)` where it should have subtracted
+   `ln 2`, overshooting `_maxKeyIndexable` by about `0.3466/alpha` keys. A decrement loop then
+   walked that overshoot back ONE key at a time -- ~2.4 ms at alpha=1e-6, 35 ms at 1e-7, seconds
+   by 2e-9, and an infinite hang once `K` passed `2^53` (the decrement is a float no-op there)
+   or `gamma` rounded to 1 (K = Infinity). The fix is the correct closed form
+   `K = floor((ln MAX_VALUE - ln 2) / ln gamma)` -- IDENTICAL to the old result at every alpha
+   in the domain, with 0 fix-up steps over 3000 alphas (the 1e-6 build is O(1) now -- a constant
+   few microseconds, down from ~2.4 ms).
+   Both key fix-ups are now BIDIRECTIONAL and share one cap of 4 steps per bound; past the cap
+   the ctor throws `[lite-sketch]` (lesson: a fix-up loop needs a cap). `alpha < DD_ALPHA_MIN`
+   is rejected at the ctor door, before the bound math; the floor is 1e-6 because at the
+   `2^20`-bin cap a single filled window spans only ~8x of value range there.
+
+2. **Exact indexable edges (F17).** `minIndexable` / `maxIndexable` were `pow(gamma, K+-1)`,
+   off by up to ~4e-13 relative -- so a consumer pre-check could pass a value `add` then threw
+   on (or reject one it would accept). The ctor now BISECTS the exact acceptance edge of add's
+   OWN key expression `ceil(log(x) * multiplier)` (same multiplier) over adjacent doubles: the
+   lower edge is EXCLUSIVE (last rejected), the upper INCLUSIVE (last accepted). The upper edge
+   is always strictly below `Number.MAX_VALUE`: `maxKeyIndexable` keeps `2*gamma^maxK/(gamma+1)`
+   finite, so `gamma^maxK <= MAX_VALUE/2` and MAX_VALUE always maps above `maxKeyIndexable`. It
+   converges in <= 25 steps; a broken bracket or an 80-step cap fails closed. Cold, plain doubles
+   -- no BigInt, no array. Over a 3000-alpha sweep all four edges (add(min) rejected,
+   add(nextUp(min)) accepted, add(max) accepted, add(nextUp(max)) rejected) hold with 0 failures.
+
+3. **`merge` carries `collapsed`; strict rejects a collapsed other (S3, F11).** `merge` never
+   propagated `other._collapsed`, so a merged sketch claimed the hard alpha while holding
+   already-folded low-end mass (the shard example: a 16-bin shard over [1,1000] merged into an
+   empty sketch read `collapsed=false`, `quantile(0)=742.6` vs a true 1). `merge` now sets
+   `this._collapsed` from `other._collapsed` past every throw, and a STRICT `this` rejects a
+   collapsed `other` outright (a new cold `_badMergeCollapsed()`), after the gamma check and
+   before the strict pre-scan, as a byte-identical no-op -- its low-end mass has already folded,
+   so the strict range guarantee cannot hold.
+
 ## Non-goals
 
 No negative values (deferred); no rank-error mode (relative-error is the point); no top-k /

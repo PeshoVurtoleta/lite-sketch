@@ -26,7 +26,23 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DDSketch, VERSION } from '../Sketch.js';
+import { spawnSync } from 'node:child_process';
+import { DDSketch, DD_ALPHA_MIN, VERSION } from '../Sketch.js';
+
+// Cold test helpers (NOT hot-path code): the adjacent double above/below x, via a
+// Float64Array / BigUint64Array bit view. Used to probe the exact acceptance edges.
+function nextUp(x) {
+    const f = new Float64Array([x]);
+    const u = new BigUint64Array(f.buffer);
+    u[0] += 1n;
+    return f[0];
+}
+function nextDown(x) {
+    const f = new Float64Array([x]);
+    const u = new BigUint64Array(f.buffer);
+    u[0] -= 1n;
+    return f[0];
+}
 
 const liteSketch = (e) => e instanceof Error && /^\[lite-sketch]/.test(e.message);
 
@@ -751,4 +767,295 @@ test('ADVERSARIAL: a strict-range sketch whose merge partner reports keys that s
     const before = snapshot(strict);
     assert.throws(() => strict.add(pastTop), liteSketch, 'one key past maxKeyStrict must throw');
     assertUnchanged(before, strict, 'past-boundary key');
+});
+
+// ===========================================================================
+// H2.2 -- F10 / F11 / F17 fail-closed fixes (S2, S3)
+// ===========================================================================
+
+// G1 (F10): the ctor must FAIL CLOSED on a small alpha instead of hanging. Each tiny
+// alpha is built in a child with a 2000 ms timeout; a timeout is a FAIL (on HEAD the
+// 1e-12 / 1e-10 children never return and the spawn is killed). The child exits 0 iff
+// `new DDSketch(alpha)` threw a tagged [lite-sketch] RangeError.
+test('G1 (F10): new DDSketch(alpha) throws tagged for alpha < DD_ALPHA_MIN within a 2000 ms child (no hang)', () => {
+    const url = new URL('../Sketch.js', import.meta.url).href;
+    const code =
+        'const u=process.argv[1],a=Number(process.argv[2]);' +
+        'import(u).then(m=>{try{new m.DDSketch(a);process.exit(2);}' +
+        'catch(e){process.exit(e instanceof RangeError && /^\\[lite-sketch]/.test(e.message)?0:3);}})' +
+        '.catch(()=>process.exit(4));';
+    const alphas = [1e-17, 1e-12, 1e-10, 2e-9, 1e-7, nextDown(DD_ALPHA_MIN)];
+    for (const a of alphas) {
+        const res = spawnSync(process.execPath, ['--input-type=module', '-e', code, url, String(a)],
+            { timeout: 2000, encoding: 'utf8' });
+        assert.equal(res.signal, null, 'alpha=' + a + ' TIMED OUT (ctor hang) -- FAIL');
+        assert.equal(res.status, 0,
+            'alpha=' + a + ' did not throw a tagged RangeError (child exit ' + res.status + ')');
+    }
+    // In process: the constant, a fast build at the floor, and the old near-zero throws.
+    assert.equal(DD_ALPHA_MIN, 1e-6, 'DD_ALPHA_MIN is exactly 1e-6');
+    let best = Infinity;
+    for (let r = 0; r < 5; r++) {
+        const t0 = performance.now();
+        new DDSketch(DD_ALPHA_MIN);
+        const dt = performance.now() - t0;
+        if (dt < best) best = dt;
+    }
+    assert.ok(best < 5, 'new DDSketch(DD_ALPHA_MIN) builds in < 5 ms (min of 5 runs: ' + best.toFixed(4) + ' ms)');
+    for (const bad of [0, 1, NaN]) {
+        assert.throws(() => new DDSketch(bad), liteSketch, 'alpha=' + String(bad) + ' still throws');
+    }
+});
+
+// G2 (F11, S3): merge must CARRY `collapsed` and a strict `this` must REJECT a collapsed
+// `other`. On HEAD the merged sketch claims collapsed=false while holding folded low-end
+// mass, and a strict sketch silently absorbs a collapsed other.
+test('G2 (F11): merge carries collapsed; a strict sketch rejects a collapsed other (byte-identical no-op)', () => {
+    const alpha = 0.01;
+    // The audit's shard example: a 16-bin shard over [1, 1000] collapses; merged into an
+    // empty sketch it must report collapsed=true, with quantile(0) unchanged at 742.6.
+    const shard = new DDSketch(alpha, { maxBins: 16 });
+    for (let i = 1; i <= 1000; i++) shard.add(i);
+    shard.add(1); shard.add(1); shard.add(1);
+    assert.equal(shard.collapsed, true, 'the shard itself collapses');
+    const merged = new DDSketch(alpha, { maxBins: 16 });
+    merged.merge(shard);
+    assert.equal(merged.collapsed, true, 'merge carries other._collapsed forward');
+    assert.equal(Number(merged.quantile(0).toFixed(1)), 742.6, 'quantile(0) bins are unchanged (742.6)');
+
+    // A collapsed other folded into a NON-EMPTY non-strict sketch -> collapsed; clear() resets.
+    const target = new DDSketch(alpha, { maxBins: 16 });
+    target.add(500); target.add(600);
+    assert.equal(target.collapsed, false, 'two in-window values do not collapse');
+    target.merge(shard);
+    assert.equal(target.collapsed, true, 'absorbing collapsed mass makes the target collapsed');
+    target.clear();
+    assert.equal(target.collapsed, false, 'clear() resets collapsed');
+
+    // A STRICT this rejects a collapsed other, tagged, as a byte-identical no-op.
+    const strict = new DDSketch(alpha, { range: [1, 1000] });
+    strict.add(5); strict.add(50); strict.add(500);
+    const before = snapshot(strict);
+    const binsBefore = Float64Array.from(strict._bins);
+    assert.throws(() => strict.merge(shard), liteSketch, 'strict must reject a collapsed other');
+    assertUnchanged(before, strict, 'strict merge of a collapsed other');
+    assert.deepEqual(Float64Array.from(strict._bins), binsBefore, 'bins unchanged after a rejected strict merge');
+
+    // A strict merge of a NON-collapsed in-range other still works.
+    const inRange = new DDSketch(alpha); // non-strict, non-collapsed, same gamma
+    inRange.add(10); inRange.add(100);
+    const countBefore = strict.count;
+    assert.doesNotThrow(() => strict.merge(inRange));
+    assert.equal(strict.count, countBefore + 2, 'an in-range non-collapsed other merges normally');
+});
+
+// G3 (F17): the minIndexable / maxIndexable getters are the EXACT acceptance edges of
+// add's own key expression. Over the prototype's 3000-alpha grid: add(min) is rejected,
+// add(nextUp(min)) accepted, add(max) accepted, and add(nextUp(max)) rejected (max is always
+// strictly below MAX_VALUE, whose representative would overflow). On HEAD thousands fail these.
+test('G3 (F17): minIndexable / maxIndexable are the exact add() edges across a 3000-alpha sweep', () => {
+    const N = 3000;
+    let failMin = 0, failNextMin = 0, failMax = 0, failNextMax = 0;
+    const accepts = (d, x) => { try { d.add(x); return true; } catch { return false; } };
+    for (let t = 0; t < N; t++) {
+        const alpha = t < 1500 ? 1e-6 * Math.pow(1e5, t / 1500) : 0.1 + (t - 1500) * (0.8999 / 1500);
+        const d = new DDSketch(alpha);
+        const min = d.minIndexable, max = d.maxIndexable;
+        if (accepts(d, min)) failMin++;                 // EXCLUSIVE floor: itself rejected
+        if (!accepts(d, nextUp(min))) failNextMin++;    // the next double up is accepted
+        if (!accepts(d, max)) failMax++;                // INCLUSIVE ceiling: accepted
+        if (accepts(d, nextUp(max))) failNextMax++;     // one past rejected (max is always < MAX_VALUE)
+    }
+    assert.equal(failMin, 0, 'add(minIndexable) must be rejected at every alpha');
+    assert.equal(failNextMin, 0, 'add(nextUp(minIndexable)) must be accepted at every alpha');
+    assert.equal(failMax, 0, 'add(maxIndexable) must be accepted at every alpha');
+    assert.equal(failNextMax, 0, 'add(nextUp(maxIndexable)) must be rejected at every alpha');
+
+    // A strict sketch resolves the SAME indexable getters (they do not depend on the range).
+    // A narrow [1000, 2000] range stays under the 2^20-bin cap even at alpha=1e-6.
+    for (const alpha of [1e-6, 0.01, 0.5]) {
+        const ns = new DDSketch(alpha);
+        const st = new DDSketch(alpha, { range: [1000, 2000] });
+        assert.equal(st.minIndexable, ns.minIndexable, 'strict minIndexable equals non-strict at alpha=' + alpha);
+        assert.equal(st.maxIndexable, ns.maxIndexable, 'strict maxIndexable equals non-strict at alpha=' + alpha);
+    }
+});
+
+// ===========================================================================
+// H2.2 qa -- boundary cases the spec implies (alpha floor/ceiling, add vs addFrom
+// edge agreement, the collapsed-merge matrix). Pure and fast: no sweeps.
+// ===========================================================================
+
+// Full internal snapshot for a byte-identical check: public aggregates PLUS the bin
+// array copy and the window geometry (_offset, _maxKeyPop, _binCount).
+function deepSnapshot(s) {
+    return {
+        pub: snapshot(s),
+        bins: Float64Array.from(s._bins),
+        offset: s._offset,
+        maxKeyPop: s._maxKeyPop,
+        binCount: s._binCount,
+    };
+}
+function assertDeepUnchanged(before, s, label) {
+    assertUnchanged(before.pub, s, label);
+    assert.deepEqual(Float64Array.from(s._bins), before.bins, label + ': _bins changed');
+    assert.equal(s._offset, before.offset, label + ': _offset changed');
+    assert.equal(s._maxKeyPop, before.maxKeyPop, label + ': _maxKeyPop changed');
+    assert.equal(s._binCount, before.binCount, label + ': _binCount changed');
+}
+function collapsedShard(alpha) {
+    const shard = new DDSketch(alpha, { maxBins: 16 });
+    for (let i = 1; i <= 1000; i++) shard.add(i);
+    assert.equal(shard.collapsed, true, 'fixture: the 16-bin shard collapses');
+    return shard;
+}
+function fourEdges(d) {
+    const accAdd = (x) => { try { d.add(x); return true; } catch { return false; } };
+    const buf = new Float64Array(1);
+    const accFrom = (x) => { buf[0] = x; try { d.addFrom(buf, 0); return true; } catch { return false; } };
+    const min = d.minIndexable, max = d.maxIndexable;
+    const xs = [min, nextUp(min), max, nextUp(max)];
+    return { add: xs.map(accAdd), from: xs.map(accFrom) };
+}
+const EDGE_EXPECT = [false, true, true, false];  // min rejected, nextUp(min) accepted, max accepted, nextUp(max) rejected
+
+test('H2.2 alpha floor: DD_ALPHA_MIN (N) builds, nextUp (N+1) builds, nextDown (N-1) throws naming [1e-6, 1)', () => {
+    const d = new DDSketch(DD_ALPHA_MIN);
+    assert.equal(d.collapsed, false);
+    assert.equal(d.count, 0);
+    assert.doesNotThrow(() => new DDSketch(nextUp(DD_ALPHA_MIN)), 'nextUp(DD_ALPHA_MIN) is inside the domain');
+    const below = nextDown(DD_ALPHA_MIN);
+    assert.ok(below < DD_ALPHA_MIN, 'fixture: nextDown is strictly below the floor');
+    assert.throws(() => new DDSketch(below), (e) => liteSketch(e) && e instanceof RangeError && e.message.includes('[1e-6, 1)'),
+        'nextDown(DD_ALPHA_MIN) throws a tagged RangeError whose message names the domain [1e-6, 1)');
+    // The floor's four edges hold through BOTH entry points.
+    const r = fourEdges(new DDSketch(DD_ALPHA_MIN));
+    assert.deepEqual(r.add, EDGE_EXPECT, 'add edges at DD_ALPHA_MIN');
+    assert.deepEqual(r.from, EDGE_EXPECT, 'addFrom edges at DD_ALPHA_MIN');
+});
+
+test('H2.2 alpha door matrix: -0, null, undefined, NaN, -DD_ALPHA_MIN, a string, a boxed Number all throw tagged', () => {
+    const bad = [-0, null, undefined, NaN, -DD_ALPHA_MIN, String(DD_ALPHA_MIN), new Number(0.01), 1, nextUp(1), Infinity];
+    for (const a of bad) {
+        assert.throws(() => new DDSketch(a), (e) => liteSketch(e) && e instanceof RangeError,
+            'alpha=' + String(a) + ' (' + typeof a + ') must throw a tagged RangeError');
+    }
+});
+
+test('H2.2 alpha ceiling: alpha = 1 - 2^-30 and 1 - 2^-53 (the largest double below 1) build and hold all four edges', () => {
+    for (const alpha of [1 - 2 ** -30, 1 - 2 ** -53]) {
+        assert.ok(alpha < 1, 'fixture: alpha < 1');
+        const d = new DDSketch(alpha);
+        assert.ok(Number.isFinite(d.minIndexable) && d.minIndexable > 0, 'minIndexable finite positive at alpha=' + alpha);
+        assert.ok(Number.isFinite(d.maxIndexable) && d.maxIndexable < Number.MAX_VALUE,
+            'maxIndexable finite and below MAX_VALUE at alpha=' + alpha);
+        assert.ok(d._minKeyIndexable < 0 && d._maxKeyIndexable > 0, 'key bounds straddle 0 at alpha=' + alpha);
+        const r = fourEdges(d);
+        assert.deepEqual(r.add, EDGE_EXPECT, 'add edges at alpha=' + alpha);
+        assert.deepEqual(r.from, EDGE_EXPECT, 'addFrom edges at alpha=' + alpha);
+        // The accepted values produce finite quantiles (the representative at both key bounds is finite).
+        assert.ok(Number.isFinite(d.quantile(0)) && Number.isFinite(d.quantile(1)), 'quantiles finite at alpha=' + alpha);
+    }
+});
+
+test('H2.2 addFrom agrees with add at all four indexable edges (same accept / reject) for several alphas', () => {
+    for (const alpha of [nextUp(DD_ALPHA_MIN), 1e-4, 0.01, 0.05, 0.3, 0.9]) {
+        const r = fourEdges(new DDSketch(alpha));
+        assert.deepEqual(r.from, r.add, 'addFrom and add disagree at an edge, alpha=' + alpha);
+        assert.deepEqual(r.add, EDGE_EXPECT, 'edges at alpha=' + alpha);
+    }
+});
+
+test('H2.2 strict merge of a collapsed other leaves this byte-identical (bins, offset, maxKeyPop, binCount), twice', () => {
+    const shard = collapsedShard(0.01);
+    const shardBefore = deepSnapshot(shard);
+    // Populated strict this.
+    const strict = new DDSketch(0.01, { range: [1, 1000] });
+    strict.add(5); strict.add(50); strict.add(500); strict.add(0);
+    const before = deepSnapshot(strict);
+    assert.throws(() => strict.merge(shard), liteSketch, 'strict rejects a collapsed other');
+    assertDeepUnchanged(before, strict, 'first rejected strict merge');
+    // Duplicate rejection: still a byte-identical no-op, and other is never touched.
+    assert.throws(() => strict.merge(shard), liteSketch, 'strict rejects it again');
+    assertDeepUnchanged(before, strict, 'second rejected strict merge');
+    assertDeepUnchanged(shardBefore, shard, 'the rejected other');
+    // EMPTY strict this (N=0) also rejects -- the check does not depend on this's contents.
+    const empty = new DDSketch(0.01, { range: [1, 1000] });
+    const eBefore = deepSnapshot(empty);
+    assert.throws(() => empty.merge(shard), liteSketch, 'empty strict rejects a collapsed other');
+    assertDeepUnchanged(eBefore, empty, 'empty strict');
+    // After the shard is clear()ed (collapsed resets), the same strict sketch accepts it.
+    shard.clear();
+    shard.add(7);
+    assert.doesNotThrow(() => strict.merge(shard), 'a cleared, refilled other is no longer collapsed');
+    assert.equal(strict.count, before.pub.count + 1);
+    assert.equal(strict.collapsed, false, 'strict never reports collapsed');
+});
+
+test('H2.2 self-merge (re-entrant: other === this) of a collapsed sketch stays collapsed with the mass doubled', () => {
+    const shard = collapsedShard(0.01);
+    const n = shard.count, sum = shard.sum;
+    shard.merge(shard);
+    assert.equal(shard.collapsed, true, 'self-merge keeps collapsed');
+    assert.equal(shard.count, 2 * n, 'count doubles');
+    assert.equal(shard.sum, 2 * sum, 'sum doubles');
+    assert.equal(shard.min, 1);
+    assert.equal(shard.max, 1000);
+    // A strict sketch is never collapsed, so its self-merge is accepted (not the collapsed reject).
+    const strict = new DDSketch(0.01, { range: [1, 1000] });
+    strict.add(3); strict.add(30);
+    assert.doesNotThrow(() => strict.merge(strict));
+    assert.equal(strict.count, 4);
+    assert.equal(strict.collapsed, false);
+});
+
+test('H2.2 an EMPTY non-strict sketch merged with a collapsed other becomes collapsed with equal quantiles', () => {
+    const shard = collapsedShard(0.01);
+    const qs = [0, 0.001, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1];
+    for (const opts of [undefined, { maxBins: 16 }]) {
+        const e = new DDSketch(0.01, opts);
+        assert.equal(e.collapsed, false);
+        e.merge(shard);
+        const label = opts ? 'maxBins 16' : 'default maxBins';
+        assert.equal(e.collapsed, true, label + ': empty target becomes collapsed');
+        assert.equal(e.count, shard.count, label + ': count');
+        assert.equal(e.sum, shard.sum, label + ': sum');
+        assert.equal(e.min, shard.min, label + ': min');
+        assert.equal(e.max, shard.max, label + ': max');
+        for (const q of qs) assert.equal(e.quantile(q), shard.quantile(q), label + ': quantile(' + q + ')');
+    }
+    // Merging an EMPTY non-collapsed other does not set collapsed (the carry is conditional).
+    const t = new DDSketch(0.01);
+    t.add(10);
+    t.merge(new DDSketch(0.01));
+    assert.equal(t.collapsed, false, 'an empty non-collapsed other does not set collapsed');
+});
+
+test('H2.2 ADVERSARIAL: a rejected merge never carries collapsed (gamma mismatch), and the strict-collapsed ' +
+    'reject runs BEFORE the pre-scan (a forged collapsed instance with no bins still gets the tagged reject)', () => {
+    // A collapsed other with a DIFFERENT alpha must throw without flipping this.collapsed:
+    // the carry sits past every throw.
+    const otherAlpha = collapsedShard(0.02);
+    const t = new DDSketch(0.01);
+    t.add(10); t.add(20);
+    const before = deepSnapshot(t);
+    assert.throws(() => t.merge(otherAlpha), liteSketch, 'gamma mismatch throws');
+    assertDeepUnchanged(before, t, 'gamma-mismatch reject');
+    assert.equal(t.collapsed, false, 'a rejected merge must not carry collapsed');
+    // A prototype-forged instance (passes instanceof, matching gamma, collapsed, NO bins):
+    // if the strict pre-scan ran first it would read the missing _bins / _offset; the
+    // strict-collapsed check must fire first with the tagged RangeError.
+    const forged = Object.create(DDSketch.prototype);
+    forged._gamma = new DDSketch(0.01)._gamma;
+    forged._collapsed = true;
+    const strict = new DDSketch(0.01, { range: [1, 1000] });
+    strict.add(5);
+    const sBefore = deepSnapshot(strict);
+    assert.throws(() => strict.merge(forged), (e) => liteSketch(e) && e instanceof RangeError && /collapsed/.test(e.message),
+        'the strict-collapsed reject precedes the pre-scan');
+    assertDeepUnchanged(sBefore, strict, 'forged collapsed reject');
+    // null / undefined others are the existing non-instance reject (still tagged).
+    for (const o of [null, undefined]) assert.throws(() => strict.merge(o), liteSketch, 'merge(' + o + ') throws tagged');
+    assertDeepUnchanged(sBefore, strict, 'null / undefined merge');
 });

@@ -233,8 +233,8 @@ cms.delta -> number                      // e^-d -- the theoretical failure prob
 More columns `w` shrink the error `epsilon`; more rows `d` shrink the failure probability `delta` -- the two independent dials, at `d * w * 4` bytes.
 
 ```js
-new DDSketch(alpha, options?)            // alpha in (0,1) = relative accuracy. options: { maxBins = 2048, range?: [min, max] }.
-                                         //   Throws [lite-sketch] on a bad alpha/maxBins/range BEFORE allocating. range present = strict fixed-range.
+new DDSketch(alpha, options?)            // alpha in [1e-6, 1) = relative accuracy (floor is the exported DD_ALPHA_MIN). options: { maxBins = 2048, range?: [min, max] }.
+                                         //   Throws [lite-sketch] on a bad alpha (incl. < DD_ALPHA_MIN) / maxBins / range BEFORE allocating. range present = strict fixed-range.
 
 dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite value (x=0 -> zero counter). Throws on x<0, non-finite,
                                          //   out-of-indexable-range, or a bad count -- a byte-identical no-op.
@@ -242,7 +242,7 @@ dd.addFrom(buf, i) -> this               // HOT, O(1), 0 B/op. Add buf[i] (count
                                          //   point for a FRACTIONAL value (add(fractionalDouble) boxes its argument ~16 B/call when not inlined).
                                          //   Same validation as add; throws on a bad buf / index or a value add would reject.
 dd.quantile(q) -> number                 // COLD, O(bins). The q-quantile (q in [0,1]) within alpha relative error. NEVER throws (empty/bad q -> NaN).
-dd.merge(other) -> this                  // Fold other in (collapsing as needed). Throws [lite-sketch] on a non-DDSketch or unequal alpha.
+dd.merge(other) -> this                  // Fold other in (collapsing as needed), carrying other.collapsed forward. Throws [lite-sketch] on a non-DDSketch, unequal alpha, a strict out-of-range key, or a collapsed other merged into a strict sketch.
 dd.clear() -> this                       // Zero the bins + all scalars; reuse the allocation.
 dd.alpha -> number                       // the relative-accuracy knob (getter)
 dd.count -> number                       // exact element count N (getter)
@@ -253,7 +253,7 @@ dd.maxBins -> number                     // the bin capacity (getter)
 dd.numBins -> number                     // the live (populated) bin count (getter)
 dd.collapsed -> boolean                  // whether any smallest-value collapse has happened (getter)
 dd.strict -> boolean                     // whether this is a STRICT fixed-range sketch (a range was given) (getter)
-dd.minIndexable / dd.maxIndexable        // the EXACT x bounds add() accepts: finite minIndexable < x <= maxIndexable (plus 0). ~2.2e-308 / ~8.9e307 at alpha=0.01 (getters)
+dd.minIndexable / dd.maxIndexable        // the EXACT x bounds add() accepts (bit-level bisected edges of add's own key expression): finite minIndexable < x <= maxIndexable (plus 0). ~2.2e-308 / ~8.9e307 at alpha=0.01; maxIndexable is always below Number.MAX_VALUE (getters)
 dd.rangeMin / dd.rangeMax                // STRICT mode: the configured range ends (NaN if not strict) (getters)
 ```
 
@@ -263,7 +263,7 @@ dd.rangeMin / dd.rangeMax                // STRICT mode: the configured range en
 | 0.01  | ~1.020              | every quantile within 1%  | ~16 KB (fixed)        |
 | 0.005 | ~1.010              | every quantile within 0.5%| ~16 KB (fixed)        |
 
-Smaller `alpha` -> finer buckets -> more bins used for a given value range (raise `maxBins` to avoid collapsing the smallest values); the guarantee holds at *every* quantile equally, and `min`/`max` are always exact.
+Smaller `alpha` -> finer buckets -> more bins used for a given value range (raise `maxBins` to avoid collapsing the smallest values); the guarantee holds at *every* quantile equally, and `min`/`max` are always exact. `alpha` is floored at the exported constant `DD_ALPHA_MIN` (`1e-6`); a smaller value throws `[lite-sketch]` at the ctor door (at the `2^20`-bin cap it spans only ~8x of value range, and smaller alphas once hung the bound search).
 
 ```js
 new SpaceSaving(capacity, options?)      // capacity = k monitored counters, integer in [1, 2^24]. options: { seed? }.
@@ -283,6 +283,7 @@ ss.seed -> number                        // the uint32 hash seed (getter)
 // NOTE: SpaceSaving has NO addHashed -- it stores key identities, so there is no pre-hashed fast path.
 
 VERSION -> string                        // '1.1.2'
+DD_ALPHA_MIN -> number                   // 1e-6, the smallest accepted DDSketch alpha
 ```
 
 | capacity k | guaranteed to report | over-count bound | memory        |

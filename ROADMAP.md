@@ -310,6 +310,7 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | F18 | B-A9 / A10 / A11 (L) the option check uses `in` against a frozen object that inherits Object.prototype (:521, :906, :1446): `{constructor:1}` / `{toString:1}` are accepted, `{__proto__:{seed:5}}` sets the seed, and Map / Date are accepted as bags. `SpaceSaving.forEach` uses a stale loop bound under mutation (:1620-1624: `clear()` at the first entry visits 4 ghosts, `merge()` mid-walk visits key 1 twice). -0 is stored as-is (SS key, DD min). | Use own-property checks and read only own values. Use the live `_size` bound and document "no mutation in forEach". Normalize with `key + 0`. | `{toString:1}` throws in all three classes. `clear()` mid-walk visits 1 entry. `Object.is(topK()[0].key, 0)`. |
 | F19 | D1-D4 (L) docs. README:137 overclaims "p50/p90/p99 within alpha" under collapse (probe: p50 6187 vs 147), and says strict throws by value when it really works by bucket key (`range [1,100]` accepts 0.99 and 101). The README:322-330 allocation table describes module-scope slots the code never writes, and omits `_hist` / `_idx`. The README Testing section has no count (182). RESEARCH.md:9 says "Not yet coded", ROADMAP H1 says "awaiting publish", and the lockfile version is 0.1.0. The unqualified "0 B/op" lines (README:30/64/100/167/188/213/215/272/275/318-334, llms.txt:32/42/65/70/299, Sketch.d.ts:68/141/147/306/315) need "0 library bytes/op; a non-Smi argument boxes at a non-inlined boundary; use addFrom". | Text fixes. | Grep: no unqualified 0 B/op line, and the count is stated. |
 | F20 | Found by H2.1 qa, confirmed on HEAD (M): all 33 cold throwers build their message with `String(x)`, which runs caller code. Three consequences: (1) `add(Object.create(null))` on any member, and `new DDSketch(Object.create(null))`, throw an UNTAGGED `TypeError: Cannot convert object to primitive value`; (2) a `toString` that throws replaces the tagged error; (3) a `toString` that calls `h.addHashed(0,0)` changes the receiver during a rejection that must be byte-identical (reg[0] 0 -> 53, and the throw is still tagged). | One cold `_describe(x)` shared by every thrower: `typeof` first, primitives formatted directly (`String` is safe for number / string / boolean / bigint / symbol / undefined, plus null), and `'[object]'` / `'[function]'` for anything else, so no user code ever runs. Replace every `String(x)` in a throw path. | A null-proto object and a throwing / mutating `toString` give a TAGGED throw with byte-identical state in all four members and every ctor. Remove the `todo` in test/HyperLogLog.test.js (case 6) and make it a real test. |
+| F21 | Found by H2.2 qa, confirmed (L): every `merge` brand-checks with `instanceof`, which a forged `Object.create(X.prototype)` passes. DDSketch: a forged other with a matching `_gamma` merges silently and leaves `count` / `sum` = NaN on strict and non-strict sketches. CMS: a forged other throws an UNTAGGED TypeError. Present in 1.1.2. | A real brand check in every `merge`: a private-field brand (`#brand in other`) or a module-scope WeakSet filled by the ctor, so a forgery throws through the tagged `_badMerge` before any read. | A forged prototype instance throws a tagged error with byte-identical state in all four members. |
 
 **New gates (N)** (none exist today)
 
@@ -389,16 +390,16 @@ grows until H2.8, which owns the 1.2.0 trinity. The order follows the dependenci
 
 | session | scope | main file surface |
 | --- | --- | --- |
-| **H2.1** | F1 + the reusable child-process lane harness (N2-HLL, N5, a one-box control) + the HLL torture lane at 0 | 2 lines of HLL |
-| H2.2 | F10, F11, F17 (S2, S3): the DDSketch ctor and merge fail-closed fixes | DDSketch ctor / merge |
-| H2.3 | F13, F14, F15, F16 (S4, S5, S6) + F20: counting honesty (estimate guard, `saturated`, count cap, withX throws) and the `String(x)` thrower fix | validation only, no restructure |
+| H2.1 (done) | F1 + the reusable child-process lane harness (N2-HLL, N5, a one-box control) + the HLL torture lane at 0 | 2 lines of HLL |
+| H2.2 (done) | F10, F11, F17 (S2, S3): the DDSketch ctor and merge fail-closed fixes | DDSketch ctor / merge |
+| **H2.3** | F13, F14, F15, F16 (S4, S5, S6) + F20: counting honesty (estimate guard, `saturated`, count cap, withX throws) and the `String(x)` thrower fix | validation only, no restructure |
 | H2.4 | F2 + F12 (S1): the hand-inlined murmur + sign bit at all five sites, and the N9 parity harness | hash sites |
 | H2.5 | F3 + F4: argument-free SpaceSaving and CMS helpers (N3) | SS / CMS internals |
 | H2.6 | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7 | public API (additive) |
-| H2.7 | F7, F8, F18: `topKInto`, merge / query cost docs, option bags, forEach, -0, N8 | cold paths |
+| H2.7 | F7, F8, F18, F21: `topKInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
 | H2.8 | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
 
-### 7.2 H2.1 spec -- F1 + the lane harness  [DONE 2026-10-04, awaiting maintainer commit]
+### 7.2 H2.1 spec -- F1 + the lane harness  [DONE, committed 980e4fe]
 
 Result: reviewer REJECTED once, then APPROVED. The first rejection found that N5 could pass vacuously
 (no positive control) and that the CHANGELOG overclaimed for keys >= 2^31. qa found a1-a7 PASS:
@@ -473,5 +474,140 @@ Reviewer focus:
 - lane flakiness: a1 / a3 margins across 3 runs;
 - whether CTRL really runs no-inline;
 - whether the lanes read keys from the Float64Array rather than from a closure int.
+
+### 7.3 H2.2 spec -- DDSketch fail-closed: F10 + F11 + F17 (S2, S3)  [DONE 2026-10-04, awaiting maintainer commit]
+
+Result: the coder hit its turn limit once. The reviewer REJECTED once, for doc truth only: the stale
+jsdoc domain and the inverted F17 direction in the CHANGELOG. It then APPROVED. qa found b1-b7 PASS:
+- G1 children 35-52 ms on the new code. On HEAD, 1e-17 / 1e-12 / 1e-10 are SIGTERMed at 2 s.
+- G3 0 edge failures. HEAD fails 508 / 2490 / 583 / 2417 on qa's grid.
+- The ctor at 1e-6 takes 0.0015-0.0018 ms (HEAD 2.36 ms).
+- The hot methods are byte-identical.
+- 199 tests (198 pass, 1 todo = F20).
+Beyond the spec:
+- **The `maxIndexable === MAX_VALUE` branch was removed as provably dead.** Since
+  `2*gamma^maxK/(gamma+1)` is finite, gamma^maxK <= MAX/2.
+- **The orchestrator fixed a pre-existing torture phase 2c flaw.** The baseline was read BEFORE the
+  ~310 KB reuse banks were built, so the gate passed only when older garbage was freed inside the
+  window, and FAILed under `npm run verify` (abGrowth=317648 = the banks exactly). Now:
+  - the banks are built first;
+  - `gc(); sleep(50)` x2 runs before both reads;
+  - the banks are kept live via SINK;
+  - abGrowth reads 0 on every run;
+  - per-clear() re-allocating mutants FAIL for all four members (HLL 3276800, CMS 39321600,
+    DD 3276800, SS 409600).
+Environment note: the perf gate's own DETECTOR self-check flakes ("negative control forced 12
+scavenges") on HEAD and the tree alike while an unrelated 10-job soak benchmark loads the machine
+(load avg 12-20). Re-run `npm run verify` on a quiet machine before committing.
+New finding: F21 (the forged-prototype merge), assigned to H2.7.
+
+Why now: these are the two High fail-closed bugs plus the bound lite-hud M2 pre-checks against.
+They are all cold DDSketch code (ctor + merge), so the hot path does not move. They are
+independent of the hash work in H2.4-H2.6.
+
+Pre-measured on a scratchpad prototype (`h22proto.mjs`) over 3000 alphas (1e-6..0.1 log-spaced,
+0.1..0.9999 linear):
+- **F10:** the closed form `K = floor((ln MAX_VALUE - ln 2) / ln gamma)` gives `_maxKeyIndexable`
+  IDENTICAL to HEAD at every alpha, with 0 fix-up iterations. The cost at 1e-6 goes 3 ms -> 0.0001 ms.
+  The old form added `ln((gamma+1)/2)` instead of subtracting `ln 2`. That overshoots by about
+  0.3466/alpha keys, which the decrement loop then walked back one at a time.
+- **F17:** bisection over doubles finds all four exact edges in <= 25 steps, with 0 failures.
+
+Out of scope (do not touch):
+- `add` / `addFrom` / `_addKey` / `quantile` (the hot path stays byte-identical);
+- the option `in` check (F18, H2.7) and `String(x)` in throwers (F20, H2.3);
+- the DD count cap (F15, H2.3);
+- the README:137 collapse wording (F19, H2.8);
+- every other member.
+
+**Tasks**
+- **T1 (coder, Sketch.js, F10 + S2):** add `export const DD_ALPHA_MIN = 1e-6;` next to the DD
+  constants, with jsdoc. At 2^20 bins it spans only ~8x of value range, which is why it is the floor.
+  - The ctor door accepts `DD_ALPHA_MIN <= alpha < 1`. It keeps the typeof-first guard, so a
+    non-number is still rejected first. The RangeError message names the domain
+    `[1e-6, 1)` (format it from the constant).
+  - Replace the max-key closed form with `Math.floor((Math.log(Number.MAX_VALUE) - Math.LN2) / lnGamma)`.
+  - Make both fix-ups bidirectional, using the SAME expression `2 * Math.pow(gamma, K) / (gamma + 1)`
+    that `quantile` uses. Step down while it is not finite, and step up while K+1 is still finite.
+    For the min key: step up while the value < MIN_NORMAL, and step down while K-1 is still >= it.
+  - Share ONE iteration cap of 4 per bound. Past the cap, throw a tagged RangeError (lesson 8: a
+    fix-up loop needs a cap).
+  - Keep the defensive tagged throws for `!(gamma > 1)` and a non-finite multiplier / lnGamma. They
+    are unreachable inside the domain, so they are not gated.
+- **T2 (coder, Sketch.js, F17):** after the key bounds, compute `_minIndexable` / `_maxIndexable` as
+  the EXACT acceptance edges of add's own key expression, `Math.ceil(Math.log(x) * this._multiplier)`,
+  using the same `multiplier` value.
+  - Min edge: bisect between `pow(gamma, minK-1) * (1 - 1e-9)` and `* (1 + 1e-9)` down to the
+    adjacent pair (lo rejected, hi accepted). `_minIndexable = lo`, the EXCLUSIVE floor.
+  - Max edge: if `MAX_VALUE` is accepted, then `_maxIndexable = MAX_VALUE`. Otherwise bisect around
+    `pow(gamma, maxK)` the same way, and `_maxIndexable` = the last accepted double (INCLUSIVE).
+  - Verify the bracket before bisecting, and cap at 80 steps. A broken bracket or an exceeded cap
+    throws tagged.
+  - Cold, 0 extra allocation (plain doubles; no BigInt, no arrays).
+  - Fix the ctor comment that claims "exact bounds", so that it is now true and says how.
+- **T3 (coder, Sketch.js, F11 + S3):** in `merge`, after the gamma check and BEFORE the strict
+  pre-scan, reject a collapsed other: `if (this._strict && other._collapsed)` throws via a new cold
+  `_badMergeCollapsed()`. That is a tagged RangeError saying a strict sketch cannot absorb a
+  collapsed sketch's low-end mass. Every rejection stays byte-identical.
+  - Past every throw: `if (other._collapsed) this._collapsed = true;`.
+  - Update the merge jsdoc: it carries `collapsed`, and strict rejects a collapsed other.
+- **T4 (coder, tests in test/DDSketch.test.js, existing style):**
+  - **G1 (F10):** a child (`spawnSync` with a 2000 ms timeout per alpha) that constructs at
+    1e-17, 1e-12, 1e-10, 2e-9, 1e-7 and `nextDown(1e-6)`. Each must throw a tagged RangeError, and a
+    timeout is a FAIL. In process: `DD_ALPHA_MIN === 1e-6`, `new DDSketch(DD_ALPHA_MIN)` builds in
+    < 5 ms (take the min of 5 runs), and 0, 1 and NaN still throw.
+  - **G2 (F11):** the shard example gives `collapsed === true` and `quantile(0)` unchanged at 742.6.
+    A collapsed other into a non-empty non-strict sketch gives collapsed, and `clear()` resets it.
+    A strict merge of a collapsed other throws tagged, with a byte-identical snapshot (bins copy +
+    count / sum / min / max / zeroCount / collapsed). A strict merge of a non-collapsed in-range
+    other still works.
+  - **G3 (F17):** the 3000-alpha sweep (the prototype's alpha grid) checks the four edges:
+    `add(min)` rejected, `add(nextUp(min))` accepted, `add(max)` accepted, and `add(nextUp(max))`
+    rejected unless max === MAX_VALUE. Also check a strict sketch at 3 alphas (same getters).
+    `nextUp` is a cold test helper (Float64Array / BigUint64Array view).
+  - The existing N1 getter test stays green unchanged.
+- **T5 (coder, test/parity.mjs):** add a DDSketch section run against the same ref.
+  - Over >= 300 alphas in [1e-6, 0.9999], `_maxKeyIndexable` / `_minKeyIndexable` must be IDENTICAL.
+  - Run value streams through non-strict (default and maxBins 64, which collapses), strict, and
+    merges of NON-collapsed others: bins, count / sum / min / max / zeroCount / collapsed, and
+    quantiles on a q grid must be identical.
+  - Documented, allowed differences, which it prints but does not fail on:
+    - the minIndexable / maxIndexable getters (F17). For these, assert the new getters pass the
+      four-edge check instead.
+    - `collapsed` after merging a collapsed other into a non-strict sketch (F11). Bins and quantiles
+      there must still be identical.
+- **T6 (coder, docs):**
+  - Change alpha in (0,1) to `[1e-6, 1)` in Sketch.d.ts (:183, plus a `DD_ALPHA_MIN` export), in
+    llms.txt :183 (and the API list), in README :236 (plus the constants table), and in
+    decisions/0004-ddsketch.md (a dated H2.2 note covering ALPHA_MIN, collapsed-merge and the exact
+    edges).
+  - Merge docs: it carries `collapsed`, and strict rejects a collapsed other.
+  - CHANGELOG `[Unreleased]`:
+    - **Fixed:** the ctor hang (with the times), merge dropping `collapsed` (the shard example), and
+      the inexact indexable getters (the counts).
+    - **Added:** `DD_ALPHA_MIN`.
+    - **Changed:** alpha < 1e-6 now throws (it was accepted before, slowly, and hung below about
+      1e-10). A strict merge of a collapsed other now throws.
+
+**Assertions (qa proves each; b1, b3, b4 also run against `git show HEAD:Sketch.js`)**
+- b1: G1 passes on the new code. On HEAD the 1e-12 / 1e-10 children time out, so the test FAILs.
+- b2: T5 parity: keys identical at every alpha, and all streams and merges identical except the two
+  documented differences.
+- b3: G2 passes on the new code and FAILs on HEAD (collapsed false; the strict merge is accepted).
+- b4: G3 shows 0 edge failures on the new code. On HEAD there are thousands (2402 / 598 / 526 / 2472
+  measured).
+- b5: the ctor at 1e-6 takes < 5 ms. The ctor at 0.01 is not slower than HEAD by more than 0.05 ms
+  per call (median over 1000).
+- b6: `npm run verify` green: tests 188 + new, torture / lanes / perf / witness unchanged.
+- b7: the Sketch.js diff touches only the DD constants, the ctor, merge and one new thrower. The
+  hot-path methods are byte-identical to HEAD (diff them). ASCII-only, no deps, pack 7 files.
+
+Reviewer focus:
+- Is the bisection predicate EXACTLY add's (`ceil(log(x) * this._multiplier)`, same multiplier)?
+- Are the exclusive / inclusive conventions right?
+- Is the max = MAX_VALUE branch right?
+- Can the strict-collapsed check ever let a partial write through (ordering vs the pre-scan)?
+- Do the caps throw rather than silently clamp?
+- Can G1 flake on a slow machine? (5 ms vs 0.0001 ms; the 2 s child timeout.)
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

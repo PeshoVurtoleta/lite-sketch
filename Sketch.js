@@ -832,6 +832,15 @@ const DD_MAX_BINS_DEFAULT = 2048;
 const DD_MAX_BINS_CAP = 1 << 20;
 /** Frozen marker of the known option keys -- an unknown key is a throw with a did-you-mean. */
 const DD_KNOWN_OPTS = Object.freeze({ maxBins: true, range: true });
+/**
+ * Smallest supported DDSketch `alpha`. At the 2^20-bin cap a single filled window spans
+ * only about 8x of value range at this alpha, so it is the practical floor; a smaller
+ * alpha is rejected at the ctor door (and below ~1e-10 the pre-1.2.0 bound search also
+ * hung for seconds as its decrement loop walked a 2^53-scale overshoot one key at a time).
+ * The ctor accepts `DD_ALPHA_MIN <= alpha < 1`.
+ * @type {number}
+ */
+export const DD_ALPHA_MIN = 1e-6;
 
 /**
  * DDSketch -- RELATIVE-ERROR QUANTILE estimation over a positive-and-zero value
@@ -884,17 +893,19 @@ const DD_KNOWN_OPTS = Object.freeze({ maxBins: true, range: true });
  */
 export class DDSketch {
     /**
-     * @param {number} alpha relative-error target; a number in (0, 1).
+     * @param {number} alpha relative-error target; a number in `[DD_ALPHA_MIN, 1)` =
+     *   `[1e-6, 1)`. A smaller alpha throws `[lite-sketch]` at the ctor door.
      * @param {{maxBins?: number, range?: [number, number]}} [options]
      *   maxBins: bin-array length in [1, 2^20] (default 2048); ignored in strict mode
      *            where the length is derived from `range`.
      *   range: [min, max] with finite `0 < min < max` -> STRICT mode (fail-closed, no collapse).
      */
     constructor(alpha, options) {
-        // typeof guard FIRST, BEFORE any allocation.
-        if (typeof alpha !== 'number' || !(alpha > 0 && alpha < 1)) {
+        // typeof guard FIRST, BEFORE any allocation. The domain floor is DD_ALPHA_MIN (S2):
+        // a smaller alpha is rejected here, before the indexable-bound math runs.
+        if (typeof alpha !== 'number' || !(alpha >= DD_ALPHA_MIN && alpha < 1)) {
             throw new RangeError(
-                '[lite-sketch] DDSketch alpha must be a number in (0, 1), got ' + String(alpha));
+                '[lite-sketch] DDSketch alpha must be a number in [' + DD_ALPHA_MIN.toExponential() + ', 1), got ' + String(alpha));
         }
         let maxBins = DD_MAX_BINS_DEFAULT;
         let range;
@@ -921,25 +932,98 @@ export class DDSketch {
         const gamma = (1 + alpha) / (1 - alpha);
         const multiplier = 1 / Math.log(gamma);
         const lnGamma = Math.log(gamma);
+        // Defensive, unreachable inside the [DD_ALPHA_MIN, 1) domain (gamma is ~1.000002..Inf there):
+        // a non-log base (gamma <= 1, or a non-finite multiplier / lnGamma) fails closed, not silently.
+        if (!(gamma > 1) || !Number.isFinite(multiplier) || !Number.isFinite(lnGamma)) {
+            throw new RangeError(
+                '[lite-sketch] DDSketch could not derive a finite log base from alpha ' + String(alpha));
+        }
         // The KEY bounds for which the representative `2*gamma^K/(gamma+1)` stays a finite,
         // NORMAL (full-relative-precision) double: above _maxKeyIndexable it overflows to
         // Infinity; below _minKeyIndexable it falls into the denormal range where a double
         // loses relative precision and the alpha guarantee breaks (bottoming out at
         // underflow-to-0 / ~100% error). A value whose key falls outside is rejected at add()
         // time (the DDSketch-reference fail-closed door). The closed form
-        // `K <= log(MAX_VALUE*(gamma+1)/2)/log(gamma)` is computed as a SUM OF LOGS (so the
-        // `MAX_VALUE*(gamma+1)/2` term never overflows to Infinity before the log), then
-        // tightened by a cold verification step so the representative AT the bound is provably
-        // finite and normal despite float rounding of the log/pow. MIN_NORMAL = 2^-1022 is
-        // the smallest normal double.
+        // `K = floor((ln MAX_VALUE - ln 2) / ln gamma)` lands on the exact bound at every alpha
+        // in the supported domain (0 fix-up steps measured over 3000 alphas); the OLD form added
+        // `ln((gamma+1)/2)` instead of subtracting `ln 2`, overshooting by ~0.3466/alpha keys,
+        // and the decrement loop below then walked that back one key at a time -- a multi-second
+        // hang for small alpha, infinite once K passed 2^53 (F10). The BIDIRECTIONAL fix-up (one
+        // shared cap of 4 steps PER BOUND, then a tagged throw) is now a defensive guard against
+        // float rounding of the log/pow, not a corrector of a systematic overshoot. It uses the
+        // SAME representative expression quantile() evaluates. MIN_NORMAL = 2^-1022 is the
+        // smallest normal double.
         const MIN_NORMAL = 2 ** -1022;
         const lnHalfGammaPlus1 = Math.log((gamma + 1) / 2);
-        let maxKeyIndexable = Math.floor((Math.log(Number.MAX_VALUE) + lnHalfGammaPlus1) / lnGamma);
-        while (maxKeyIndexable > 0 &&
-            !Number.isFinite(2 * Math.pow(gamma, maxKeyIndexable) / (gamma + 1))) maxKeyIndexable--;
+        let boundOk = true;
+        let maxKeyIndexable = Math.floor((Math.log(Number.MAX_VALUE) - Math.LN2) / lnGamma);
+        let fx = 0;
+        while (!Number.isFinite(2 * Math.pow(gamma, maxKeyIndexable) / (gamma + 1))) {
+            maxKeyIndexable--;
+            if (++fx > 4) { boundOk = false; break; }
+        }
+        while (boundOk && Number.isFinite(2 * Math.pow(gamma, maxKeyIndexable + 1) / (gamma + 1))) {
+            maxKeyIndexable++;
+            if (++fx > 4) { boundOk = false; break; }
+        }
         let minKeyIndexable = Math.ceil((Math.log(MIN_NORMAL) + lnHalfGammaPlus1) / lnGamma);
-        while (minKeyIndexable < 0 &&
-            2 * Math.pow(gamma, minKeyIndexable) / (gamma + 1) < MIN_NORMAL) minKeyIndexable++;
+        fx = 0;
+        while (boundOk && 2 * Math.pow(gamma, minKeyIndexable) / (gamma + 1) < MIN_NORMAL) {
+            minKeyIndexable++;
+            if (++fx > 4) { boundOk = false; break; }
+        }
+        while (boundOk && 2 * Math.pow(gamma, minKeyIndexable - 1) / (gamma + 1) >= MIN_NORMAL) {
+            minKeyIndexable--;
+            if (++fx > 4) { boundOk = false; break; }
+        }
+        if (!boundOk) {
+            throw new RangeError(
+                '[lite-sketch] DDSketch could not bound the indexable key range for alpha ' + String(alpha));
+        }
+        // EXACT acceptance edges of add's OWN key expression `ceil(log(x) * multiplier)` (F17),
+        // found by bit-level bisection of THAT expression with THIS multiplier -- so the
+        // minIndexable / maxIndexable getters are the real door, not the off-by-ulps
+        // `pow(gamma, K+-1)` the pre-1.2.0 code exposed (up to ~4e-13 relative). add accepts a
+        // finite x > 0 iff `minKeyIndexable <= ceil(log(x)*multiplier) <= maxKeyIndexable`, so the
+        // LOWER edge is EXCLUSIVE (the last REJECTED double; add accepts x > it) and the UPPER edge
+        // is INCLUSIVE (the last ACCEPTED double). maxKeyIndexable keeps `2*gamma^maxK/(gamma+1)`
+        // finite, hence `gamma^maxK <= MAX_VALUE/2`, so MAX_VALUE ALWAYS maps above maxKeyIndexable
+        // and the top accepted value is strictly below it. Cold, plain doubles -- no BigInt, no
+        // array. Over 3000 alphas this converges in <= 25 steps; a broken bracket or the 80-step
+        // cap fails closed.
+        let edgeOk = true;
+        let eLo = Math.pow(gamma, minKeyIndexable - 1) * (1 - 1e-9);
+        let eHi = Math.pow(gamma, minKeyIndexable - 1) * (1 + 1e-9);
+        if (Math.ceil(Math.log(eLo) * multiplier) >= minKeyIndexable ||
+            Math.ceil(Math.log(eHi) * multiplier) < minKeyIndexable) edgeOk = false;
+        if (edgeOk) {
+            let bs = 0;
+            for (;;) {
+                const mid = eLo + (eHi - eLo) / 2;
+                if (mid === eLo || mid === eHi) break;
+                if (Math.ceil(Math.log(mid) * multiplier) >= minKeyIndexable) eHi = mid; else eLo = mid;
+                if (++bs > 80) { edgeOk = false; break; }
+            }
+        }
+        const minIndexable = eLo;   // EXCLUSIVE floor: add accepts x > this (the last rejected double)
+        eLo = Math.pow(gamma, maxKeyIndexable) * (1 - 1e-9);
+        eHi = Math.pow(gamma, maxKeyIndexable) * (1 + 1e-9);
+        if (Math.ceil(Math.log(eLo) * multiplier) > maxKeyIndexable ||
+            Math.ceil(Math.log(eHi) * multiplier) <= maxKeyIndexable) edgeOk = false;
+        if (edgeOk) {
+            let bs = 0;
+            for (;;) {
+                const mid = eLo + (eHi - eLo) / 2;
+                if (mid === eLo || mid === eHi) break;
+                if (Math.ceil(Math.log(mid) * multiplier) > maxKeyIndexable) eHi = mid; else eLo = mid;
+                if (++bs > 80) { edgeOk = false; break; }
+            }
+        }
+        const maxIndexable = eLo;   // INCLUSIVE ceiling: the last accepted double (always < MAX_VALUE)
+        if (!edgeOk) {
+            throw new RangeError(
+                '[lite-sketch] DDSketch could not resolve the exact indexable edges for alpha ' + String(alpha));
+        }
         let strict = false;
         let minKey = 0, maxKeyStrict = 0, nb = 0;
         if (range !== undefined) {
@@ -972,11 +1056,12 @@ export class DDSketch {
         this._maxKeyStrict = maxKeyStrict;  // strict: highest legal key
         this._maxKeyIndexable = maxKeyIndexable;  // key ceiling: representative stays finite
         this._minKeyIndexable = minKeyIndexable;  // key floor: representative stays positive
-        // The exact x bounds add() accepts at this alpha (0-alloc getters read these).
-        // add accepts a value iff minKeyIndexable <= ceil(log_gamma(value)) <= maxKeyIndexable,
-        // i.e. a finite x with _minIndexable < x <= _maxIndexable (plus exact 0 always).
-        this._minIndexable = Math.pow(gamma, minKeyIndexable - 1);  // EXCLUSIVE floor: add accepts x > this
-        this._maxIndexable = Math.pow(gamma, maxKeyIndexable);      // INCLUSIVE ceiling: add accepts x <= this
+        // The EXACT x bounds add() accepts at this alpha (0-alloc getters read these), resolved
+        // above by bisecting add's own key expression -- NOT `pow(gamma, K+-1)`, which is off by
+        // ulps. add accepts a finite x > 0 iff `_minIndexable < x <= _maxIndexable` (plus exact 0
+        // always): the floor is the last REJECTED double, the ceiling the last ACCEPTED one.
+        this._minIndexable = minIndexable;  // EXCLUSIVE floor: add accepts x > this
+        this._maxIndexable = maxIndexable;  // INCLUSIVE ceiling: add accepts x <= this
         this._rangeMin = strict ? range[0] : NaN;                   // configured strict range (NaN if not strict)
         this._rangeMax = strict ? range[1] : NaN;
         this._bins = new Float64Array(strict ? nb : maxBins);
@@ -1249,12 +1334,18 @@ export class DDSketch {
      * `other` through the same collapse logic as `add` (so the collapsed floor stays
      * consistent). O(other bins), NEVER allocates. Fails closed `[lite-sketch]` if `other`
      * is not a DDSketch or has a different gamma (i.e. a different alpha). If this is in
-     * STRICT mode, an incoming key outside the fixed range throws (documented fail-closed).
+     * STRICT mode, an incoming key outside the fixed range throws (documented fail-closed),
+     * and a COLLAPSED `other` is rejected outright (S3): its low-end mass has already folded,
+     * so a strict sketch cannot absorb it without breaking its range guarantee. A non-strict
+     * `this` carries `other._collapsed` forward (merging collapsed mass makes `this` collapsed).
      * @param {DDSketch} other
      * @returns {DDSketch} this
      */
     merge(other) {
         if (!(other instanceof DDSketch) || other._gamma !== this._gamma) return this._badMerge(other);
+        // A strict sketch cannot absorb a collapsed other (S3): reject AFTER the gamma check and
+        // BEFORE the strict pre-scan, as a byte-identical no-op (no write has happened yet).
+        if (this._strict && other._collapsed) return this._badMergeCollapsed();
         // STRICT: pre-scan other's populated keys against this fixed range and fail closed
         // BEFORE any aggregate/bin write -- a rejected merge is a byte-identical no-op too.
         if (this._strict && other._binCount !== 0) {
@@ -1271,7 +1362,9 @@ export class DDSketch {
                 }
             }
         }
-        // Past every throw: write the aggregates, then fold each populated bin.
+        // Past every throw (gamma, strict-collapsed, strict pre-scan): carry other's collapsed
+        // state, then write the aggregates and fold each populated bin.
+        if (other._collapsed) this._collapsed = true;
         this._zeroCount += other._zeroCount;
         this._count += other._count;
         this._sum += other._sum;
@@ -1327,6 +1420,13 @@ export class DDSketch {
     _badRange(range) {
         throw new RangeError(
             '[lite-sketch] DDSketch range must be [min, max] with finite 0 < min < max, got ' + String(range));
+    }
+
+    /** @private Cold thrower: a strict sketch cannot absorb a collapsed sketch's low-end mass (S3). */
+    _badMergeCollapsed() {
+        throw new RangeError(
+            '[lite-sketch] DDSketch.merge: a strict sketch cannot absorb a collapsed sketch ' +
+            '(its low-end mass has already folded, so the strict range guarantee cannot hold)');
     }
 
     /** @private Cold thrower for an incompatible merge (non-instance vs unequal gamma/alpha). */

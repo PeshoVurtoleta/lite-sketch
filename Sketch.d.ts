@@ -166,6 +166,12 @@ export interface DDSketchOptions {
 }
 
 /**
+ * Smallest supported DDSketch `alpha` (1e-6). The ctor accepts `DD_ALPHA_MIN <= alpha < 1`;
+ * a smaller alpha throws [lite-sketch] at the ctor door.
+ */
+export const DD_ALPHA_MIN: number;
+
+/**
  * DDSketch -- a zero-GC, relative-error QUANTILE sketch over a dense
  * `Float64Array` of log-scale bins (Masson, Rim, Lee -- "DDSketch: A Fast and
  * Fully-Mergeable Quantile Sketch with Relative-Error Guarantees"). Unlike
@@ -180,7 +186,8 @@ export interface DDSketchOptions {
  */
 export class DDSketch {
     /**
-     * @param alpha relative-error target, a number in (0, 1).
+     * @param alpha relative-error target, a number in `[1e-6, 1)` (the floor is
+     *   `DD_ALPHA_MIN`; a smaller alpha throws [lite-sketch] at the ctor door).
      * @param options maxBins / range. Throws [lite-sketch] on any bad argument
      *   BEFORE the bin array is allocated (incl. an unknown option key).
      */
@@ -216,10 +223,10 @@ export class DDSketch {
     /** Whether this is a STRICT fixed-range sketch (a `range` was given at construction; no collapse). O(1). */
     readonly strict: boolean;
 
-    /** The smallest x > 0 `add` accepts at this alpha (EXCLUSIVE floor: `add` accepts finite `minIndexable < x <= maxIndexable`, plus exact 0). ~2.2e-308 at alpha=0.01. O(1), 0 B/op. */
+    /** The smallest x > 0 `add` accepts at this alpha, the EXACT bisected edge of `add`'s own key expression (EXCLUSIVE floor: `add` accepts finite `minIndexable < x <= maxIndexable`, plus exact 0). ~2.2e-308 at alpha=0.01. O(1), 0 B/op. */
     readonly minIndexable: number;
 
-    /** The largest x `add` accepts at this alpha (INCLUSIVE ceiling: `add` accepts finite `minIndexable < x <= maxIndexable`). ~8.9e307 at alpha=0.01. O(1), 0 B/op. */
+    /** The largest x `add` accepts at this alpha, the EXACT bisected edge of `add`'s own key expression (INCLUSIVE ceiling: `add` accepts finite `minIndexable < x <= maxIndexable`; always below `Number.MAX_VALUE`, whose representative would overflow). ~8.9e307 at alpha=0.01. O(1), 0 B/op. */
     readonly maxIndexable: number;
 
     /** STRICT mode: the configured range minimum passed at construction (NaN if not strict). O(1). */
@@ -237,7 +244,7 @@ export class DDSketch {
     /** Estimate the value at quantile q in [0, 1] -- the alpha-approximate member. COLD, O(bins). NEVER throws; returns NaN for a bad q or an empty sketch. */
     quantile(q: number): number;
 
-    /** Merge `other` into this: fold the running aggregates and every populated bin through the same collapse logic as `add`. O(other bins). Throws [lite-sketch] on a non-DDSketch, an unequal alpha/gamma, or (strict mode) an incoming key outside the fixed range. */
+    /** Merge `other` into this: fold the running aggregates and every populated bin through the same collapse logic as `add`, and carry `other.collapsed` forward (merging collapsed mass makes this collapsed). O(other bins). Throws [lite-sketch] on a non-DDSketch, an unequal alpha/gamma, (strict mode) an incoming key outside the fixed range, or (strict mode) a COLLAPSED `other`. */
     merge(other: DDSketch): this;
 
     /** Reset the sketch to empty. O(maxBins). */
