@@ -8,7 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **HyperLogLog `add` / `addHashed` no longer deopt-loop on register suffixes `>= 2^31`.**
+- **Negative keys no longer collide with their `2^32`-shifted twins (F12).** The key's sign was
+  folded into **bit 0** of the high word (`hiw ^ neg`), a magnitude bit, so `-k` aliased a real
+  positive key: `add(-1); add(2**32+1)` counted **1** distinct (now **2**); 20000 distinct
+  `(-i, 2^32+i)` pairs counted **10023** (now **~20000**); and `CountMinSketch.add(-7, 100)` made
+  `estimate(2**32+7)` read **100** (now **0**). The sign now lives in **bit 31** of the high word
+  (`hiw ^ (neg << 31)`), which is free because a safe integer's high word is `< 2^21`. The
+  `mix64` / `hashHi` / `hashLo` lanes change for **NEGATIVE keys only** (including `-Infinity`);
+  positive keys and `-0` stay **bit-identical**. `SpaceSaving` was already exact (keys are
+  compared by value in the probe) but every `-k` / twin pair shared a home slot; they now probe
+  to distinct homes.
+- **`HyperLogLog` / `CountMinSketch` `add` and `CountMinSketch.estimate` no longer box the hash
+  words for `|key| >= 2^31` (F2, Node part).** The key is split into int32 words (`lo = a | 0`,
+  `hiw = (a / 2^32) | 0`) that stay Smis across `_m3round`, so the library adds **0** boxes. With
+  all inlining disabled the no-inline lane drops from **49 scavenges at 1.6M ops** (`~2 boxes/op`;
+  `-2^31` keys **73**) to **24** (`~1 box/op`, the caller's own argument box at the non-inlined call
+  boundary), which stays until `addFrom` lands (1.2.0). The default-tier `-2^31` HLL lane drops from
+  **48 to 24 or less** (0-3 when V8 inlines `add` into the caller). Positive-key output is
+  bit-identical.
   The register suffix was computed as `(h << p) >>> 0`, a uint32 that is `>= 2^31` about
   half the time. Maglev assumed it was an int32, so that half deopted (`not int32`) and
   recompiled in a loop (hundreds of deopts per run), and the deopted tiers boxed every
@@ -20,8 +37,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `>= 2^31` still costs boxes from two separate causes, both fixed later in 1.2.0:
   the caller boxes the argument itself at a non-inlined call (~24 scavenges at 1.6M
   ops; only `addFrom` removes it), and the library boxes `lo = a >>> 0` into
-  `_m3round` (the other ~25 of the 49 seen with no inlining; removed by hand-inlining
-  the murmur). Output is **bit-identical** --
+  `_m3round` (the other ~25 of the 49 seen with no inlining; removed in 1.2.0 by the
+  int32 word split below, which keeps `lo` / `hiw` as Smis across `_m3round` -- the
+  murmur hand-inline itself is deferred to a later 1.2.0 step). Output is **bit-identical** --
   the `_reg[]` registers and `count()` match the prior release exactly at p = 4, 12, 18
   over 600k mixed (positive, negative, `> 2^32`) keys plus the `addHashed` lanes.
 - **`DDSketch` constructor no longer hangs for a small `alpha`.** The max-key closed form

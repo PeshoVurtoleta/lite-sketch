@@ -20,7 +20,7 @@
 //
 // `--lib <absolute path>` runs every lane against another module (the revert-check:
 // the N2-HLL and N5 lanes FAIL on HEAD, while CTRL still passes). ASCII-only.
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, execFile } from 'node:child_process';
 
 const LANE = new URL('./lanes/lane.mjs', import.meta.url).pathname;
 const libArg = (() => { const k = process.argv.indexOf('--lib'); return k >= 0 ? process.argv[k + 1] : null; })();
@@ -93,6 +93,105 @@ for (const noInline of [false, true]) {
     const v = runScav('noop', 'b31', 'fresh', true);
     gate('CTRL[b31/ni]', v, v >= 12);
 }
+
+// ---- N3 (H2.4): the F2-Node + F12 hash-word box lanes ------------------------
+// 144 fresh children ((36 gated + 8 Noop) x REPS=3, + 12 SS once): {hll,cms,cmsest} x {b31,u32,n31,safe} x {df,ni,nc}, Noop x 4kc x
+// {ni,nc} (the subtraction baseline + the never-optimize teeth), ss x 4kc x 3 modes
+// (print-only; F3 is gated in H2.5). Run through an execFile pool of N3_JOBS (default 4;
+// 1 = serial). Scavenges over 8N with a 4 MB semi-space; one HeapNumber box/op reads ~24.
+const N3_JOBS = Math.max(1, parseInt(process.env.N3_JOBS || '4', 10) || 4);
+const N3_KINDS = ['hll', 'cms', 'cmsest'];
+const N3_MODES = ['df', 'ni', 'nc'];
+const N3_KCS = ['b31', 'u32', 'n31', 'safe'];
+
+function n3Flags(mode) {
+    if (mode === 'ni') return [...BASE, ...NOINL];
+    if (mode === 'nc') return [...BASE, '--allow-natives-syntax'];   // for natives.mjs's %NeverOptimizeFunction
+    return [...BASE];
+}
+function scavJob(kind, kc, mode) {
+    const args = [...n3Flags(mode), LANE, 'scav', kind, kc, 'fresh',
+        ...(mode === 'nc' ? ['--nc'] : []), ...LIBFLAGS];
+    return new Promise((resolve, reject) => {
+        execFile(process.execPath, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+            if (err) return reject(new Error('scav ' + kind + '/' + kc + '/' + mode + ': ' + err.message));
+            const v = JSON.parse(stdout.trim().split('\n').pop()).scav;
+            if (!Number.isInteger(v) || v < 0) return reject(new Error('scav ' + kind + '/' + kc + '/' + mode + ' returned ' + v));
+            resolve(v);
+        });
+    });
+}
+
+// Every GATED lane (the 3 kinds x 4 kc x {df,ni,nc}) and its Noop baseline is run REPS times
+// as separate children; the gate is on the MIN. Scheduler jitter / caller tier-up under CPU
+// load only ADDS scavenges, never removes a real library box, so the MIN is the honest library
+// estimate for all three modes. SS lanes are print-only (F3) and run once.
+const REPS = 3;
+const jobs = [];
+for (const kind of N3_KINDS) for (const kc of N3_KCS) for (const mode of N3_MODES) {
+    for (let r = 0; r < REPS; r++) jobs.push([kind, kc, mode]);
+}
+for (const kc of N3_KCS) for (const mode of ['ni', 'nc']) {
+    for (let r = 0; r < REPS; r++) jobs.push(['noop', kc, mode]);
+}
+for (const kc of N3_KCS) for (const mode of N3_MODES) jobs.push(['ss', kc, mode]);
+
+const R = {};   // key -> array of scav values (REPS entries for every gated lane and its Noop; one for SS)
+let nextJob = 0;
+async function n3Worker() {
+    while (nextJob < jobs.length) {
+        const idx = nextJob++;
+        const [kind, kc, mode] = jobs[idx];
+        const k = kind + '/' + kc + '/' + mode;
+        const v = await scavJob(kind, kc, mode);
+        (R[k] || (R[k] = [])).push(v);
+    }
+}
+await Promise.all(Array.from({ length: Math.min(N3_JOBS, jobs.length) }, n3Worker));
+const one = (k) => R[k][0];
+const vmin = (k) => Math.min(...R[k]);
+
+// Gates, fixed order. (1) ni/nc: min(lane) - min(noop, same mode, kc) <= 2 (24 lanes). Both
+// sides are the MIN over REPS children (tier / jitter noise only adds scavenges).
+for (const mode of ['ni', 'nc']) {
+    for (const kind of N3_KINDS) {
+        for (const kc of N3_KCS) {
+            const delta = vmin(kind + '/' + kc + '/' + mode) - vmin('noop/' + kc + '/' + mode);
+            gate('N3[' + mode + '/' + kind + '/' + kc + ']', delta, delta <= 2);
+        }
+    }
+}
+// (2) df: every rep is PRINTED, the gate is on the MIN. Default-tier caller tier-up (starved
+// background compilation under CPU load) only ADDS scavenges, never removes a real library
+// box, so the MIN is the honest library estimate. The HLL df lanes carry HEAD teeth (HEAD min
+// b31/u32/safe ~25, n31 ~49). hll/n31 is gated against the LIVE Noop(ni, n31): under the default
+// cumulative inline budget `add` stays OUT of the lane loop so the caller boxes its own read and
+// the library adds 0 -- but when V8 DOES inline `add` the same lane reads 2-3, so the gate is
+// min <= noop(ni,n31) + 2, not a hard 24. The cms / cmsest df lanes read 1-2 on HEAD too, so
+// they are regression guards (gated on MIN <= 2; the ni / nc lanes are their HEAD teeth).
+for (const kind of N3_KINDS) {
+    for (const kc of N3_KCS) {
+        const k = kind + '/' + kc + '/df';
+        const mn = vmin(k);
+        const all = R[k].join(',');
+        if (kind === 'hll' && kc === 'n31') {
+            const lim = vmin('noop/n31/ni') + 2;
+            gate('N3[df/hll/n31]', 'min=' + mn + '[' + all + '](<=' + lim + ')', mn <= lim);
+        } else {
+            const guard = kind === 'hll' ? '' : ' (regression guard; ni/nc are the HEAD teeth)';
+            gate('N3[df/' + kind + '/' + kc + ']', 'min=' + mn + '[' + all + ']' + guard, mn <= 2);
+        }
+    }
+}
+// (3) NC-CTRL teeth: a never-optimize that silently failed would read 0 (the caller would
+// be optimized and unbox the Float64Array read); the interpreter caller boxes, so >= 12.
+for (const kc of N3_KCS) {
+    const v = vmin('noop/' + kc + '/nc');
+    gate('NC-CTRL[noop/' + kc + ']', v, v >= 12);
+}
+// Print-only: the ni Noop baseline (min), and the SS lanes (F3, gated in H2.5).
+for (const kc of N3_KCS) results.push('noop-ni[' + kc + ']=' + vmin('noop/' + kc + '/ni'));
+for (const mode of N3_MODES) for (const kc of N3_KCS) results.push('SS[' + mode + '/' + kc + ']=' + one('ss/' + kc + '/' + mode) + ' (print-only: F3, gated in H2.5)');
 
 const ok = fails === 0;
 console.log('GATE lanes' + (libArg ? ' (lib=' + libArg + ')' : '') + ': ' + results.join(' ') +

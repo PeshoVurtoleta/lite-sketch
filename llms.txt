@@ -105,7 +105,7 @@ Hot surface (add / addHashed are worst-case O(1), zero allocation):
                             closed: a non-number / NaN / Symbol / BigInt / +-Infinity /
                             non-integer / out-of-safe-range key throws [lite-sketch]
                             (typeof-first, byte-identical no-op) -- a non-integer or Infinity
-                            would truncate/alias under >>> 0.
+                            would truncate/alias under the 32-bit word split.
 - addHashed(hi, lo) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
                             hashed with their own good hash; skips the internal mix.
                             Both lanes typeof-guarded as uint32.
@@ -160,7 +160,7 @@ Hot surface (add / addHashed / estimate are worst-case O(d), zero allocation):
                                   out-of-safe-range key, a count outside [1, 2^32-1], or an add
                                   that would push the running total past 2^53-1 throws
                                   [lite-sketch] (typeof-first) -- a non-integer or Infinity would
-                                  truncate/alias under >>> 0.
+                                  truncate/alias under the 32-bit word split.
 - addHashed(hi, lo, count = 1) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
                                   hashed; skips the internal mix. Both lanes typeof-guarded uint32.
 - estimate(key) -> number         The estimated frequency: the MIN of the key's d cells. QUERY,

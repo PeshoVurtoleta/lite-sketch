@@ -17,7 +17,9 @@ export const VERSION: string;
  * allocation -- no BigInt, no tuple). Read the lanes immediately via `hashHi()` /
  * `hashLo()`. Members call this internally; a caller who wants the canonical hash to
  * feed a pre-hashed entry point uses it then reads the two lanes.
- * @param key a numeric key (integer keys hash injectively; see the numeric-key note).
+ * @param key a numeric key. Integers with |key| <= 2^53 hash injectively WITH their sign
+ *   (the sign lives in bit 31 of the high word; see the numeric-key note). The lanes changed
+ *   for NEGATIVE keys in 1.2.0 (F12 -- positive keys and -0 are unchanged).
  * @param seed a uint32 seed (coerced via >>> 0).
  */
 export function mix64(key: number, seed: number): void;

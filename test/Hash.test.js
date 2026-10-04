@@ -145,3 +145,108 @@ test('saltRow: deterministic, uint32, distinct per row index', () => {
     }
     assert.ok(seen.size >= 15, 'row salts should be near-distinct, got ' + seen.size + '/16');
 });
+
+// ===========================================================================
+// G-F12 (hash sign bit): a negative key's sign lives in bit 31 of the high word
+// (`hiw ^ (neg << 31)`), so -k and k no longer collide on bit 0. The negative-vector
+// and pair tests FAIL on HEAD (where the sign was bit 0 -- a magnitude bit).
+// ===========================================================================
+
+test('G-F12 (hash): the pair (-(H*2^32+L), (H^1)*2^32+L) separates on BOTH lanes over 1e5 keys', () => {
+    const N = 100000;
+    let both = 0;
+    for (let i = 0; i < N; i++) {
+        const H = (i % 1000) + 1;
+        const L = (i * 2654435761) >>> 0;
+        const k1 = -(H * 4294967296 + L);
+        const k2 = (H ^ 1) * 4294967296 + L;
+        mix64(k1, 7); const a1h = hashHi(), a1l = hashLo();
+        mix64(k2, 7); const a2h = hashHi(), a2l = hashLo();
+        if (a1h !== a2h && a1l !== a2l) both++;
+    }
+    assert.equal(both, N, 'every pair must separate on both lanes (HEAD: all collide)');
+});
+
+test('G-F12 (hash): mix64(-0, s) === mix64(0, s) -- negative zero is not a negative key', () => {
+    for (const s of [0x9e3779b1, 1, 123]) {
+        mix64(-0, s); const nh = hashHi(), nl = hashLo();
+        mix64(0, s); const ph = hashHi(), pl = hashLo();
+        assert.equal(nh, ph, 'hi seed=' + s);
+        assert.equal(nl, pl, 'lo seed=' + s);
+    }
+});
+
+test('G-F12 (hash): golden POSITIVE vectors are bit-identical to HEAD (positive parity)', () => {
+    // Cut from `git show HEAD:Sketch.js` BEFORE the H2.4 edit; the sign split must not
+    // perturb any non-negative key. k in {0, 1, 2^31, 2^32-1, 2^32, 2^32+1, 2^53-1, 1.5}.
+    const GOLDEN_POS = [
+        [0x9e3779b1, [[0, 2362355725, 2021278343], [1, 3200788411, 2496031126], [2 ** 31, 1978638733, 1058767606], [2 ** 32 - 1, 2401977980, 1300909082], [2 ** 32, 1139062891, 1931245547], [2 ** 32 + 1, 2853606066, 4110443577], [2 ** 53 - 1, 1595987163, 2417292288], [1.5, 3200788411, 2496031126]]],
+        [1, [[0, 3935659133, 1322395136], [1, 3741873941, 3242480447], [2 ** 31, 3655845367, 759505952], [2 ** 32 - 1, 2673058961, 1886042939], [2 ** 32, 4108302650, 407570088], [2 ** 32 + 1, 2688304468, 1424160707], [2 ** 53 - 1, 4036036706, 3721801793], [1.5, 3741873941, 3242480447]]],
+    ];
+    for (const [seed, vecs] of GOLDEN_POS) {
+        for (const [k, hi, lo] of vecs) {
+            mix64(k, seed);
+            assert.equal(hashHi(), hi, 'hi k=' + k + ' seed=' + seed);
+            assert.equal(hashLo(), lo, 'lo k=' + k + ' seed=' + seed);
+        }
+    }
+});
+
+test('G-F12 (hash): golden NEGATIVE vectors are pinned (FAILs on HEAD -- sign was bit 0)', () => {
+    // Pinned from the H2.4 code: k in {-1, -(2^31), -(2^32+1), -(2^53-1)} at two seeds.
+    const GOLDEN_NEG = [
+        [0x9e3779b1, [[-1, 1034675502, 2434954898], [-(2 ** 31), 2993034131, 4207917661], [-(2 ** 32 + 1), 3774027700, 3328298424], [-(2 ** 53 - 1), 4060527541, 3493993696]]],
+        [1, [[-1, 2480142199, 642811977], [-(2 ** 31), 2031817424, 739786215], [-(2 ** 32 + 1), 3084668204, 177295390], [-(2 ** 53 - 1), 674693959, 2374071941]]],
+    ];
+    for (const [seed, vecs] of GOLDEN_NEG) {
+        for (const [k, hi, lo] of vecs) {
+            mix64(k, seed);
+            assert.equal(hashHi(), hi, 'hi k=' + k + ' seed=' + seed);
+            assert.equal(hashLo(), lo, 'lo k=' + k + ' seed=' + seed);
+        }
+    }
+});
+
+// QA H2.4 boundary matrix (gap: the G-F12 pins cover 4 negative keys; nothing proved the
+// new (a|0, hiw ^ (neg<<31)) word split is INJECTIVE across the int32 / uint32 / 2^32 /
+// 2^53 word edges, where `a | 0` goes negative and `hiw` first turns non-zero).
+const QA_EDGE = [0, 1, -1, 2 ** 31 - 1, -(2 ** 31 - 1), 2 ** 31, -(2 ** 31), -(2 ** 31) - 1,
+    2 ** 32 - 1, -(2 ** 32 - 1), 2 ** 32, -(2 ** 32), 2 ** 32 + 1, -(2 ** 32 + 1),
+    2 ** 40 + 104729, -(2 ** 40 + 104729), 2 ** 52, -(2 ** 52), 2 ** 53 - 2, -(2 ** 53 - 2),
+    2 ** 53 - 1, -(2 ** 53 - 1), (2 ** 21 - 1) * 4294967296, -((2 ** 21 - 1) * 4294967296)];
+
+test('QA H2.4 (hash): every boundary key (0, +-1, +-(2^31-1), +-2^31, +-(2^32-1), +-2^32, ' +
+    '+-(2^53-1) ...) hashes to a distinct (hi,lo) at two seeds; -0 aliases 0 only', () => {
+    for (const seed of [0x9e3779b1, 7]) {
+        const seen = new Map();
+        for (const k of QA_EDGE) {
+            mix64(k, seed);
+            const id = hashHi() + ':' + hashLo();
+            assert.ok(!seen.has(id), 'k=' + k + ' collides with k=' + seen.get(id) + ' at seed ' + seed);
+            seen.set(id, k);
+        }
+        mix64(-0, seed);
+        assert.equal(seen.get(hashHi() + ':' + hashLo()), 0, '-0 hashes exactly as 0');
+    }
+});
+
+test('QA H2.4 (hash): ADVERSARIAL -- -k never aliases ANY high-word bit flip of k ' +
+    '(the old sign-on-bit-0 collision generalised to every high-word bit 0..20)', () => {
+    // On HEAD the sign was xor-ed into bit 0 of the high word, so -k aliased k ^ 2^32. A bad
+    // encoding could alias any other high-word bit; probe every bit a safe integer can own.
+    let collisions = 0, checked = 0;
+    for (let i = 1; i <= 64; i++) {
+        const L = (i * 2654435761) >>> 0;
+        const H = i * 997 % 2097152;
+        const k = H * 4294967296 + L;
+        mix64(-k, 7); const nh = hashHi(), nl = hashLo();
+        for (let b = 0; b < 21; b++) {
+            const k2 = (H ^ (1 << b)) * 4294967296 + L;
+            if (k2 > 9007199254740991) continue;
+            mix64(k2, 7); checked++;
+            if (hashHi() === nh || hashLo() === nl) collisions++;
+        }
+    }
+    assert.ok(checked > 1000, 'checked ' + checked);
+    assert.equal(collisions, 0, 'a negative key must not share a lane with any bit-flip twin');
+});

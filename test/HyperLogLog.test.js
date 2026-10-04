@@ -603,3 +603,52 @@ test('G-F20 (HLL): a rejected arg never runs caller code (tagged, calls===0, rec
     try { new HyperLogLog(Object.create(null)); } catch (e) { msg = e.message; }
     assert.ok(/got \[object]$/.test(msg), 'null-proto message: ' + msg);
 });
+
+// ===========================================================================
+// G-F12 (HLL hash sign bit): -k and k count as distinct. FAILs on HEAD (collided).
+// ===========================================================================
+
+test('G-F12 (HLL): add(-1); add(2**32+1) counts 2 distinct (HEAD: 1 -- sign collided)', () => {
+    const h = new HyperLogLog(14);
+    h.add(-1);
+    h.add(2 ** 32 + 1);
+    assert.equal(h.count(), 2, 'two sign-split keys are two distinct cardinalities');
+});
+
+test('G-F12 (HLL): 10000 pairs (-i, 2^32+i) at p=14 count ~20000 (|count-20000| <= 488)', () => {
+    const h = new HyperLogLog(14);
+    for (let i = 1; i <= 10000; i++) { h.add(-i); h.add(2 ** 32 + i); }
+    const c = h.count();
+    assert.ok(Math.abs(c - 20000) <= 488, 'count=' + c + ' (HEAD collides to ~10000)');
+});
+
+test('G-F12 (HLL site consistency): add(k) == addHashed(mix64(k, seed)) over mixed-sign keys', () => {
+    // Passes on HEAD too -- it only proves the member site uses the SAME hash as mix64.
+    const a = new HyperLogLog(12, 7), b = new HyperLogLog(12, 7);
+    for (const k of [-5, 2 ** 40 + 3, 7, -(2 ** 33), -1, 2 ** 32 + 1, -(2 ** 53 - 1), -(2 ** 32), 0, -0]) {
+        a.add(k);
+        mix64(k, a.seed);
+        b.addHashed(hashHi(), hashLo());
+    }
+    let d = 0;
+    for (let i = 0; i < a._reg.length; i++) if (a._reg[i] !== b._reg[i]) d++;
+    assert.equal(d, 0, 'HLL add and addHashed(mix64) must set identical registers');
+});
+
+test('QA H2.4 (HLL site consistency, boundary matrix): add(k) == addHashed(mix64(k)) per key, ' +
+    'fresh instances, across every word edge incl. -(2^31)-1, -(2^32-1), two-word negatives', () => {
+    // Gap: the mixed-sign list above shares ONE instance (a register max can mask a site
+    // diff) and has no |k| in [2^31, 2^32) negative, where `a | 0` is a negative int32.
+    const KS = [0, -0, 1, -1, -(2 ** 31 - 1), -(2 ** 31), -(2 ** 31) - 1, -(2 ** 32 - 1), -(2 ** 32),
+        -(2 ** 32 + 1), 2 ** 31, 2 ** 32 - 1, -(2 ** 40 + 104729), -(2 ** 52), -(2 ** 53 - 2),
+        -(2 ** 53 - 1), 2 ** 53 - 1, -((2 ** 21 - 1) * 4294967296)];
+    let bad = '';
+    for (const k of KS) {
+        const a = new HyperLogLog(10, 7), b = new HyperLogLog(10, 7);
+        a.add(k);
+        mix64(k, a.seed);
+        b.addHashed(hashHi(), hashLo());
+        for (let i = 0; i < a._reg.length; i++) if (a._reg[i] !== b._reg[i]) { bad += k + ' '; break; }
+    }
+    assert.equal(bad, '', 'add and addHashed(mix64) disagree for: ' + bad);
+});

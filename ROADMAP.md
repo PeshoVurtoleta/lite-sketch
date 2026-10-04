@@ -286,7 +286,7 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | id | finding | task | falsifiable gate |
 | --- | --- | --- | --- |
 | F1 | A1 (H) HLL `hiSuf = (h << p) >>> 0` (Sketch.js:320 `add`, :341 `addHashed`). Maglev assumes int32; hiSuf >= 2^31 deopts ("not int32") and recompiles: 416-461 deopts per run in the audit's driver. The deopted tiers box every uint32 / double temporary (incl. `Math.abs(key)` :301). ~0.5 box/op on SMALL keys (12-13 scavenges at 8N in all modes; Chrome 9 B/op). This IS the torture "pinned floor" (torture.mjs:292), whose stated cause is wrong. | `h << p` (clz32 reads the same bits). | HLL small-key lane 12-13 -> 0 (orchestrator re-measured 13 -> 0). The N5 deopt gate shows <= 3. Torture HLL SCAV 4 -> 0. |
-| F2 | A3/A4 (H/M) the murmur helpers `_m3round` / `_m3final` (:75, :90) take and return int32 words. In Chrome (31-bit Smis) any word outside +-2^30 boxes, about half of all hash words: no-inline small keys count 1 gives HLL 77, CMS 113, SS 170 B/op. On Node, CMS `lo = a >>> 0` (:621/:715) into `_m3round` boxes for \|key\| >= 2^31 (49 vs 24 no-inline; the -2^31 class 73). | Hand-inline the murmur in every hot body (HLL/CMS/SS add, CMS estimate, SS home). Use `lo = a \| 0`, `hw = ((a / 2^32) \| 0) ^ neg` (with F12's sign fix), `M3_ADD = 0xe6546b64 \| 0`. Replace `Math.abs(key) > MAX` with two compares. | N3 (library delta <= 2) and N6 (Chrome) green. |
+| F2 | A3/A4 (H/M) the murmur helpers `_m3round` / `_m3final` (:75, :90) take and return int32 words. In Chrome (31-bit Smis) any word outside +-2^30 boxes, about half of all hash words: no-inline small keys count 1 gives HLL 77, CMS 113, SS 170 B/op. On Node, CMS `lo = a >>> 0` (:621/:715) into `_m3round` boxes for \|key\| >= 2^31 (49 vs 24 no-inline; the -2^31 class 73). | Hand-inline the murmur in every hot body (HLL/CMS/SS add, CMS estimate, SS home). Use `lo = a \| 0`, `hw = ((a / 2^32) \| 0) ^ neg` (with F12's sign fix), `M3_ADD = 0xe6546b64 \| 0`. Replace `Math.abs(key) > MAX` with two compares. H2.4 planner delta: the Node part (int32 words + a `Math.abs` sign split) ships in H2.4; the hand-inline and the two compares move into H2.6's `_addAt`, because hand-inlining into `add` pushes it past V8's 460-byte inline cap (Node default non-Smi keys 0-1 -> 24; see 7.5). | N3 (library delta <= 2) and N6 (Chrome) green. |
 | F3 | A2 (H) SpaceSaving doubles crossing calls: `_mapDeleteKey(this._key[sl])` (:1572), `_hash(mkey[j])` per backshift step (:1815), `_attach(slot, val, hint)` (:1564/:1579/:1851), `_bump(slot, count)` (:1552), and `lo` -> `_m3round` (:1543/:1547). A per-key COUNT passing 2^31 boxes, which is exactly lite-hud's cumulative-microseconds case. No-inline 2^31 keys read 192 (~8 boxes/op, 125 B/op by sampler). | `_attach(slot, hint)` reads `_count[slot]` itself. `_homeAt(arr, i)` returns `h & mask` (always a Smi). `_probeAt(arr, i, home)` reads the key from the array. Eviction deletes via `_probeAt(_key, sl, _homeAt(_key, sl))`. Inline the bump path. | SS no-inline 2^31 keys 192 -> 24 (the caller box only). SS small keys with count 2^30: 24 -> 0. |
 | F4 | A4 (M) CMS `_applyCons(base, ...)` / `_applyPlain(base, ...)` (:635-636) and per-row `_m3final` (:669/:693/:730) pass doubles. | `base` goes into an Int32Array(1) scratch and `count` into a Float64Array(2) scratch. The apply helpers take no arguments, and the per-row fmix is inlined. | CMS -2^31 keys 73 -> 24 and estimate no-inline 49 -> 24. |
 | F5 | A5 (H for consumers) a key or count outside Smi range passed to `add(...)` is boxed by the CALLER at a non-inlined boundary (24 at 8N on Node, 12 B in Chrome). lite-hud's CMS key `channelIdx * 2^32 + tag` is >= 2^32 for every channel >= 1, so it ALWAYS boxes. | `add(key[, count])` validates, writes into a per-instance Float64Array scratch, and calls a shared `_addAt(buf, i)`. New `addFrom(buf, i)`: HLL reads key = buf[i]; CMS / SS read key = buf[i], count = buf[i+1]. Same validation and same throws (byte-identical no-op), like DDSketch.addFrom (1.1.0). CMS / SS `estimate` also go through the scratch. | N1: every addFrom lane <= 2 at 8N on Node (default + no-inline, fresh + warm, 6 key classes x counts {1, 2^30}). N6: 0 in Chrome. |
@@ -393,9 +393,9 @@ grows until H2.8, which owns the 1.2.0 trinity. The order follows the dependenci
 | H2.1 (done) | F1 + the reusable child-process lane harness (N2-HLL, N5, a one-box control) + the HLL torture lane at 0 | 2 lines of HLL |
 | H2.2 (done) | F10, F11, F17 (S2, S3): the DDSketch ctor and merge fail-closed fixes | DDSketch ctor / merge |
 | H2.3 (done) | F13, F14, F15, F16 (S4, S5, S6) + F20: counting honesty (estimate guard, `saturated`, count cap, withX throws) and the `String(x)` thrower fix | validation only, no restructure |
-| **H2.4** | F2 + F12 (S1): the hand-inlined murmur + sign bit at all five sites, and the N9 parity harness | hash sites |
-| H2.5 | F3 + F4: argument-free SpaceSaving and CMS helpers (N3) | SS / CMS internals |
-| H2.6 | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7 | public API (additive) |
+| H2.4 (done) | F12 (S1) + the F2 Node part (int32 hash words, `Math.abs` sign split) at all six sites, N9 parity, N3 lanes. The F2 hand-inline moved to H2.6 (7.5 planner delta) | hash sites |
+| **H2.5** | F3 + F4: argument-free SpaceSaving and CMS helpers (N3) | SS / CMS internals |
+| H2.6 | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7, plus the F2 murmur hand-inline inside `_addAt` (moved from H2.4) | public API (additive) |
 | H2.7 | F7, F8, F18, F21: `topKInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
 | H2.8 | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
 
@@ -610,7 +610,7 @@ Reviewer focus:
 - Do the caps throw rather than silently clamp?
 - Can G1 flake on a slow machine? (5 ms vs 0.0001 ms; the 2 s child timeout.)
 
-### 7.4 H2.3 spec -- counting honesty: F13 + F14 + F15 + F16 (S4, S5, S6) + F20  [DONE 2026-10-04, awaiting maintainer commit]
+### 7.4 H2.3 spec -- counting honesty: F13 + F14 + F15 + F16 (S4, S5, S6) + F20  [DONE, committed e805ac8]
 
 Result: the reviewer REJECTED twice, then APPROVED; qa found c1-c8 PASS.
 - **Rejection 1 (HIGH, an orchestrator miss):** the new guards pushed DD `add` from 445 to 483
@@ -839,5 +839,254 @@ Reviewer focus:
 
 RISK: a forged `other` (F21) can still run caller code through `this._total + other._total` in the
 new merge guards. That class is pre-existing and owned by H2.7.
+
+### 7.5 H2.4 spec -- hash sign bit (F12, S1) + int32 hash words (F2, Node part) + N9 parity + N3 lanes  [DONE 2026-10-04, awaiting maintainer commit]
+
+Result: the reviewer REJECTED once, then APPROVED; qa found d1-d7 PASS.
+- **Rejection (HIGH, gate robustness):** the single-window default-mode (df) lanes FAILed 3/3 runs
+  under machine load (load average ~10 on 12 cores: reads of 3-4 against <= 2). A single window
+  includes the caller's tier-up, and starved background compilation stretches it.
+  - Fix: every gated lane and its Noop baseline run 3 reps as separate children, every rep is
+    printed, and the gate is on the MIN. Tier-up noise only adds scavenges, while a real library box
+    shows in all 3 reps: HEAD and a Math.abs-revert mutant read 25/25/25 and 49/50/49.
+  - The cms / cmsest df lanes read 0-2 on HEAD too, so they are labelled regression guards; the
+    ni / nc deltas are their teeth.
+  - CHANGELOG units were fixed (scavenges at 1.6M ops, not "per-op").
+- **qa additions:**
+  - two-word negative classes in the parity oracle; a two-word-only mutant was invisible to the
+    old one-word oracle;
+  - a CMS estimate site check (the old site test passed with only estimate mutated);
+  - a per-key fresh-instance HLL site check;
+  - an SS add-vs-`_hash` home check;
+  - boundary injectivity and bit-flip-twin hash tests.
+- **Numbers:**
+  - 236 tests (0 todo).
+  - ni / nc library deltas 0 (one 1) in every run; NC-CTRL 24.
+  - df min-of-3 0-1, and hll/n31 1-3 against its live limit of 26.
+  - `--lib HEAD` FAILs 19 gates.
+  - Parity: identity sections at 0 diffs, DOC-DIFF F12 11/11, H2.3 7/7.
+  - Torture ok x4, perf 9/9, witness byte-identical (sha1 2ed81a8b).
+  - Bytecode: HLL add 338->335, CMS add 365->362, estimate 368->364, SS add 721->714,
+    `_hash` 115->109, mix64 158->164; the helpers are unchanged.
+  - `npm run lanes` takes +7 s (4 jobs) / 29 s serial.
+- **Known harness gaps (recorded, not fixed):**
+  - parity.mjs has no watchdog: a broken SS hash makes its SS identity section spin forever instead
+    of FAILing. The unit tests do kill both SS mutants.
+  - df/hll/n31 bites HEAD only narrowly (HEAD min 27 vs limit 26). The ni / nc lanes carry that site.
+  - About 10% of single df reps land in the high mode (24-26), so a 3/3-high lane is a ~1% false-FAIL
+    risk per run. If a lane ever reads high 3/3, classify each rep with `--trace-turbo-inlining`;
+    never raise the limit.
+
+Why now: F12 is a live correctness bug in HLL / CMS. Today `add(-1); add(2**32+1)` counts 1, while the
+docs already promise distinct negative keys (README:349, llms:103/154, d.ts:68/149, jsdoc :307/:639).
+The hash words must settle before H2.5's helpers and H2.6's `_addAt` consume them. The Node part of
+F2 is the smallest shape that removes every library box at the hash sites while keeping `add`
+inlinable.
+
+Pre-measured (HEAD e805ac8, Node 26.8.2, Chrome 154; prototypes and numbers in the session scratchpad
+`h24/facts.md`; the chosen prototype is v1a):
+- **F12:**
+  - HEAD: the pair counts 1; 20000 distinct (-i, 2^32+i) count 10023; CMS `add(-7,100)` gives
+    `estimate(2**32+7)` = 100.
+  - v1a: 2 / 20009 / 0.
+  - Positive keys: 0 diffs over 300k keys in 6 classes (HLL p 4/12/18, CMS cons+plain, SS cap
+    1/7/64/1000, mix64 lanes).
+- **Scavenges at 8N.** Noop baseline: df 0, ni 24, nc 24.
+  - nc means a never-optimized caller, so `add` is compiled standalone with its helpers inlined:
+    the "big consumer frame" case.
+
+  | method | HEAD ni b31/n31/safe | HEAD nc | HEAD df n31 | v1a |
+  | --- | --- | --- | --- | --- |
+  | HLL add | 49/73/49 | 25/50/25 | 48 | ni 24, nc 24, df <= 1 (n31: 24) |
+  | CMS add | 49/73/49 | 25/49/25 | 1 | ni 24, nc 24, df 0 |
+  | CMS estimate | 49/73/49 | 25/49/25 | 2 | ni 24, nc 24, df 1 |
+
+  - The v1a HLL df n31 = 24 is the caller's own box. Under the 920-byte cumulative budget, `add` is
+    not inlined into the lane loop: HLL add 335 + four `_m3round` at 109 + two `_m3final` at 71 is
+    about 913. With the budget raised to 4000 it reads 2 (HEAD 5).
+  - SS add on v1a: 49 / 99 / 49 (F3, H2.5).
+- **Bytecode (HEAD -> v1a):** HLL add 338 -> 335, CMS add 365 -> 362, CMS estimate 368 -> 364,
+  SS add 721 -> 714 (never inlined), mix64 158 -> 164, `_m3round` 109, `_m3final` 71. DD add (448)
+  is untouched.
+  - Correction to facts.md: the helpers are NOT under V8's 27-byte small-function size. They inline
+    under the 460 cap and spend the cumulative budget.
+- **Chrome:**
+  - default and nc: v1a == HEAD.
+  - ni: HEAD HLL 60 / CMS 126 / SS 161 B/op; v1a the same for small / b30 keys and +12 for negative
+    keys, because `neg << 31` crosses the non-inlined `_m3round` as a non-Smi.
+- **Rejected variants:**
+  - v2a (full hand-inline into `add`): over 460 bytes, so add is no longer inlined and Node df
+    non-Smi keys go 0-1 -> 24.
+  - v1L (one `_mixLane` helper): Chrome default SS add 6 -> 18 B/op and CMS estimate 0 -> 6
+    (measured, cause unconfirmed).
+  - v1 without `Math.abs`: n31 stays 49 in ni / nc. The old `let a = key; if (a < 0) a = -a;` makes
+    `a` a phi of the tagged parameter and a float64, which boxes.
+
+Planner delta (recorded in the 7.1 table and on the F2 row; S1 is untouched):
+- H2.4 = F12 + the F2 Node part (int32 words + the `Math.abs` sign split).
+- The F2 hand-inline of the murmur and the two-compare guard move to H2.6, inside F5's
+  `_addAt(buf, i)`. Its arguments are an object and a Smi, so it never needs to be inlined.
+- N6 stays with H2.8. Chrome no-inline is recorded, not gated, until H2.6 / H2.8.
+- Note: F12 has six code sites (SS add and SS `_hash` are separate), not five. Only S1's "editing
+  the sites twice" rationale is affected, not its outcome.
+
+Hot body vs cold path. Exactly 6 hot methods change bytes: `mix64` (sign only), HLL `add`, CMS `add`,
+CMS `estimate`, SS `add`, SS `_hash`.
+- At the 5 member sites:
+  - `const neg = key < 0 ? 1 : 0; const a = Math.abs(key); const lo = a | 0;`
+  - `const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);`
+  - the second round takes `hiw ^ (neg << 31)`.
+- The guard line stays verbatim: typeof first, and `Math.abs(key) > 9007199254740991` stays inside
+  the short-circuit chain. Hoisting `a` above it would run `Math.abs` on a non-number, an F20
+  regression. Every throw site and message is unchanged.
+- Zero-box: `lo`, `hiw`, `neg` and the xor word are int32 (a Smi on Node) when they cross
+  `_m3round`. `a` is a float64 local that never crosses a call.
+- mix64 keeps its own word math (`>>> 0`, `(a-lo)/2^32`) because it accepts non-integers.
+- Positive parity proof:
+  - `_m3round` starts with `Math.imul(k, C1)`, which is ToInt32, so `a | 0` and `a >>> 0` feed the
+    same bits;
+  - for a <= 2^53-1, a/2^32 < 2^21, so truncating equals flooring;
+  - `neg << 31` is 0 for every non-negative key, and -0 takes neg 0 on both builds.
+
+Out of scope:
+- the murmur hand-inline and the two-compare guard (H2.6);
+- F3 / F4 helper arguments and the per-row `_m3final` (H2.5);
+- addFrom / addHashedFrom (H2.6);
+- N6 / Chrome gates and thresholds (H2.8);
+- any count or validation semantics;
+- the DD hot path;
+- torture / perf thresholds.
+
+**Tasks**
+- **T1 (coder, Sketch.js):** apply the site shape above at the 5 member sites:
+  - HLL add :320-336;
+  - CMS add :653-673;
+  - CMS estimate :754-768;
+  - SS add :1725-1740;
+  - SS `_hash` :1958-1970.
+
+  The guards stay byte-identical, and `_m3round` / `_m3final` are unchanged.
+- **T2 (coder, Sketch.js `mix64`):** `hi ^ neg` -> `hi ^ (neg << 31)` at :119 and :125, with nothing
+  else in the body changed. Jsdoc: the sign is bit 31 of the high word, which is free because a safe
+  integer's high word is < 2^21.
+- **T3 (coder, test/lanes.mjs + test/lanes/lane.mjs, N3):**
+  - **lane.mjs:**
+    - `fillKeys` gains u32 = 2^32-1-65536+i, n31 = -(2^31)-65536+i, safe = 2^53-1-65536+i.
+    - New kinds:
+      - `cms`: `add(K[i&MASK], 1)` on CMS(5,16384) cons;
+      - `cmsest`: `sink += c.estimate(K[i&MASK]) > 0 ? 1 : 0`;
+      - `ss`: `add(K[i&MASK], 1)` on SS(1024).
+    - Flag `--nc`: dynamically import a new `test/lanes/natives.mjs`
+      (`export function neverOpt(f) { %NeverOptimizeFunction(f); }`) only in nc mode, and call
+      `neverOpt(step)` before warm-up. The df / ni children run without `--allow-natives-syntax`,
+      so the `%` call cannot live in lane.mjs.
+  - **lanes.mjs:** after the untouched N2 / N5 / CTRL block, run the N3 jobs through an execFile pool
+    of 4 (`N3_JOBS` env, default 4; 1 = serial). Results are keyed and gated in a fixed order.
+    - Jobs, fresh only (56 children; the df lanes run R=3 children each, see the review amendment):
+      - {hll, cms, cmsest} x {b31, u32, n31, safe} x {df, ni, nc};
+      - Noop x 4 key classes x {ni, nc};
+      - ss x 4 key classes x 3 modes.
+    - Gates:
+      - `N3[ni|nc/kind/kc] = lane - noop(same mode, kc) <= 2` (24 lanes).
+      - `N3[df/kind/kc] <= 2` (11 lanes). Review amendment: gated on the MIN of 3 children, every value
+        printed. A single fresh window includes the caller's tier-up, which starved background compilation
+        stretches under load (3/3 runs FAILed at 3-4). Lanes that read 1-2 on HEAD are labelled regression
+        guards; the ni / nc deltas are the teeth for those sites.
+      - `N3[df/hll/n31] <= noop(ni,n31) + 2`, taken from the LIVE Noop lane. Its comment: under the
+        default cumulative budget, the caller boxes its own read, and the library adds 0. HEAD's 48
+        (caller + library) FAILs. Tighten to <= 2 when addFrom lands.
+      - `NC-CTRL[noop/kc] >= 12` (4 lanes). A never-optimize that silently fails reads 0 and trips it.
+    - Print-only:
+      - `noop-ni[kc]`;
+      - `SS[mode/kc]=v (print-only: F3, gated in H2.5)`.
+- **T4 (coder, tests in the existing per-member files; each G-F12 FAILs on HEAD):**
+  - **Hash G-F12:**
+    - over 1e5 pairs (-(H*2^32+L), (H^1)*2^32+L), both lanes differ for every pair;
+    - `mix64(-0,s)` equals `mix64(0,s)`;
+    - golden positive vectors, cut from `git show HEAD:Sketch.js` BEFORE the edit, are pinned as
+      literals: k in {0, 1, 2^31, 2^32-1, 2^32, 2^32+1, 2^53-1, 1.5}, at two seeds;
+    - negative vectors (-1, -(2^31), -(2^32+1), -(2^53-1)) are pinned from the new code.
+  - **Site consistency (passes on HEAD too; catches a missed site):** for mixed-sign keys:
+    - HLL `add(k)` and `addHashed(hashHi(), hashLo())` after `mix64(k, seed)` give identical `_reg`;
+    - CMS `add(k,c)` and `addHashed(...)` give identical `_counts`;
+    - SS `_hash(k) === (mix64(k, seed), hashHi() | 0)`.
+  - **HLL G-F12:** `add(-1); add(2**32+1)` gives `count() === 2`. 10000 pairs (-i, 2^32+i) at p=14
+    give |count - 20000| <= 488 (3 sigma).
+  - **CMS G-F12 (cons + plain, (4,1024)):** `add(-7,100)` gives `estimate(2**32+7) === 0` and
+    `estimate(-7) === 100`.
+  - **SS G-F12:**
+    - `_hash` differs on all 1e4 pairs (HEAD: all equal);
+    - the home-slot share at capacity 1024 is < 1% (HEAD 100%);
+    - `add(-1); add(2**32+1)`: both estimate 1, their homes differ, and 2**32+1's probe distance is 0
+      (HEAD 1).
+    - Extend SpaceSaving.test.js:703 beyond +-big.
+- **T5 (coder, test/parity.mjs, the N9 section):**
+  - Re-key the identity sections so they stay identical:
+    - H2.1 HLL: the `-(i*7919)` class moves to a separate negative instance;
+    - CMS: `keyClass` r===1 becomes b31 / u32, and the random estimate ints become [0, 2e6);
+    - HLL / CMS / SS cover small, b31, u32, exactly 2^32, > 2^32, near MAX_SAFE and 2^53-1, plus
+      merges;
+    - mix64 / hashHi / hashLo over non-negative ints, fractions, +Infinity, NaN and -0;
+    - hashString and saltRow;
+    - SS mixed-sign streams: the observable snapshot (`ssSnapP`, merge) stays identical, because slots
+      and buckets are hash-independent. Print the count of differing `_mapOcc` positions.
+  - DOC-DIFF F12 (checked on the new side, ref printed):
+    - pairs that differ on both lanes: 1e5/1e5 (ref: all collide);
+    - every negative int key's (hi,lo) differs from ref;
+    - HLL pair count 2 (ref 1);
+    - CMS `estimate(2**32+7)` 0 (ref 100);
+    - the negative-instance HLL / CMS state differs from ref.
+  - The H2.3 DOC-DIFF stays 7/7.
+- **T6 (coder, docs, never VERSION):**
+  - CHANGELOG `[Unreleased]` **Fixed**:
+    - F12: old/new pair count 1 -> 2, 20000 pairs 10023 -> ~20000, CMS 100 -> 0. The sign is bit 31
+      of the high word. `mix64` / `hashHi` / `hashLo` lanes change for NEGATIVE keys only (incl.
+      -Infinity); positive keys and -0 stay bit-identical. SS was exact but shared home slots.
+    - F2-Node: HLL / CMS add and CMS estimate no longer box the hash words for |key| >= 2^31.
+      No-inline 49 (-2^31 keys: 73) -> 24, which is the caller's argument box and remains until
+      addFrom (1.2.0). Default -2^31 HLL 48 -> 24.
+    - Amend the H2.1 entry if it claims "hand-inlining".
+  - **Changed:** none.
+  - Wording:
+    - "truncate/alias under `>>> 0`" becomes "under the 32-bit word split" in jsdoc :309 / :641,
+      llms :108 / :163 and README :349;
+    - the d.ts mix64 @param says integers with |key| <= 2^53 hash with their sign, and the lanes
+      changed for negative keys in 1.2.0.
+  - ADR 0001: a dated H2.4 amendment covering:
+    - the encoding `(a|0, hiw ^ (neg<<31))`;
+    - the old bit-0 collision;
+    - S1;
+    - the hand-inline deferred to H2.6, with the measured reason.
+
+**Assertions (qa; d1-d3 also run against `git show HEAD:Sketch.js` via `--lib` or the tests copied with
+the import repointed, and must FAIL there)**
+- d1: all 24 N3 ni / nc deltas are <= 2 (0 expected), and NC-CTRL >= 12. On HEAD the ni deltas are
+  25 / 49 / 25 / 25 and nc n31 is 25-26, so it FAILs. N2 / N5 / CTRL are unchanged.
+- d2: N3 df min-of-3 <= 2 on 11 lanes, and hll/n31's min sits under its live limit (Noop ni + 2). It
+  reads 2-3 when V8 inlines `add` into the caller and 24 when it does not. HEAD's 48-50 FAILs. Stable
+  over 3 loaded `N3_JOBS=4` runs.
+- d3: every G-F12 passes on the tree and FAILs on HEAD. The site-consistency tests pass on both.
+- d4: `node test/parity.mjs`: every identity section at 0 diffs, DOC-DIFF F12 all yes, H2.3 still 7/7.
+- d5 (bytecode, HEAD -> tree): HLL add, CMS add and CMS estimate each stay <= their HEAD size (and
+  <= 460). SS add is recorded. `_m3round` / `_m3final` are unchanged. The hot-set diff is exactly the
+  6 methods.
+- d6: torture `ok` x3, unchanged:
+  - 9 lanes at 0 B/op;
+  - SCAV_CLEAN lanes 0, and N7 DD add(value) <= 2;
+  - maxMajor 0;
+  - trackers return to 0.
+- d7: perf 9/9, witness byte-identical, and `npm run verify` green with 217 + new tests and 0 todo.
+  `npm run lanes` grows by <= 15 s. ASCII-only, pack 7 files, VERSION '1.1.2'.
+
+Reviewer focus:
+- Is the guard byte-identical and typeof-first at all 5 member sites?
+- Does any site still read `hiw ^ neg`?
+- Do mix64's positive non-integer lanes stay unchanged?
+- Is the hll/n31 df limit taken from the live Noop lane?
+- Are NC liveness and the d1 / d2 margins stable over 3 runs with `N3_JOBS=1` and `=4`?
+- Does any changed hot method grow past its HEAD bytecode size?
+
+RISK: Chrome no-inline negative keys read +12 B/op, which is recorded and not gated. The H2.6
+hand-inline in `_addAt` removes it. Chrome default is unchanged.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

@@ -41,23 +41,46 @@ try {
     let countDiffs = 0;
     const lines = [];
 
+    // Identity key domain (H2.4 re-key): NON-NEGATIVE only, because F12 changed how a
+    // negative key splits (sign -> bit 31 of the high word), so negatives no longer agree
+    // with the ref. Positive keys stay bit-identical. Classes cover small, b31 (2^31+i),
+    // u32 (2^32-1), exactly 2^32, > 2^32, near MAX_SAFE and 2^53-1.
+    const posKey = (i) => {
+        switch (i % 7) {
+            case 0: return i;                               // small
+            case 1: return 2 ** 31 + i;                     // b31
+            case 2: return 4294967295 - (i % 65536);        // u32 (2^32-1 down)
+            case 3: return 4294967296;                      // exactly 2^32
+            case 4: return 2 ** 40 + i * 104729;            // > 2^32
+            case 5: return 9007199254740000 + (i % 900);    // near MAX_SAFE
+            default: return 9007199254740991;               // 2^53-1
+        }
+    };
+    // Negative instance (moved out of the identity lane): its state is EXPECTED to differ
+    // from the ref under F12; the delta is checked in the DOC-DIFF F12 block below.
+    let hllNegDiffs = 0;
+
     for (const p of PS) {
         // SEPARATE instances per lane so one lane's register max cannot mask another's diff.
         const aAdd = new A.HyperLogLog(p), bAdd = new B.HyperLogLog(p);
         const aHsh = new A.HyperLogLog(p), bHsh = new B.HyperLogLog(p);
+        const aNeg = new A.HyperLogLog(p), bNeg = new B.HyperLogLog(p);
         for (let i = 0; i < KEYS; i++) {
-            // add lane: mixed key domain -- positive, negative, and > 2^32
-            const k = i % 3 === 0 ? i : i % 3 === 1 ? -(i * 7919) : 2 ** 40 + i * 104729;
-            aAdd.add(k); bAdd.add(k);
+            // add lane: non-negative mixed key domain (identity-preserving under F12)
+            aAdd.add(posKey(i)); bAdd.add(posKey(i));
             // addHashed lane (uint32)
             const hi = (i * 2654435761) >>> 0;
             const lo = (i * 40503) >>> 0;
             aHsh.addHashed(hi, lo); bHsh.addHashed(hi, lo);
+            // negative lane (DOC-DIFF F12 witness): new differs from ref
+            const nk = -(i * 7919) - 1;
+            aNeg.add(nk); bNeg.add(nk);
         }
         let d = 0;
         for (let j = 0; j < aAdd._reg.length; j++) {
             if (aAdd._reg[j] !== bAdd._reg[j]) d++;
             if (aHsh._reg[j] !== bHsh._reg[j]) d++;
+            if (aNeg._reg[j] !== bNeg._reg[j]) hllNegDiffs++;
         }
         regDiffs += d;
         const caAdd = aAdd.count(), cbAdd = bAdd.count();
@@ -186,7 +209,9 @@ try {
     const keyClass = (i) => {
         const r = i & 3;
         if (r === 0) return (irnd() * 1000) | 0;                 // small
-        if (r === 1) return -((irnd() * 1e6) | 0) - 1;           // negative
+        // H2.4 re-key: the old negative class split (F12) is now a DOC-DIFF witness; the
+        // identity lane feeds b31 (2^31+i) / u32 (2^32-1 down) here so it stays identical.
+        if (r === 1) return (i & 4) ? (2 ** 31 + ((irnd() * 1e6) | 0)) : (4294967295 - ((irnd() * 65536) | 0));
         if (r === 2) return 2 ** 33 + ((irnd() * 1e6) | 0);      // > 2^32
         return 9007199254740000 + ((irnd() * 900) | 0);          // near MAX_SAFE
     };
@@ -210,7 +235,7 @@ try {
         const sd = cmsCountsEq(a, b, 'cms ' + d + 'x' + w + (conservative ? ' cons' : ' plain'));
         if (sd && !cmsFail) cmsFail = sd;
         for (const k of seen) if (a.estimate(k) !== b.estimate(k) && !cmsFail) cmsFail = 'cms estimate added key';
-        for (let i = 0; i < 10000; i++) { const k = (irnd() * 2e6 | 0) - 1e6; if (a.estimate(k) !== b.estimate(k) && !cmsFail) cmsFail = 'cms estimate rnd int'; }
+        for (let i = 0; i < 10000; i++) { const k = (irnd() * 2e6) | 0; if (a.estimate(k) !== b.estimate(k) && !cmsFail) cmsFail = 'cms estimate rnd int'; }
         return [a, b];
     };
     const [cp4a, cp4b] = cmsBuild(4, 1024, false);          // plain (4,1024)
@@ -237,11 +262,18 @@ try {
         o.topK = s.topK().map((e) => e.key + ':' + e.count + ':' + e.error);
         return o;
     };
-    const ssStream = (a, b, seed, n) => { let z = seed >>> 0; const zr = () => { z = (z + 0x6d2b79f5) | 0; let t = z; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; for (let i = 0; i < n; i++) { const k = ((1 / (zr() * 0.999 + 0.001)) | 0) % 5000; a.add(k); b.add(k); } };
+    // H2.4 re-key: MIXED-SIGN streams. SpaceSaving's monitored set/counts/errors and topK are
+    // hash-INDEPENDENT (the hash is only the index that finds an existing key), so ssSnapP and
+    // merge stay bit-identical even though F12 changed negative-key hashes. The internal _mapOcc
+    // occupancy positions DO move; that count is printed, never failed.
+    const ssStream = (a, b, seed, n) => { let z = seed >>> 0; const zr = () => { z = (z + 0x6d2b79f5) | 0; let t = z; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; for (let i = 0; i < n; i++) { const base = ((1 / (zr() * 0.999 + 0.001)) | 0) % 5000; const k = (i & 1) ? -base - 1 : base; a.add(k); b.add(k); } };
+    const mapOccDiff = (a, b) => { let d = 0; const ma = a._mapOcc, mb = b._mapOcc; const n = Math.min(ma.length, mb.length); for (let i = 0; i < n; i++) if (ma[i] !== mb[i]) d++; return d; };
+    let occMoved = 0;
     for (const cap of [1, 7, 64, 1000]) {
         const a = new A.SpaceSaving(cap, { seed: 5 }), b = new B.SpaceSaving(cap, { seed: 5 });
         ssStream(a, b, 0x9e37 + cap, 30000);
         if (JSON.stringify(ssSnapP(a)) !== JSON.stringify(ssSnapP(b)) && !ssFail) ssFail = 'cap ' + cap + ' stream';
+        occMoved += mapOccDiff(a, b);
     }
     // merge: two same-(capacity,seed) shards, fold one into the other.
     const sma = new A.SpaceSaving(64, { seed: 5 }), smb = new B.SpaceSaving(64, { seed: 5 });
@@ -249,8 +281,10 @@ try {
     ssStream(sma, smb, 0x111, 20000); ssStream(soa, sob, 0x222, 20000);
     sma.merge(soa); smb.merge(sob);
     if (JSON.stringify(ssSnapP(sma)) !== JSON.stringify(ssSnapP(smb)) && !ssFail) ssFail = 'merge';
+    occMoved += mapOccDiff(sma, smb);
     const ssOk = ssFail === '';
-    console.log('PARITY SS vs ' + ref + ': streams(cap 1/7/64/1000)+merge=' + (ssFail || 'identical') + ' | ' + (ssOk ? 'ok' : 'FAIL'));
+    console.log('PARITY SS vs ' + ref + ': streams(cap 1/7/64/1000)+merge=' + (ssFail || 'identical') +
+        ' | _mapOcc-positions-moved=' + occMoved + ' (hash-dependent, print-only) | ' + (ssOk ? 'ok' : 'FAIL'));
 
     // ---- primitive throw-message parity (except DD/SS _badCount, whose text changed) ----
     const msgOf = (fn) => { try { fn(); return null; } catch (e) { return e.message; } };
@@ -296,7 +330,142 @@ try {
         Object.keys(doc).map((k) => k + '=' + (doc[k] ? 'yes' : 'NO')).join(' ') +
         ' | ' + (docFail === '' ? 'ok' : 'FAIL ' + docFail));
 
-    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '';
+    // ---- N9: hash identity (non-negative) + DOC-DIFF F12 (negative keys) ----
+    // F12 moved the sign into bit 31 of the high word. Non-negative keys, fractions, +-Inf,
+    // NaN and -0 all hash BIT-IDENTICALLY to the ref (identity), while every negative integer
+    // key now hashes differently (DOC-DIFF, checked on the new side with the ref printed).
+    const seeds9 = [0x9e3779b1, 1, 0xdeadbeef];
+    const posVals = [];
+    for (let i = 0; i < 2000; i++) posVals.push(i);
+    posVals.push(2 ** 31, 2 ** 32 - 1, 2 ** 32, 2 ** 32 + 1, 2 ** 40, 9007199254740991);
+    posVals.push(0.5, 1.5, 3.14159, 1e-9, 123.456, Infinity, NaN, -0);
+    let hashIdDiffs = 0;
+    for (const s of seeds9) {
+        for (const k of posVals) {
+            A.mix64(k, s); const ah = A.hashHi(), al = A.hashLo();
+            B.mix64(k, s); const bh = B.hashHi(), bl = B.hashLo();
+            if (ah !== bh || al !== bl) hashIdDiffs++;
+        }
+    }
+    let strDiffs = 0;
+    const strs = ['', 'a', 'hello world', 'the quick brown fox', 'x'.repeat(1000), '0123456789'];
+    for (const s of seeds9) for (const str of strs) { A.hashString(str, s); B.hashString(str, s); if (A.hashHi() !== B.hashHi() || A.hashLo() !== B.hashLo()) strDiffs++; }
+    let saltDiffs = 0;
+    for (let i = 0; i < 64; i++) { const h = (i * 2654435761) >>> 0; if (A.saltRow(h, i) !== B.saltRow(h, i)) saltDiffs++; }
+    const n9Ok = hashIdDiffs === 0 && strDiffs === 0 && saltDiffs === 0;
+    console.log('PARITY N9 hash-identity vs ' + ref + ': non-neg mix64/hashHi/hashLo-diffs=' + hashIdDiffs +
+        ' hashString-diffs=' + strDiffs + ' saltRow-diffs=' + saltDiffs + ' | ' + (n9Ok ? 'ok' : 'FAIL'));
+
+    // DOC-DIFF F12 (new-side checked, ref printed): the pair (-(H*2^32+L), (H^1)*2^32+L)
+    // collides on the ref (sign on bit 0 == a magnitude bit) and separates on the new build.
+    let f12NewDiff = 0, f12RefDiff = 0;
+    const N12 = 100000;
+    for (let i = 0; i < N12; i++) {
+        const H = (i % 1000) + 1;
+        const L = (i * 2654435761) >>> 0;
+        const k1 = -(H * 4294967296 + L);
+        const k2 = (H ^ 1) * 4294967296 + L;
+        A.mix64(k1, 7); const a1h = A.hashHi(), a1l = A.hashLo();
+        A.mix64(k2, 7); const a2h = A.hashHi(), a2l = A.hashLo();
+        if (a1h !== a2h && a1l !== a2l) f12NewDiff++;     // both lanes separate
+        B.mix64(k1, 7); const b1h = B.hashHi(), b1l = B.hashLo();
+        B.mix64(k2, 7); const b2h = B.hashHi(), b2l = B.hashLo();
+        if (b1h !== b2h || b1l !== b2l) f12RefDiff++;      // ref: any lane that separated
+    }
+    let negKeyDiff = 0, negKeyTotal = 0;
+    for (let i = 1; i <= 10000; i++) {
+        const k = -i;
+        A.mix64(k, 7); const ah = A.hashHi(), al = A.hashLo();
+        B.mix64(k, 7); const bh = B.hashHi(), bl = B.hashLo();
+        negKeyTotal++;
+        if (ah !== bh || al !== bl) negKeyDiff++;
+    }
+    const hpa = new A.HyperLogLog(14); hpa.add(-1); hpa.add(2 ** 32 + 1);
+    const hpb = new B.HyperLogLog(14); hpb.add(-1); hpb.add(2 ** 32 + 1);
+    const hllPairNew = Math.round(hpa.count()), hllPairRef = Math.round(hpb.count());
+    const cza = new A.CountMinSketch(4, 1024, { seed: 7 }); cza.add(-7, 100);
+    const czb = new B.CountMinSketch(4, 1024, { seed: 7 }); czb.add(-7, 100);
+    const cmsEstNew = cza.estimate(2 ** 32 + 7), cmsEstRef = czb.estimate(2 ** 32 + 7);
+    const cna = new A.CountMinSketch(4, 1024, { seed: 7 }), cnb = new B.CountMinSketch(4, 1024, { seed: 7 });
+    for (let i = 1; i <= 5000; i++) { cna.add(-i, 1); cnb.add(-i, 1); }
+    let cmsNegDiffs = 0;
+    for (let i = 0; i < cna._counts.length; i++) if (cna._counts[i] !== cnb._counts[i]) cmsNegDiffs++;
+    // New-side oracle: a negative-key member's state must equal addHashed(mix64(neg) lanes) --
+    // proves the F12 site hashes negatives EXACTLY as the public mix64 does (0 diffs expected).
+    const hllOA = new A.HyperLogLog(14, 7), hllOB = new A.HyperLogLog(14, 7);
+    const cmsOA = new A.CountMinSketch(4, 1024, { seed: 7 }), cmsOB = new A.CountMinSketch(4, 1024, { seed: 7 });
+    for (let i = 1; i <= 5000; i++) {
+        const nk = -(i * 7919) - 1;
+        hllOA.add(nk); A.mix64(nk, hllOA.seed); hllOB.addHashed(A.hashHi(), A.hashLo());
+        cmsOA.add(nk, 3); A.mix64(nk, cmsOA.seed); cmsOB.addHashed(A.hashHi(), A.hashLo(), 3);
+    }
+    let hllOracleDiffs = 0;
+    for (let i = 0; i < hllOA._reg.length; i++) if (hllOA._reg[i] !== hllOB._reg[i]) hllOracleDiffs++;
+    let cmsOracleDiffs = 0;
+    for (let i = 0; i < cmsOA._counts.length; i++) if (cmsOA._counts[i] !== cmsOB._counts[i]) cmsOracleDiffs++;
+    // QA H2.4: the class above is ONE-word (|k| < 2^32, hiw 0). Add TWO-word negative classes
+    // (hiw != 0, so `hiw ^ (neg << 31)` sets bit 31 over a live magnitude word) on SEPARATE
+    // instances, so one class's register max cannot mask the other's diff:
+    //   c1 = -(2^40 + i*104729), c2 = -(2^53-1 - i) (the top of the safe domain, hiw = 2^21-1),
+    //   c3 = -(2^31 + i) (one word, but `a | 0` is a NEGATIVE int32 there).
+    // The same new-side oracle also covers the CMS estimate site (estimate == estimateHashed)
+    // and the SS map site (_hash == mix64 HI lane, and add() homes where _hash probes).
+    const negClasses = [
+        (i) => -(2 ** 40 + i * 104729),
+        (i) => -(9007199254740991 - i),
+        (i) => -(2 ** 31 + i),
+    ];
+    let hll2Diffs = 0, cms2Diffs = 0, est2Diffs = 0, ss2Diffs = 0, two2Keys = 0;
+    for (const cls of negClasses) {
+        const ha = new A.HyperLogLog(14, 7), hb = new A.HyperLogLog(14, 7);
+        const ca = new A.CountMinSketch(4, 1024, { seed: 7 }), cb = new A.CountMinSketch(4, 1024, { seed: 7 });
+        const sa = new A.SpaceSaving(4096, { seed: 7 });
+        for (let i = 0; i < 3000; i++) {
+            const nk = cls(i);
+            two2Keys++;
+            ha.add(nk); A.mix64(nk, ha.seed); hb.addHashed(A.hashHi(), A.hashLo());
+            ca.add(nk, 3); A.mix64(nk, ca.seed); cb.addHashed(A.hashHi(), A.hashLo(), 3);
+            A.mix64(nk, sa.seed);
+            if (sa._hash(nk) !== (A.hashHi() | 0)) ss2Diffs++;
+            sa.add(nk, 1);
+        }
+        for (let i = 0; i < ha._reg.length; i++) if (ha._reg[i] !== hb._reg[i]) hll2Diffs++;
+        for (let i = 0; i < ca._counts.length; i++) if (ca._counts[i] !== cb._counts[i]) cms2Diffs++;
+        for (let i = 0; i < 3000; i++) {
+            const nk = cls(i);
+            A.mix64(nk, ca.seed);
+            if (ca.estimate(nk) !== ca.estimateHashed(A.hashHi(), A.hashLo())) est2Diffs++;
+            if (sa.estimate(nk) !== 1) ss2Diffs++;     // add() homed it where _hash probes
+        }
+    }
+    hllOracleDiffs += hll2Diffs;
+    cmsOracleDiffs += cms2Diffs;
+    const f12checks = {
+        'pairs-differ-both-lanes(1e5)': f12NewDiff === N12,
+        'ref-all-collide': f12RefDiff === 0,
+        'every-neg-key-differs': negKeyDiff === negKeyTotal,
+        'hll-pair-count-2(ref1)': hllPairNew === 2 && hllPairRef === 1,
+        'cms-estimate-0(ref100)': cmsEstNew === 0 && cmsEstRef === 100,
+        'hll-neg-state-differs': hllNegDiffs > 0,
+        'cms-neg-state-differs': cmsNegDiffs > 0,
+        'hll-neg-oracle(add==addHashed-mix64)': hllOracleDiffs === 0,
+        'cms-neg-oracle(add==addHashed-mix64)': cmsOracleDiffs === 0,
+        'cms-est-neg-oracle(estimate==estimateHashed-mix64)': est2Diffs === 0,
+        'ss-neg-oracle(_hash==hashHi,add-homes-at-_hash)': ss2Diffs === 0,
+    };
+    let f12Fail = '';
+    for (const k of Object.keys(f12checks)) if (!f12checks[k] && !f12Fail) f12Fail = k;
+    console.log('PARITY DOC-DIFF F12 (new-side vs ' + ref + '; new/ref: pairs=' + f12NewDiff + '/' + N12 +
+        ' ref-separated=' + f12RefDiff + ' neg-key-diffs=' + negKeyDiff + '/' + negKeyTotal +
+        ' hll-pair=' + hllPairNew + '/' + hllPairRef + ' cms-est=' + cmsEstNew + '/' + cmsEstRef +
+        ' hll-neg-state-diffs=' + hllNegDiffs + ' cms-neg-state-diffs=' + cmsNegDiffs +
+        ' hll-neg-oracle-diffs=' + hllOracleDiffs + ' cms-neg-oracle-diffs=' + cmsOracleDiffs +
+        ' (two-word/2^31 classes: keys=' + two2Keys + ' hll=' + hll2Diffs + ' cms=' + cms2Diffs +
+        ' est=' + est2Diffs + ' ss=' + ss2Diffs + ')): ' +
+        Object.keys(f12checks).map((k) => k + '=' + (f12checks[k] ? 'yes' : 'NO')).join(' ') +
+        ' | ' + (f12Fail === '' ? 'ok' : 'FAIL ' + f12Fail));
+
+    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '';
     if (!ok) process.exitCode = 1;
 } finally {
     rmSync(dir, { recursive: true, force: true });

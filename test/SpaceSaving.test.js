@@ -27,7 +27,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SpaceSaving, VERSION } from '../Sketch.js';
+import { SpaceSaving, mix64, hashHi, VERSION } from '../Sketch.js';
 
 void VERSION; // VERSION-pin is asserted once, centrally, by the other suites; not duplicated here.
 
@@ -708,6 +708,12 @@ test('ADVERSARIAL: a key exactly at the safe-integer ceiling used as BOTH a posi
     assert.equal(s.estimate(big), 3);
     assert.equal(s.estimate(-big), 5);
     assert.equal(s.size, 2);
+    // Extended beyond +-big: a sign-split key and its 2^32-shifted twin stay distinct too.
+    const t = new SpaceSaving(16, { seed: 1 });
+    const cases = [[-1, 11], [2 ** 32 + 1, 13], [-(2 ** 32 + 1), 17], [2 ** 40 + 7, 19], [-(2 ** 40 + 7), 23], [0, 29]];
+    for (const [k, c] of cases) t.add(k, c);
+    for (const [k, c] of cases) assert.equal(t.estimate(k), c, 'key ' + k + ' stays distinct at count ' + c);
+    assert.equal(t.size, cases.length, 'every sign-split / shifted key is its own slot');
 });
 
 // ===========================================================================
@@ -806,4 +812,77 @@ test('QA H2.3 (SS): self-merge at the total ceiling; _badTotal prints current to
     assert.throws(() => s.add(1, 2), (e) => e instanceof RangeError &&
         e.message.includes('current total ' + (2 ** 53 - 2) + ' + 2'));
     ssUnchanged(b, s, 'add total+1 reject');
+});
+
+// ===========================================================================
+// G-F12 (SS hash sign bit): the map home function separates -k from its 2^32-twin.
+// FAILs on HEAD (where _hash collided and every pair shared a home slot).
+// ===========================================================================
+
+test('G-F12 (SS): _hash separates (-(H*2^32+L), (H^1)*2^32+L) on all 1e4 pairs (HEAD: all equal)', () => {
+    const s = new SpaceSaving(1024, { seed: 7 });
+    const N = 10000;
+    let diffs = 0, shared = 0;
+    for (let i = 0; i < N; i++) {
+        const H = (i % 1000) + 1;
+        const L = (i * 2654435761) >>> 0;
+        const k1 = -(H * 4294967296 + L);
+        const k2 = (H ^ 1) * 4294967296 + L;
+        if ((s._hash(k1) | 0) !== (s._hash(k2) | 0)) diffs++;
+        if ((s._hash(k1) & s._mask) === (s._hash(k2) & s._mask)) shared++;
+    }
+    assert.equal(diffs, N, 'every pair must hash distinctly (HEAD: 0 -- all collide)');
+    assert.ok(shared / N < 0.01, 'home-slot share must be < 1% (HEAD 100%), got ' + (100 * shared / N).toFixed(3) + '%');
+});
+
+test('G-F12 (SS site consistency): _hash(k) === (mix64(k, seed), hashHi() | 0) over mixed-sign keys', () => {
+    // Passes on HEAD too -- proves the map home uses the SAME HI lane as mix64.
+    const s = new SpaceSaving(64, { seed: 7 });
+    let d = 0;
+    for (const k of [-5, 2 ** 40 + 3, 7, -1, 2 ** 32 + 1, -(2 ** 33), -(2 ** 53 - 1), -(2 ** 32), 0, -0]) {
+        mix64(k, s.seed);
+        if (s._hash(k) !== (hashHi() | 0)) d++;
+    }
+    assert.equal(d, 0, 'SS _hash must equal mix64 HI lane for every key');
+});
+
+test('G-F12 (SS): add(-1); add(2**32+1) -- both estimate 1, homes differ, probe distance 0 (HEAD 1)', () => {
+    const s = new SpaceSaving(1024, { seed: 7 });
+    s.add(-1);
+    s.add(2 ** 32 + 1);
+    assert.equal(s.estimate(-1), 1);
+    assert.equal(s.estimate(2 ** 32 + 1), 1);
+    const mask = s._mask;
+    const h1 = s._hash(-1), h2 = s._hash(2 ** 32 + 1);
+    assert.notEqual(h1 & mask, h2 & mask, 'the two home slots must differ (HEAD: identical)');
+    const idx = s._probe(2 ** 32 + 1, h2);
+    assert.equal((idx - (h2 & mask)) & mask, 0, '2**32+1 lands on its own home (HEAD: pushed to distance 1)');
+});
+
+test('QA H2.4 (SS site consistency, boundary matrix): the add() inline hash and _hash agree -- ' +
+    'every added key is found from its _hash home and estimates its exact count', () => {
+    // Gap: the site test above checks _hash only; add() carries its OWN inline murmur, so a
+    // drift between the two sites (add homes a key where estimate/_hash never probes) was
+    // only indirectly covered. Capacity 64 > keys, so every count is exact.
+    const KS = [0, 1, -1, -(2 ** 31 - 1), -(2 ** 31), -(2 ** 31) - 1, -(2 ** 32 - 1), -(2 ** 32),
+        -(2 ** 32 + 1), 2 ** 31, 2 ** 32 - 1, -(2 ** 40 + 104729), -(2 ** 52), -(2 ** 53 - 2),
+        -(2 ** 53 - 1), 2 ** 53 - 1, -((2 ** 21 - 1) * 4294967296)];
+    const s = new SpaceSaving(64, { seed: 7 });
+    let n = 0;
+    for (const k of KS) s.add(k, ++n);
+    s.add(-0, 100);                       // -0 is the SAME key as 0
+    assert.equal(s.size, KS.length);
+    let bad = '';
+    n = 0;
+    for (const k of KS) {
+        n++;
+        const want = k === 0 ? n + 100 : n;
+        mix64(k, s.seed);
+        const h = s._hash(k);
+        if (h !== (hashHi() | 0)) bad += 'hash:' + k + ' ';
+        const i = s._probe(k, h);
+        if (s._mapOcc[i] !== 1) bad += 'home:' + k + ' ';
+        if (s.estimate(k) !== want) bad += 'est:' + k + '=' + s.estimate(k) + ' ';
+    }
+    assert.equal(bad, '', 'site drift: ' + bad);
 });

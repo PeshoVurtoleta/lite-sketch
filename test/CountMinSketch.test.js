@@ -23,7 +23,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CountMinSketch, VERSION } from '../Sketch.js';
+import { CountMinSketch, mix64, hashHi, hashLo, VERSION } from '../Sketch.js';
 
 const liteSketch = (e) => e instanceof Error && /^\[lite-sketch]/.test(e.message);
 
@@ -789,3 +789,64 @@ test('QA H2.3 (CMS): saturated is getter-only; estimate accepts the -(2^53-1) bo
     assert.ok(c.estimate(MAX_SAFE) >= 3);
     assert.equal(c.estimate(-(MAX_SAFE + 2)), 0, 'N+1 (2^53 rounded) estimates 0');
 });
+
+// ===========================================================================
+// G-F12 (CMS hash sign bit): a negative key never aliases its 2^32-shifted twin.
+// FAILs on HEAD (where add(-7,100) made estimate(2**32+7) read 100).
+// ===========================================================================
+
+for (const conservative of [false, true]) {
+    test('G-F12 (CMS ' + (conservative ? 'cons' : 'plain') + ' 4x1024): add(-7,100) ' +
+        'does not alias 2**32+7, and estimate(-7) is exact', () => {
+        const c = new CountMinSketch(4, 1024, { conservative, seed: 7 });
+        c.add(-7, 100);
+        assert.equal(c.estimate(2 ** 32 + 7), 0, '2**32+7 must not collide with -7 (HEAD: 100)');
+        assert.equal(c.estimate(-7), 100, '-7 estimates its own exact count');
+    });
+}
+
+test('G-F12 (CMS site consistency): add(k,c) == addHashed(mix64(k, seed), c) over mixed-sign keys', () => {
+    // Passes on HEAD too -- proves the add site uses the SAME hash as mix64.
+    const a = new CountMinSketch(4, 1024, { seed: 7 }), b = new CountMinSketch(4, 1024, { seed: 7 });
+    for (const k of [-5, 2 ** 40 + 3, 7, -1, 2 ** 32 + 1, -(2 ** 53 - 1), -(2 ** 32), 0, -0]) {
+        a.add(k, 3);
+        mix64(k, a.seed);
+        b.addHashed(hashHi(), hashLo(), 3);
+    }
+    let d = 0;
+    for (let i = 0; i < a._counts.length; i++) if (a._counts[i] !== b._counts[i]) d++;
+    assert.equal(d, 0, 'CMS add and addHashed(mix64) must set identical counts');
+});
+
+for (const conservative of [false, true]) {
+    test('QA H2.4 (CMS ' + (conservative ? 'cons' : 'plain') + ' site consistency, boundary matrix): ' +
+        'add AND estimate both hash exactly as mix64 (estimate == estimateHashed per key)', () => {
+        // Gap: the existing site test covers add only; the estimate site (its own inline
+        // murmur) had no direct consistency check, and no |k| in [2^31, 2^32) negative.
+        const KS = [0, -0, 1, -1, -(2 ** 31 - 1), -(2 ** 31), -(2 ** 31) - 1, -(2 ** 32 - 1), -(2 ** 32),
+            -(2 ** 32 + 1), 2 ** 31, 2 ** 32 - 1, -(2 ** 40 + 104729), -(2 ** 52), -(2 ** 53 - 2),
+            -(2 ** 53 - 1), 2 ** 53 - 1, -((2 ** 21 - 1) * 4294967296)];
+        const a = new CountMinSketch(4, 256, { conservative, seed: 7 });
+        const b = new CountMinSketch(4, 256, { conservative, seed: 7 });
+        let n = 0;
+        for (const k of KS) {
+            n++;
+            a.add(k, n);
+            mix64(k, a.seed);
+            b.addHashed(hashHi(), hashLo(), n);
+        }
+        let d = 0;
+        for (let i = 0; i < a._counts.length; i++) if (a._counts[i] !== b._counts[i]) d++;
+        assert.equal(d, 0, 'add vs addHashed(mix64) counts');
+        let bad = '';
+        // probe every added key AND unseen twins (-(k) for positives, +|k| for negatives).
+        for (const k0 of KS) {
+            for (const k of [k0, -k0, k0 - 1]) {
+                if (Math.abs(k) > 9007199254740991) continue;
+                mix64(k, a.seed);
+                if (a.estimate(k) !== a.estimateHashed(hashHi(), hashLo())) bad += k + ' ';
+            }
+        }
+        assert.equal(bad, '', 'estimate != estimateHashed(mix64) for: ' + bad);
+    });
+}

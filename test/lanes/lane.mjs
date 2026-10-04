@@ -27,7 +27,16 @@ const MASK = SIZE - 1;
 // lane measures -- the keys never live in a closure int.
 function fillKeys(kc) {
     const K = new Float64Array(SIZE);
-    const base = kc === 'small' ? 0 : kc === 'b30' ? 2 ** 30 : kc === 'b31' ? 2 ** 31 : 0;
+    let base;
+    switch (kc) {
+        case 'small': base = 0; break;
+        case 'b30': base = 2 ** 30; break;
+        case 'b31': base = 2 ** 31; break;                 // >= 2^31 (non-Smi positive)
+        case 'u32': base = 2 ** 32 - 1 - 65536; break;     // up to 2^32-1
+        case 'n31': base = -(2 ** 31) - 65536; break;      // negative, |key| >= 2^31
+        case 'safe': base = 2 ** 53 - 1 - 65536; break;    // up to 2^53-1 (two-word)
+        default: base = 0;
+    }
     for (let i = 0; i < SIZE; i++) K[i] = base + i;
     return K;
 }
@@ -80,8 +89,10 @@ class Ctl {
 
 async function main() {
     if (laneType === 'scav') {
-        // scav <kind: hll|noop> <kc: small|b30|b31> <warm: fresh|warm>
+        // scav <kind: hll|cms|cmsest|ss|noop> <kc: small|b30|b31|u32|n31|safe> <warm: fresh|warm> [--nc]
+        // --nc pins step in the interpreter (standalone add) via test/lanes/natives.mjs.
         const kind = argv[1], kc = argv[2], warm = argv[3] === 'warm';
+        const nc = argv.indexOf('--nc') >= 0;
         const M = await import(MODULE);
         const K = fillKeys(kc);
         let sink = 0;
@@ -89,10 +100,20 @@ async function main() {
         if (kind === 'hll') {
             const hll = new M.HyperLogLog(14);
             step = (i) => { hll.add(K[i & MASK]); sink = (sink + hll._reg[i & 16383]) | 0; };
+        } else if (kind === 'cms') {
+            const cms = new M.CountMinSketch(5, 16384, { conservative: true });
+            step = (i) => { cms.add(K[i & MASK], 1); sink = (sink + cms._counts[i & 16383]) | 0; };
+        } else if (kind === 'cmsest') {
+            const cms = new M.CountMinSketch(5, 16384, { conservative: true });
+            step = (i) => { sink = (sink + (cms.estimate(K[i & MASK]) > 0 ? 1 : 0)) | 0; };
+        } else if (kind === 'ss') {
+            const ss = new M.SpaceSaving(1024);
+            step = (i) => { ss.add(K[i & MASK], 1); sink = (sink + ss._count[i & 1023]) | 0; };
         } else {
             const noop = new Noop();
             step = (i) => { noop.add(K[i & MASK]); sink = (sink + noop.s) | 0; };
         }
+        if (nc) { const { neverOpt } = await import('./natives.mjs'); neverOpt(step); }
         const scav = await countScav(step, warm);
         console.log(JSON.stringify({ scav, sink: sink & 1 }));
         return;

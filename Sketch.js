@@ -101,8 +101,10 @@ function _m3final(h) {
 /**
  * Hash a numeric key with a uint32 seed into the two lanes HASH_HI / HASH_LO.
  * Splits the key into its low 32 bits and its high word (exact for integers up to
- * 2^53) plus a sign flag, folds both words through TWO independently seeded murmur3
- * bodies. Zero allocation, no BigInt, no ref retained.
+ * 2^53), then folds BOTH words through TWO independently seeded murmur3 bodies. The
+ * sign lives in bit 31 of the high word (`hi ^ (neg << 31)`), which is free because a
+ * safe integer's high word is < 2^21, so the sign bit never collides with a magnitude
+ * bit -- `-k` and `k` hash distinctly. Zero allocation, no BigInt, no ref retained.
  * @param {number} key  a finite number (integers up to +/-2^53 hash exactly)
  * @param {number} seed a uint32 seed
  */
@@ -116,13 +118,13 @@ export function mix64(key, seed) {
     // lane HI (seed s)
     let h = s | 0;
     h = _m3round(h, lo);
-    h = _m3round(h, hi ^ neg);
+    h = _m3round(h, hi ^ (neg << 31));
     h = h ^ 8;                                 // length tag (two 32-bit blocks)
     HASH_HI = _m3final(h) | 0;
     // lane LO (seed s ^ LANE_SALT -- decorrelated)
     let g = (s ^ LANE_SALT) | 0;
     g = _m3round(g, lo);
-    g = _m3round(g, hi ^ neg);
+    g = _m3round(g, hi ^ (neg << 31));
     g = g ^ 8;
     HASH_LO = _m3final(g) | 0;
 }
@@ -306,7 +308,8 @@ export class HyperLogLog {
      * throws `[lite-sketch]` (byte-identical no-op) -- the typeof guard runs FIRST. The hot
      * body distinguishes the FULL magnitude (low word + high word + sign), so the accepted
      * domain is every safe integer |key| <= 2^53 - 1, matching CountMinSketch / SpaceSaving;
-     * a non-integer or an Infinity would truncate/alias under `>>> 0`, so both fail closed.
+     * a non-integer or an Infinity would truncate/alias under the 32-bit word split, so both
+     * fail closed.
      *
      * The two-lane murmur is INLINED here (identical math to mix64) so the lanes are
      * pure LOCALS (int32), which TurboFan keeps in registers -- it never writes the
@@ -319,21 +322,20 @@ export class HyperLogLog {
     add(key) {
         if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
             Math.abs(key) > 9007199254740991) return this._badKey(key);
-        let a = key;
-        let neg = 0;
-        if (a < 0) { a = -a; neg = 1; }
-        const lo = a >>> 0;
+        const neg = key < 0 ? 1 : 0;
+        const a = Math.abs(key);
+        const lo = a | 0;
         // High word: 0 for the common case (|key| < 2^32, incl. every int32 id) so the hot
         // body stays PURE int32 -- the float divide runs ONLY for a genuine > 32-bit key.
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
         const s = this._seed;
         let h = s;
         h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ neg);
+        h = _m3round(h, hiw ^ (neg << 31));
         h = _m3final(h ^ 8);                       // HI lane (int32 local)
         let g = s ^ LANE_SALT;
         g = _m3round(g, lo);
-        g = _m3round(g, hiw ^ neg);
+        g = _m3round(g, hiw ^ (neg << 31));
         g = _m3final(g ^ 8);                       // LO lane (int32 local)
         const p = this._p;
         const j = h >>> (32 - p);
@@ -639,7 +641,7 @@ export class CountMinSketch {
      * guards run FIRST. The hot body distinguishes the FULL magnitude (low word + high word +
      * sign), so the accepted domain is every safe integer |key| <= 2^53 - 1, matching
      * HyperLogLog / SpaceSaving; a non-integer or an Infinity would truncate/alias under
-     * `>>> 0`, so both fail closed. An add that would push the running `total` past 2^53-1
+     * the 32-bit word split, so both fail closed. An add that would push the running `total` past 2^53-1
      * throws tagged (F15/S5) -- the aggregate stays exact -- as a byte-identical no-op.
      *
      * The two-lane murmur is INLINED (identical math to mix64) into int32 LOCALS so it
@@ -656,21 +658,20 @@ export class CountMinSketch {
             return this._badCount(count);
         }
         if (this._total + count > 9007199254740991) return this._badTotal(count);
-        let a = key;
-        let neg = 0;
-        if (a < 0) { a = -a; neg = 1; }
-        const lo = a >>> 0;
+        const neg = key < 0 ? 1 : 0;
+        const a = Math.abs(key);
+        const lo = a | 0;
         // High word: 0 for |key| < 2^32 (incl. every int32 id) so the hot body stays PURE
         // int32; the float divide runs ONLY for a genuine > 32-bit key.
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
         const s = this._seed;
         let h = s;
         h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ neg);
+        h = _m3round(h, hiw ^ (neg << 31));
         h = _m3final(h ^ 8);                        // HI lane (int32 local)
         let g = s ^ LANE_SALT;
         g = _m3round(g, lo);
-        g = _m3round(g, hiw ^ neg);
+        g = _m3round(g, hiw ^ (neg << 31));
         g = _m3final(g ^ 8);                        // LO lane (int32 local)
         const base = (h ^ g) | 0;
         if (this._conservative) return this._applyCons(base, count);
@@ -753,19 +754,18 @@ export class CountMinSketch {
     estimate(key) {
         if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
             Math.abs(key) > 9007199254740991) return 0;
-        let a = key;
-        let neg = 0;
-        if (a < 0) { a = -a; neg = 1; }
-        const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const neg = key < 0 ? 1 : 0;
+        const a = Math.abs(key);
+        const lo = a | 0;
+        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
         const s = this._seed;
         let h = s;
         h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ neg);
+        h = _m3round(h, hiw ^ (neg << 31));
         h = _m3final(h ^ 8);
         let g = s ^ LANE_SALT;
         g = _m3round(g, lo);
-        g = _m3round(g, hiw ^ neg);
+        g = _m3round(g, hiw ^ (neg << 31));
         g = _m3final(g ^ 8);
         const base = (h ^ g) | 0;
         const d = this._d, w = this._w, mask = this._mask, counts = this._counts;
@@ -1729,15 +1729,14 @@ export class SpaceSaving {
         }
         if (this._total + count > 9007199254740991) return this._badTotal(count);
         // inline HI-lane murmur into an int32 local (the map needs one lane).
-        let a = key;
-        let neg = 0;
-        if (a < 0) { a = -a; neg = 1; }
-        const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const neg = key < 0 ? 1 : 0;
+        const a = Math.abs(key);
+        const lo = a | 0;
+        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
         const s = this._seed;
         let h = s;
         h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ neg);
+        h = _m3round(h, hiw ^ (neg << 31));
         h = _m3final(h ^ 8);                        // HI lane (int32 local); == _hash(key)
         const i = this._probe(key, h);
         if (this._mapOcc[i] === 1) {                // monitored -> bump
@@ -1956,15 +1955,14 @@ export class SpaceSaving {
      * @returns {number} int32 HI lane
      */
     _hash(key) {
-        let a = key;
-        let neg = 0;
-        if (a < 0) { a = -a; neg = 1; }
-        const lo = a >>> 0;
-        const hiw = a < 4294967296 ? 0 : (Math.floor(a / 4294967296) >>> 0);
+        const neg = key < 0 ? 1 : 0;
+        const a = Math.abs(key);
+        const lo = a | 0;
+        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
         const s = this._seed;
         let h = s;
         h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ neg);
+        h = _m3round(h, hiw ^ (neg << 31));
         h = _m3final(h ^ 8);
         return h | 0;
     }
