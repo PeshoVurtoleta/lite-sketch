@@ -120,6 +120,28 @@ crossing the call in the default tier (the remaining Node F4 box after H2.4's in
    fmix inline is deferred to 1.2.0 through the F5 scratch (422 bytes would crowd the cap with H2.6's
    own bytes). An interleave parity test confirms `_base` / `_cnt` are PER-INSTANCE, not shared.
 
+## H2.6 amendment (2026-10-04) -- the addFrom family + the F2 / estimate hand-inline (F5, F6)
+
+Bit-identical output over the N9 parity sweep (incl. `estimate` across 1.5 / NaN / +-Inf / +-2^53 /
+1e300); the H2.5 `estimate` per-row fmix deferral is resolved here.
+
+1. **`add` -> wrapper + `_addAt`; `estimate` -> wrapper + `_estimateAt`.** `add(key, count)` rejects a
+   non-number key OR count FIRST via a cold `_badArgs(key, count)` that replays HEAD `add`'s exact
+   guard order (full key check, then count), so the thrown class + message are IDENTICAL to HEAD for
+   every bad `(key, count)` pair; it then writes `key` / `count` into `_buf = Float64Array(2)` and
+   defers to `_addAt(_buf, 0)` (`_base` / `_cnt` written only AFTER all three guards). The murmur is
+   hand-inlined in `_addAt` (F2). `estimate` writes the key into `_buf[0]`, runs `_estimateAt(_buf,
+   0)`, and returns `_buf[1]`: **D3** -- `_estimateAt` writes the d-cell minimum into `_buf[1]` rather
+   than returning it, so a min `>= 2^31` never boxes on the non-inlined return. Its per-row fmix is now
+   inlined.
+2. **`addFrom(buf, i)`** reads `key = buf[i]`, `count = buf[i+1]` (needs `i+1` in bounds).
+   **`addHashedFrom(buf, i)` is 3-slot** `[hi, lo, count]` -- i.e. `addHashed(hi, lo, count)` with
+   every argument read unboxed, using `addHashed`'s count guard verbatim (D2). WHY 3 slots and not a
+   fixed count of 1: a counted stream's count would otherwise have to cross the call as a boxed
+   argument, re-introducing the box the entry point exists to remove; it is symmetric with CMS
+   `addFrom(key, count)` and `addHashed(hi, lo, count)`. An `Int32Array` cannot carry a count `>=
+   2^31`, so that cap is documented.
+
 ## Non-goals
 
 No range / heavy-hitter queries (that is SpaceSaving, M4, and DDSketch, M3); no serialization

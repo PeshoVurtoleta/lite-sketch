@@ -73,6 +73,12 @@ export class HyperLogLog {
     /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-uint32 lane. */
     addHashed(hi: number, lo: number): this;
 
+    /** Add the key at `buf[i]` of a caller-owned Float64Array -- the ZERO-BOX entry point for a key >= 2^31 (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws / no-op-on-reject as `add`. */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /** Add a pre-hashed key from two uint32 lanes read UNBOXED at `buf[i]`, `buf[i+1]` (Uint32Array or Int32Array) -- the zero-box sibling of `addHashed`. Throws [lite-sketch] on a bad buffer / index, and with addHashed's lane error on a lane read that is neither uint32 nor int32 (e.g. through a Proxy), before any write. */
+    addHashedFrom(buf: Uint32Array | Int32Array, i: number): this;
+
     /** The estimated distinct count via Ertl's improved estimator (table-free, accurate across the whole range). COLD, O(m) -- a disclosed co-headline, not per-add. Never throws. */
     count(): number;
 
@@ -153,6 +159,12 @@ export class CountMinSketch {
 
     /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-uint32 lane, an out-of-range count, or a running `total` past 2^53-1. */
     addHashed(hi: number, lo: number, count?: number): this;
+
+    /** Add the key at `buf[i]` with count at `buf[i+1]` of a caller-owned Float64Array -- the ZERO-BOX entry point for a key or count >= 2^31 (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws / no-op-on-reject as `add`. */
+    addFrom(buf: Float64Array, i: number): this;
+
+    /** Add a pre-hashed key from three slots [hi, lo, count] read UNBOXED at `buf[i..i+2]` (Uint32Array or Int32Array; an Int32Array caps count at 2^31-1). The zero-box sibling of `addHashed`. Throws [lite-sketch] on a bad buffer / index / count, and with addHashed's lane error on a lane read that is neither uint32 nor int32 (e.g. through a Proxy), before any write. */
+    addHashedFrom(buf: Uint32Array | Int32Array, i: number): this;
 
     /** The minimum over the key's d cells -- the tightest one-sided over-estimate. HOT, O(d), 0 B/op. Never throws: a key `add` would reject (non-integer / non-finite / out-of-safe-range) estimates 0 and never aliases a real key (F13). */
     estimate(key: number): number;
@@ -323,6 +335,9 @@ export class SpaceSaving {
 
     /** Add a safe-integer `key` with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 B/op. Increments, inserts, or evicts the min. Throws [lite-sketch] on a non-safe-integer key, a count outside [1, 2^32-1], or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
     add(key: number, count?: number): this;
+
+    /** Add the key at `buf[i]` with count at `buf[i+1]` of a caller-owned Float64Array -- the ZERO-BOX entry point for a key or count >= 2^31 (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call). Snapshots both slots before use (D1). Same validation / throws / no-op-on-reject as `add`. */
+    addFrom(buf: Float64Array, i: number): this;
 
     /** The estimated frequency of `key` (an upper bound), or 0 if not monitored. HOT, O(1). NEVER throws. */
     estimate(key: number): number;

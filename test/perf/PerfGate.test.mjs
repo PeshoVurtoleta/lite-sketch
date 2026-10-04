@@ -54,16 +54,17 @@ const addHashedStream = {
     setup() {
         const h = new HyperLogLog(P, 0x9e3779b1);
         for (let k = 0; k < M; k++) h.add(k);
-        return { h, v: 0, sink: 0 };
+        return { h, v: 0, sink: 0, buf: new Uint32Array(2) };
     },
     hot(s, n) {
         const h = s.h;
+        const buf = s.buf;
         let v = s.v | 0, sink = s.sink | 0;
         for (let i = 0; i < n; i++) {
             v = (v + 0x9e3779b1) | 0;
-            const hi = v >>> 0;
-            h.addHashed(hi, (hi ^ 0x5bd1e995) >>> 0);
-            sink = (sink + h._reg[hi & (M - 1)]) | 0;
+            buf[0] = v; buf[1] = v ^ 0x5bd1e995;    // ToUint32 on store: same lane bits as addHashed(hi, lo)
+            h.addHashedFrom(buf, 0);                 // F6: lanes >= 2^31 read UNBOXED from the Uint32Array
+            sink = (sink + h._reg[v & (M - 1)]) | 0;
         }
         s.v = v | 0; s.sink = sink | 0;
     },
@@ -173,14 +174,17 @@ const ssEvictStream = {
     setup() {
         const s = new SpaceSaving(SS_K, { seed: 0x9e3779b1 });
         for (let k = 0; k < SS_K; k++) s.add(k);      // prime to capacity (full)
-        return { s, v: SS_K, sink: 0 };
+        const kb = new Float64Array(2); kb[1] = 1;    // addFrom scratch: KB[0] = key, KB[1] = count 1
+        return { s, v: SS_K, sink: 0, kb };
     },
     hot(s, n) {
         const ss = s.s;
+        const kb = s.kb;
         let v = s.v | 0, sink = s.sink | 0;
         for (let i = 0; i < n; i++) {
             v = (v + 0x9e3779b1) | 0;                  // a fresh, unmonitored key every op -> forces evict
-            ss.add(v >>> 0);
+            kb[0] = v >>> 0;                           // F5: the key crosses UNBOXED via (Float64Array, i)
+            ss.addFrom(kb, 0);
             sink = (sink + ss.size) | 0;               // observe state (defeat DCE)
         }
         s.v = v | 0; s.sink = sink | 0;
@@ -215,11 +219,13 @@ const mustFailAlloc = {
 // maxScavenges: the AUTHORITATIVE 0-B/op proof is test/torture.mjs (measureAllocs = 0 B/op on add
 // AND addHashed, gc major 0). This perf gate proves the other invariants strictly -- NO old-gen GC,
 // NO arrayBuffer growth (grows delta 0: the register bank never resizes), flat throughput, and the
-// mustFail teeth catch a real allocator -- and allows a SMALL scavenge floor. That floor is a V8
-// artifact of the addHashed CALLER contract: a uint32 hash lane >= 2^31 is a boxed double, and
-// passing those lanes as addHashed args across a not-yet-inlined call registers a few young-gen
-// scavenges that net to 0 B/op (torture) and never reach old gen (F6, a later session). HLL add
-// USED to add to this floor; that was NOT the suffix widening but a Maglev deopt loop on
+// mustFail teeth catch a real allocator -- and allows a SMALL scavenge floor. That floor DISCLOSED a
+// V8 artifact of the old addHashed CALLER contract: a uint32 hash lane >= 2^31 is a boxed double, and
+// passing those lanes as addHashed args across a not-yet-inlined call registered a few young-gen
+// scavenges that netted to 0 B/op (torture) and never reached old gen. Since H2.6 this scenario drives
+// addHashedFrom (and ssEvict drives addFrom), reading the lanes / key UNBOXED from a caller buffer
+// (F6 / F5), so it no longer rides the floor; maxScavenges 64 is retained unchanged and recalibrated
+// in H2.8. HLL add USED to add to this floor; that was NOT the suffix widening but a Maglev deopt loop on
 // `hiSuf = (h << p) >>> 0` ("not int32"), fixed in H2.1 by `h << p` (clz32 reads the same bits), so
 // HLL add is now 0 scavenges. It is NOT a per-op heap allocation (that would be thousands of
 // scavenges + a tripped teeth, as the mustFail control shows). The value 64 is recalibrated in H2.8.

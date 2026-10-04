@@ -1051,3 +1051,341 @@ test('QA H2.5 (CMS _base/_cnt scratch, NEW-CODE ONLY): per-instance Int32Array(1
         assert.equal(s._cnt[0], 2 ** 31 + 9);
     }
 });
+
+// ===========================================================================
+// H2.6 F5/F6 -- addFrom / addHashedFrom (the zero-box entry points), D2 + D3.
+// addFrom reads key = buf[i], count = buf[i+1] UNBOXED; addHashedFrom reads
+// [hi, lo, count] with addHashed's exact count guard (D2); estimate returns the
+// cell-min via _buf[1] (D3). Twins vs add / addHashed, tagged rejects (no-op).
+// ===========================================================================
+for (const conservative of [true, false]) {
+    test('H2.6 (CMS ' + (conservative ? 'cons' : 'plain') + '): add and addFrom build byte-identical state (counts incl 2^31)', () => {
+        const a = new CountMinSketch(7, 64, { conservative }), b = new CountMinSketch(7, 64, { conservative });
+        const F = new Float64Array(3);
+        const keys = [0, -0, 1, -1, 2 ** 30, 2 ** 31, -(2 ** 31), 2 ** 32 - 1, 2 ** 32 + 7, -(2 ** 32 + 7), 2 ** 53 - 1, -(2 ** 53 - 1)];
+        let t = 0;
+        for (const k of keys) { const cn = (t++ & 1) ? 2 ** 31 + (t & 7) : 1 + (t & 3); a.add(k, cn); F[1] = k; F[2] = cn; b.addFrom(F, 1); }
+        assert.deepEqual(Array.from(a._counts), Array.from(b._counts), 'addFrom _counts != add');
+        assert.equal(a.total, b.total, 'total'); assert.equal(a.saturated, b.saturated, 'saturated');
+        for (const k of keys.concat([1.5, NaN, Infinity, 2 ** 53])) assert.equal(a.estimate(k), b.estimate(k), 'estimate ' + k);
+    });
+}
+
+test('H2.6 (CMS): estimate returns a large (>= 2^31) cell-min exactly, and 0 for a rejected key (value check only; the D3 zero-box teeth is the N1e lane)', () => {
+    const s = new CountMinSketch(4, 1024, { conservative: false });
+    s.add(7, 2 ** 31);
+    assert.equal(s.estimate(7), 2 ** 31, 'a >= 2^31 min must round-trip exactly (not a boxed/truncated return)');
+    s.add(7, 2 ** 31);                                   // 2^32 -> clamps to 2^32-1
+    assert.equal(s.estimate(7), 0xffffffff);
+    assert.equal(s.saturated, true);
+    assert.equal(s.estimate(1.5), 0, 'a non-integer key estimates 0 (D3 writes _buf[1] = 0)');
+    assert.equal(s.estimate(2 ** 53), 0, 'an out-of-safe-range key estimates 0');
+});
+
+test('H2.6 (CMS): addHashedFrom (Uint32Array and Int32Array) equals addHashed(hi, lo, count)', () => {
+    for (const conservative of [true, false]) {
+        const a = new CountMinSketch(7, 64, { conservative }), b = new CountMinSketch(7, 64, { conservative });
+        const U = new Uint32Array(3), I = new Int32Array(3);
+        for (let t = 0; t < 4000; t++) {
+            const hi = Math.imul(t + 1, 2654435761) >>> 0, lo = Math.imul(t ^ 0x5bd1e995, 40503) >>> 0, cn = 1 + (t & 7);
+            a.addHashed(hi, lo, cn); U[0] = hi; U[1] = lo; U[2] = cn; b.addHashedFrom(U, 0);
+        }
+        assert.deepEqual(Array.from(a._counts), Array.from(b._counts), 'addHashedFrom U32 != addHashed');
+        assert.equal(a.total, b.total);
+        // Int32 lanes are the same 32 bits; a separate pair must agree.
+        const c = new CountMinSketch(7, 64, { conservative }), d = new CountMinSketch(7, 64, { conservative });
+        for (let t = 0; t < 2000; t++) {
+            const hi = (t * -2654435761) | 0, lo = (t ^ 0x5bd1e995) | 0, cn = 1 + (t & 3);
+            c.addHashed(hi >>> 0, lo >>> 0, cn); I[0] = hi; I[1] = lo; I[2] = cn; d.addHashedFrom(I, 0);
+        }
+        assert.deepEqual(Array.from(c._counts), Array.from(d._counts), 'addHashedFrom I32 != addHashed');
+    }
+});
+
+test('H2.6 (CMS): addFrom rejects a bad buffer / index (needs i and i+1 in range), byte-identical no-op', () => {
+    const c = new CountMinSketch(4, 64); c.add(5, 3);
+    const before = cmsSnap(c);
+    const F = new Float64Array(2);
+    for (const bad of [new Float32Array(2), new Int32Array(2), [1, 2], new DataView(new ArrayBuffer(16)), null, undefined, {}]) {
+        assert.throws(() => c.addFrom(bad, 0), (e) => e instanceof TypeError && /\[lite-sketch\] CountMinSketch\.addFrom/.test(e.message), 'buf ' + String(bad));
+    }
+    for (const i of [0.5, -1, NaN, Infinity, 1, 2]) {   // length 2 -> only i = 0 keeps i+1 in bounds
+        assert.throws(() => c.addFrom(F, i), (e) => e instanceof TypeError && /CountMinSketch\.addFrom/.test(e.message), 'i ' + i);
+    }
+    cmsUnchanged(before, c, 'bad addFrom');
+});
+
+test('H2.6 (CMS): a key or count addFrom would reject throws add\'s exact error, byte-identical no-op', () => {
+    const c = new CountMinSketch(4, 64); c.add(9, 2);
+    const F = new Float64Array(2);
+    for (const [k, cn] of [[1.5, 1], [2 ** 53, 1], [Infinity, 1], [NaN, 1], [1, 0], [1, 2 ** 32], [5, 1.5], [5, -1]]) {
+        const before = cmsSnap(c);
+        F[0] = k; F[1] = cn;
+        let eAdd = null, eFrom = null;
+        try { c.add(k, cn); } catch (e) { eAdd = e; }
+        try { c.addFrom(F, 0); } catch (e) { eFrom = e; }
+        assert.ok(eFrom, 'addFrom(' + k + ',' + cn + ') did not throw');
+        assert.equal(eFrom.constructor, eAdd.constructor, k + ',' + cn + ' class');
+        assert.equal(eFrom.message, eAdd.message, k + ',' + cn + ' message');
+        cmsUnchanged(before, c, 'reject ' + k + ',' + cn);
+    }
+});
+
+test('H2.6 (CMS): addHashedFrom rejects bad buffer / index / count; D2 catches a Proxy NaN count as _badCount', () => {
+    const c = new CountMinSketch(4, 64);
+    const before = cmsSnap(c);
+    assert.throws(() => c.addHashedFrom(new Float64Array(3), 0), (e) => e instanceof TypeError && /addHashedFrom/.test(e.message), 'Float64Array');
+    assert.throws(() => c.addHashedFrom(new Uint32Array(3), 1), (e) => e instanceof TypeError, 'i = length - 2 -> i+2 out of range');
+    assert.throws(() => c.addHashedFrom(new Uint32Array(3), -1), (e) => e instanceof TypeError, 'i = -1');
+    assert.throws(() => c.addHashedFrom(new Uint32Array([1, 2, 0]), 0), (e) => liteSketch(e) && /count must be an integer/.test(e.message), 'count 0');
+    assert.throws(() => c.addHashedFrom(new Int32Array([1, 2, -1]), 0), (e) => liteSketch(e) && /count must be an integer/.test(e.message), 'Int32 count -1');
+    // D2 TEETH: a Proxy over a Uint32Array passes instanceof but yields NaN for the count slot.
+    // addHashed's verbatim guard (!Number.isInteger) rejects it; without D2, NaN would slip through
+    // and write _cnt[0] = NaN, corrupting total -- so cmsUnchanged would catch the mis-port.
+    const px = new Proxy(new Uint32Array([123, 456, 0]), { get(t, k) { return k === '2' ? NaN : t[k]; } });
+    assert.throws(() => c.addHashedFrom(px, 0), (e) => e instanceof RangeError && /count must be an integer/.test(e.message), 'Proxy NaN count -> _badCount (D2)');
+    cmsUnchanged(before, c, 'addHashedFrom rejects');
+});
+
+test('H2.6 (CMS): addFrom / addHashedFrom honor the running-total ceiling 2^53-1 (byte-identical)', () => {
+    const f = new CountMinSketch(4, 64, { conservative: false });
+    for (let i = 0; i < (1 << 21); i++) f.add(1, 0xffffffff);
+    f.add(1, (1 << 21) - 1);
+    assert.equal(f.total, MAX_SAFE, 'total reaches exactly 2^53-1');
+    const F = new Float64Array([2, 1]), U = new Uint32Array([1, 2, 1]);
+    for (const fn of [() => f.addFrom(F, 0), () => f.addHashedFrom(U, 0)]) {
+        const before = cmsSnap(f);
+        assert.throws(fn, (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+        cmsUnchanged(before, f, 'total+1 reject');
+    }
+});
+
+test('H2.6 (CMS): _buf is per instance -- interleaved addFrom instances equal solo twins', () => {
+    const x = new CountMinSketch(5, 128), y = new CountMinSketch(5, 128), xs = new CountMinSketch(5, 128), ys = new CountMinSketch(5, 128);
+    const F = new Float64Array(2);
+    for (let k = 0; k < 3000; k++) {
+        F[0] = (k * 2654435761) % (2 ** 40); F[1] = 1 + (k & 7); x.addFrom(F, 0); xs.addFrom(F, 0);
+        F[0] = -((k * 40503) % (2 ** 35)); F[1] = 2 ** 31 + (k & 3); y.addFrom(F, 0); ys.addFrom(F, 0);
+    }
+    assert.deepEqual(Array.from(x._counts), Array.from(xs._counts), 'interleaved x != solo');
+    assert.deepEqual(Array.from(y._counts), Array.from(ys._counts), 'interleaved y != solo');
+    assert.equal(x.total, xs.total); assert.equal(y.total, ys.total);
+});
+
+// ===========================================================================
+// H2.6 TEETH -- exact HEAD (key,count) error literals (kills a count-first _badArgs
+// mutant, which add==addFrom equivalence cannot catch) + addHashedFrom fail-closed.
+// ===========================================================================
+test('H2.6 (CMS TEETH): add pins HEAD\'s exact (key,count) error class + message (kills a count-first _badArgs)', () => {
+    const sym = Symbol('z');
+    const LITS = [
+        [NaN, 'x', 'TypeError', '[lite-sketch] CountMinSketch.add key must be a number, got NaN'],
+        ['1', NaN, 'TypeError', '[lite-sketch] CountMinSketch.add key must be a number, got 1'],
+        [1, '2', 'RangeError', '[lite-sketch] CountMinSketch count must be an integer in [1, 4294967295], got 2'],
+        [1.5, sym, 'TypeError', '[lite-sketch] CountMinSketch.add key must be a number, got 1.5'],
+        [1, 2 ** 32, 'RangeError', '[lite-sketch] CountMinSketch count must be an integer in [1, 4294967295], got 4294967296'],
+        [1, null, 'RangeError', '[lite-sketch] CountMinSketch count must be an integer in [1, 4294967295], got null'],
+    ];
+    const c = new CountMinSketch(4, 16); c.add(3, 2);
+    const before = cmsSnap(c);
+    const F = new Float64Array(2);
+    for (const [k, cn, cls, msg] of LITS) {
+        assert.throws(() => c.add(k, cn), (e) => e.constructor.name === cls && e.message === msg, 'add(' + String(k) + ',' + String(cn) + ')');
+        // addFrom reaches _addAt only for numeric (key, count); those must give the SAME literal.
+        if (typeof k === 'number' && typeof cn === 'number') { F[0] = k; F[1] = cn; assert.throws(() => c.addFrom(F, 0), (e) => e.constructor.name === cls && e.message === msg, 'addFrom(' + String(k) + ',' + String(cn) + ')'); }
+    }
+    cmsUnchanged(before, c, 'teeth rejects');
+});
+
+test('H2.6 (CMS TEETH): addHashedFrom fails closed on a non-int32 lane (Proxy / overridden length), byte-identical no-op', () => {
+    const c = new CountMinSketch(4, 64); c.add(9, 5);
+    const before = cmsSnap(c);
+    for (const v of [undefined, 'x', NaN, 2 ** 40, -1.5, Infinity, null, 1.5]) {
+        const pHi = new Proxy(new Uint32Array([0, 123, 1]), { get(t, k) { return k === '0' ? v : t[k]; } });
+        assert.throws(() => c.addHashedFrom(pHi, 0),
+            (e) => e instanceof TypeError && e.message === '[lite-sketch] CountMinSketch.addHashed lanes must be uint32, got ' + String(v), 'hi=' + String(v));
+        const pLo = new Proxy(new Uint32Array([123, 0, 1]), { get(t, k) { return k === '1' ? v : t[k]; } });
+        assert.throws(() => c.addHashedFrom(pLo, 0),
+            (e) => e instanceof TypeError && /addHashed lanes must be uint32/.test(e.message), 'lo=' + String(v));
+    }
+    class Evil extends Uint32Array { get length() { return 99; } }   // backing 0, lies as 99 -> hi reads undefined
+    assert.throws(() => c.addHashedFrom(new Evil(0), 0),
+        (e) => e instanceof TypeError && /addHashed lanes must be uint32/.test(e.message));
+    cmsUnchanged(before, c, 'bad lane');
+});
+
+test('H2.6 (CMS): addHashedFrom accepts an Int32Array (negative lanes reinterpreted) == addHashed', () => {
+    for (const conservative of [true, false]) {
+        const a = new CountMinSketch(5, 256, { conservative }), b = new CountMinSketch(5, 256, { conservative });
+        const I = new Int32Array(3);
+        for (let t = 0; t < 2000; t++) {
+            const hi = (t * -2654435761) | 0, lo = (t ^ 0x5bd1e995) | 0, cn = 1 + (t & 7);
+            a.addHashed(hi >>> 0, lo >>> 0, cn); I[0] = hi; I[1] = lo; I[2] = cn; b.addHashedFrom(I, 0);
+        }
+        assert.deepEqual(Array.from(a._counts), Array.from(b._counts), conservative ? 'cons' : 'plain');
+    }
+});
+
+// ===========================================================================
+// QA H2.6 -- boundary matrix for addFrom / addHashedFrom / estimate (CMS).
+// Index 0 / 1 / N-2 (last valid) / N-1 / N / N+1 / -0 / empty / null /
+// undefined / NaN; byteOffset / SharedArrayBuffer / detached / shrunk views;
+// the key x count matrix through addFrom == add; D3 after a merge with cells
+// >= 2^31; interleaved add / addFrom / estimate on two instances; a Proxy that
+// re-enters the same sketch mid-read; addHashedFrom at the end of the buffer.
+// ===========================================================================
+const qa26Err = (fn) => { try { fn(); return null; } catch (e) { return e.constructor.name + ': ' + e.message; } };
+const qa26Same = (a, b, m) => {
+    assert.deepEqual(Array.from(b._counts), Array.from(a._counts), m + ': _counts');
+    assert.equal(b.total, a.total, m + ': total'); assert.equal(b.saturated, a.saturated, m + ': saturated');
+};
+
+test('QA H2.6 (CMS): addFrom index matrix 0 / 1 / N-2 accepted == add; N-1 / N / N+1 / empty / -1 / NaN / null / undefined rejected tagged, no-op', () => {
+    const F = new Float64Array([2 ** 40 + 1, 3, 2 ** 31 + 7, 2 ** 31, 9]);   // pairs (F[i], F[i+1]), every pair legal
+    const N = F.length;
+    for (const i of [0, 1, N - 2, -0]) {
+        const a = new CountMinSketch(4, 256), b = new CountMinSketch(4, 256);
+        a.add(F[i], F[i + 1]); b.addFrom(F, i);
+        qa26Same(a, b, 'i ' + i);
+    }
+    const c = new CountMinSketch(4, 256); c.add(17, 4);
+    const before = cmsSnap(c);
+    for (const i of [N - 1, N, N + 1, -1, NaN, null, undefined, '0', 0.5, Infinity])
+        assert.match(qa26Err(() => c.addFrom(F, i)), /^TypeError: \[lite-sketch\] CountMinSketch\.addFrom\(buf, i\)/, 'i ' + String(i));
+    for (const len of [0, 1])
+        assert.match(qa26Err(() => c.addFrom(new Float64Array(len), 0)), /^TypeError: \[lite-sketch\] CountMinSketch\.addFrom/, 'length ' + len);
+    cmsUnchanged(before, c, 'rejected index');
+});
+
+test('QA H2.6 (CMS): addFrom over a byteOffset view and a SharedArrayBuffer view == add; detached / shrunk buffers reject, no-op', () => {
+    const base = new Float64Array([0, 0, 0, -(2 ** 33) - 9, 2 ** 31 + 1]);
+    const view = base.subarray(3);
+    assert.equal(view.byteOffset, 24);
+    const S = new Float64Array(new SharedArrayBuffer(16)); S[0] = -(2 ** 33) - 9; S[1] = 2 ** 31 + 1;
+    for (const conservative of [true, false]) {
+        const a = new CountMinSketch(5, 128, { conservative }), b = new CountMinSketch(5, 128, { conservative }), s = new CountMinSketch(5, 128, { conservative });
+        a.add(-(2 ** 33) - 9, 2 ** 31 + 1);
+        b.addFrom(view, view.length - 2);
+        s.addFrom(S, 0);
+        qa26Same(a, b, 'view'); qa26Same(a, s, 'SAB');
+        assert.equal(b.estimate(-(2 ** 33) - 9), 2 ** 31 + 1);
+        const before = cmsSnap(a);
+        const D = new Float64Array([1, 1]); structuredClone(D.buffer, { transfer: [D.buffer] });
+        assert.match(qa26Err(() => a.addFrom(D, 0)), /^TypeError: \[lite-sketch\] CountMinSketch\.addFrom/, 'detached');
+        const DU = new Uint32Array([1, 2, 1]); structuredClone(DU.buffer, { transfer: [DU.buffer] });
+        assert.match(qa26Err(() => a.addHashedFrom(DU, 0)), /^TypeError: \[lite-sketch\] CountMinSketch\.addHashedFrom/, 'detached hashed');
+        const rab = new ArrayBuffer(32, { maxByteLength: 32 }); const R = new Float64Array(rab); R[2] = 5; R[3] = 1;
+        rab.resize(24);                               // length 4 -> 3: i = 2 loses its count slot
+        assert.match(qa26Err(() => a.addFrom(R, 2)), /^TypeError: \[lite-sketch\] CountMinSketch\.addFrom/, 'shrunk');
+        cmsUnchanged(before, a, 'detached / shrunk');
+    }
+});
+
+test('QA H2.6 (CMS): addFrom key x count matrix == add (error class + message, or state), incl -0, +-(2^53-1), 2^53, NaN, counts 0 / 2^32-1 / 2^32 / 1.5', () => {
+    const KEYS = [0, -0, 1, 2 ** 53 - 1, -(2 ** 53 - 1), 2 ** 53, -(2 ** 53), NaN, Infinity, 1.5, 2 ** 31];
+    const COUNTS = [0, 1, 2 ** 31 - 1, 2 ** 31, 2 ** 32 - 1, 2 ** 32, 1.5, NaN, -1, -0, Infinity];
+    const F = new Float64Array(2);
+    for (const conservative of [true, false]) for (const k of KEYS) for (const cn of COUNTS) {
+        const a = new CountMinSketch(4, 64, { conservative }), b = new CountMinSketch(4, 64, { conservative });
+        a.add(3, 2); b.add(3, 2);
+        const ea = qa26Err(() => a.add(k, cn));
+        F[0] = k; F[1] = cn;
+        const eb = qa26Err(() => b.addFrom(F, 0));
+        const lab = (conservative ? 'cons' : 'plain') + ' (' + k + ', ' + cn + ')';
+        assert.equal(eb, ea, lab + ': addFrom outcome != add');
+        qa26Same(a, b, lab);
+        assert.equal(b.estimate(k), a.estimate(k), lab + ': estimate');
+    }
+});
+
+test('QA H2.6 (CMS): estimate (D3) is exact for cells >= 2^31 built by merge, incl a non-Smi key and a clamped (saturated) merge', () => {
+    for (const conservative of [true, false]) for (const key of [7, 2 ** 40 + 3, -(2 ** 31) - 1]) {
+        const a = new CountMinSketch(4, 4096, { conservative }), b = new CountMinSketch(4, 4096, { conservative });
+        a.add(key, 2 ** 31 + 3); b.add(key, 2 ** 31 - 7);
+        a.merge(b);
+        assert.equal(a.estimate(key), 2 ** 32 - 4, 'merged sum 2^32-4 key ' + key);
+        assert.equal(a.saturated, false);
+        const F = new Float64Array([key, 1]);
+        a.addFrom(F, 0);
+        assert.equal(a.estimate(key), 2 ** 32 - 3, 'after addFrom key ' + key);
+        const c = new CountMinSketch(4, 4096, { conservative }); c.add(key, 2 ** 31 + 9);
+        a.merge(c);                                     // clamps to 2^32-1
+        assert.equal(a.estimate(key), 2 ** 32 - 1, 'clamped key ' + key);
+        assert.equal(a.saturated, true);
+        assert.equal(a.estimate(key + 1 === key ? 0 : 999331), 0, 'an absent key still estimates 0 after a large estimate');
+    }
+});
+
+test('QA H2.6 (CMS): interleaved add / addFrom / estimate on two instances never cross-talk through _buf', () => {
+    const x = new CountMinSketch(5, 512), y = new CountMinSketch(5, 512, { conservative: false });
+    const xs = new CountMinSketch(5, 512), ys = new CountMinSketch(5, 512, { conservative: false });
+    const F = new Float64Array(2);
+    for (let t = 0; t < 3000; t++) {
+        const kx = (t * 2654435761) % (2 ** 40), ky = -((t * 40503) % (2 ** 35)) - 1;
+        const cx = 1 + (t & 7), cy = 2 ** 30 + (t & 3);
+        if (t & 1) x.add(kx, cx); else { F[0] = kx; F[1] = cx; x.addFrom(F, 0); }
+        const ey = y.estimate(ky);                      // writes y._buf[1] between x's ops
+        F[0] = ky; F[1] = cy; y.addFrom(F, 0);
+        const ex = x.estimate(kx);
+        assert.equal(ey, ys.estimate(ky), 't ' + t + ' y.estimate (before its add)');
+        xs.add(kx, cx); ys.add(ky, cy);
+        assert.equal(ex, xs.estimate(kx), 't ' + t + ' x.estimate');
+        assert.equal(y.estimate(ky), ys.estimate(ky), 't ' + t + ' y.estimate (after its add)');
+        if ((t & 1) === 0) x.add(kx);                   // default count 1 after an estimate left _buf[1] = min
+        if ((t & 1) === 0) xs.add(kx);
+    }
+    qa26Same(xs, x, 'x vs solo'); qa26Same(ys, y, 'y vs solo');
+});
+
+test('QA H2.6 (CMS): a Proxy that RE-ENTERS the same sketch while a slot is read still adds the caller (key, count)', () => {
+    for (const slot of ['0', '1']) {
+        const a = new CountMinSketch(4, 1024), b = new CountMinSketch(4, 1024);
+        a.add(424242, 2); a.add(2 ** 33 + 1, 5);
+        let fired = false;
+        const px = new Proxy(new Float64Array([2 ** 33 + 1, 5]), {
+            get(t, k) { if (k === slot && !fired) { fired = true; b.add(424242, 2); } return t[k]; },
+        });
+        b.addFrom(px, 0);
+        assert.ok(fired);
+        qa26Same(a, b, 're-entry on slot ' + slot);
+        assert.equal(b.estimate(2 ** 33 + 1), a.estimate(2 ** 33 + 1));
+    }
+});
+
+test('QA H2.6 (CMS): addHashedFrom at the end of the buffer (N-3 ok; N-2 / N-1 / N / -0) and the Int32Array count cap 2^31-1', () => {
+    for (const Ctor of [Uint32Array, Int32Array]) {
+        const U = new Ctor(7);
+        U[4] = 0x9e3779b1 | 0; U[5] = 0x7f4a7c15; U[6] = 2 ** 31 - 1;
+        const a = new CountMinSketch(4, 256), b = new CountMinSketch(4, 256);
+        a.addHashed(0x9e3779b1, 0x7f4a7c15, 2 ** 31 - 1);
+        b.addHashedFrom(U, U.length - 3);
+        qa26Same(a, b, Ctor.name + ' N-3 count 2^31-1');
+        const c = new CountMinSketch(4, 256); U[0] = U[4]; U[1] = U[5]; U[2] = U[6]; c.addHashedFrom(U, -0);
+        qa26Same(a, c, Ctor.name + ' i = -0');
+        const before = cmsSnap(b);
+        for (const i of [U.length - 2, U.length - 1, U.length, U.length + 1, -1, NaN, null, undefined])
+            assert.match(qa26Err(() => b.addHashedFrom(U, i)), /^TypeError: \[lite-sketch\] CountMinSketch\.addHashedFrom/, Ctor.name + ' i ' + String(i));
+        for (const len of [0, 1, 2])
+            assert.match(qa26Err(() => b.addHashedFrom(new Ctor(len), 0)), /^TypeError: \[lite-sketch\] CountMinSketch\.addHashedFrom/, Ctor.name + ' length ' + len);
+        cmsUnchanged(before, b, Ctor.name + ' bad index');
+        const V = new Ctor(9).subarray(6); V[0] = U[4]; V[1] = U[5]; V[2] = U[6];
+        const d = new CountMinSketch(4, 256); d.addHashedFrom(V, 0);
+        qa26Same(a, d, Ctor.name + ' subarray view');
+    }
+    // Int32Array: count -1 (= 0xffffffff as uint32) and 0 are _badCount, never reinterpreted.
+    const e = new CountMinSketch(4, 256); e.add(1, 1);
+    const before = cmsSnap(e);
+    for (const cn of [-1, 0, -(2 ** 31)]) {
+        const I = new Int32Array([5, 6, cn]);
+        assert.match(qa26Err(() => e.addHashedFrom(I, 0)), /^RangeError: \[lite-sketch\] CountMinSketch count/, 'Int32 count ' + cn);
+    }
+    const U0 = new Uint32Array([5, 6, 0]);
+    assert.match(qa26Err(() => e.addHashedFrom(U0, 0)), /^RangeError: /, 'Uint32 count 0');
+    cmsUnchanged(before, e, 'bad hashed counts');
+    // Uint32Array count 2^32-1 is legal (== addHashed); a second one saturates.
+    const f = new CountMinSketch(4, 256), g = new CountMinSketch(4, 256, { conservative: true });
+    const UM = new Uint32Array([1, 2, 2 ** 32 - 1]);
+    f.addHashedFrom(UM, 0); g.addHashed(1, 2, 2 ** 32 - 1);
+    qa26Same(g, f, 'count 2^32-1');
+    assert.equal(f.estimateHashed(1, 2), 2 ** 32 - 1);
+});

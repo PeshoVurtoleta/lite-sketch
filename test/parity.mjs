@@ -617,7 +617,137 @@ try {
         Object.keys(f12checks).map((k) => k + '=' + (f12checks[k] ? 'yes' : 'NO')).join(' ') +
         ' | ' + (f12Fail === '' ? 'ok' : 'FAIL ' + f12Fail));
 
-    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '' && h25Ok;
+    // ---- H2.6 F5/F6 identity: addFrom / addHashedFrom vs the ref's add / addHashed ----------
+    // The tree's zero-box entry points must build bit-identical state to the ref's add / addHashed
+    // over the same stream (F5 moves the value off the argument boundary; it changes NO behavior).
+    // Ref-aware: the key domain is MIXED-SIGN when the ref carries F12 (else NON-NEGATIVE, since a
+    // pre-F12 ref hashes negatives differently -- the F12 DOC-DIFF's job, not this section's).
+    // Error identity runs only when the ref throws TAGGED on add(Object.create(null)) (post-F20);
+    // otherwise it prints SKIP. When the ref ALSO exposes addFrom (not the default HEAD), the tree's
+    // addFrom is compared against the ref's addFrom too. A tree-side per-op _mapOcc population
+    // watchdog (an array walk that cannot spin) guards the SS lanes.
+    let h26Fail = '';
+    let h26Checks = 0;
+    const refHasAddFrom = typeof B.HyperLogLog.prototype.addFrom === 'function';
+    const h26key = (i) => {
+        let base;
+        switch (i % 7) {
+            case 0: base = (i * 2654435761) % 1000; break;              // small
+            case 1: base = 2 ** 31 + (i % 1000000); break;              // b31
+            case 2: base = 4294967295 - (i % 65536); break;             // u32
+            case 3: base = 4294967296; break;                           // exactly 2^32
+            case 4: base = 2 ** 40 + i * 104729; break;                 // > 2^32
+            case 5: base = 9007199254740000 + (i % 900); break;         // near MAX_SAFE
+            default: base = 9007199254740991;                           // 2^53-1
+        }
+        return (h25RefHasF12 && (i & 1)) ? -base : base;
+    };
+    const h26cnt = (i) => [1, 2 ** 30, 2 ** 31 + (i & 7), 2 ** 32 - 1][i & 3];
+
+    // HLL: tree add + tree addFrom vs ref add; addHashedFrom (U32 + I32, idempotent max) vs ref addHashed.
+    for (const p of [4, 12, 18]) {
+        if (h26Fail) break;
+        const tAdd = new A.HyperLogLog(p, 7), tFrom = new A.HyperLogLog(p, 7), rAdd = new B.HyperLogLog(p, 7);
+        const F = new Float64Array(2);
+        for (let i = 0; i < 40000; i++) { const k = h26key(i); tAdd.add(k); rAdd.add(k); F[0] = k; tFrom.addFrom(F, 0); h26Checks += 2; }
+        for (let j = 0; j < rAdd._reg.length && !h26Fail; j++) {
+            if (tAdd._reg[j] !== rAdd._reg[j]) h26Fail = 'hll p' + p + ' add reg[' + j + ']';
+            else if (tFrom._reg[j] !== rAdd._reg[j]) h26Fail = 'hll p' + p + ' addFrom reg[' + j + ']';
+        }
+        const tHF = new A.HyperLogLog(p, 7), rH = new B.HyperLogLog(p, 7), U = new Uint32Array(2), I = new Int32Array(2);
+        for (let i = 0; i < 20000; i++) { const hi = (i * 2654435761) >>> 0, lo = (i * 40503) >>> 0; rH.addHashed(hi, lo); U[0] = hi; U[1] = lo; tHF.addHashedFrom(U, 0); I[0] = hi; I[1] = lo; tHF.addHashedFrom(I, 0); h26Checks++; }
+        for (let j = 0; j < rH._reg.length && !h26Fail; j++) if (tHF._reg[j] !== rH._reg[j]) h26Fail = 'hll p' + p + ' addHashedFrom reg[' + j + ']';
+    }
+
+    // CMS: tree add + addFrom + estimate (D3) vs ref; addHashedFrom (U32 small + I32 small) vs ref addHashed.
+    for (const [d, w] of [[4, 1024], [7, 64]]) for (const conservative of [true, false]) {
+        if (h26Fail) break;
+        const tAdd = new A.CountMinSketch(d, w, { conservative, seed: 7 });
+        const tFrom = new A.CountMinSketch(d, w, { conservative, seed: 7 });
+        const rAdd = new B.CountMinSketch(d, w, { conservative, seed: 7 });
+        const F = new Float64Array(2);
+        for (let i = 0; i < 20000 && !h26Fail; i++) {
+            const k = h26key(i), c = h26cnt(i);
+            tAdd.add(k, c); rAdd.add(k, c); F[0] = k; F[1] = c; tFrom.addFrom(F, 0);
+            h26Checks += 3;
+            if (tAdd.estimate(k) !== rAdd.estimate(k)) h26Fail = 'cms ' + d + 'x' + w + ' estimate@' + i;
+            else if (tFrom.estimate(k) !== rAdd.estimate(k)) h26Fail = 'cms ' + d + 'x' + w + ' addFrom-estimate@' + i;
+        }
+        for (let j = 0; j < rAdd._counts.length && !h26Fail; j++) {
+            if (tAdd._counts[j] !== rAdd._counts[j]) h26Fail = 'cms ' + d + 'x' + w + ' add counts[' + j + ']';
+            else if (tFrom._counts[j] !== rAdd._counts[j]) h26Fail = 'cms ' + d + 'x' + w + ' addFrom counts[' + j + ']';
+        }
+        if (!h26Fail && (tAdd.total !== rAdd.total || tFrom.total !== rAdd.total || tAdd.saturated !== rAdd.saturated)) h26Fail = 'cms ' + d + 'x' + w + ' total/saturated';
+        const tHF = new A.CountMinSketch(d, w, { conservative, seed: 7 }), rH = new B.CountMinSketch(d, w, { conservative, seed: 7 });
+        const U = new Uint32Array(3), I = new Int32Array(3);
+        for (let i = 0; i < 8000 && !h26Fail; i++) {
+            const hi = (i * 2654435761) >>> 0, lo = (i * 40503) >>> 0, c = 1 + (i & 7);
+            rH.addHashed(hi, lo, c); rH.addHashed(hi, lo, c);               // U32 then I32 both add once each -> twice
+            U[0] = hi; U[1] = lo; U[2] = c; tHF.addHashedFrom(U, 0);
+            I[0] = hi | 0; I[1] = lo | 0; I[2] = c; tHF.addHashedFrom(I, 0);
+            h26Checks++;
+        }
+        for (let j = 0; j < rH._counts.length && !h26Fail; j++) if (tHF._counts[j] !== rH._counts[j]) h26Fail = 'cms ' + d + 'x' + w + ' addHashedFrom counts[' + j + ']';
+    }
+
+    // SS: FULL-POOL identity for tree add and tree addFrom vs ref add (ssFullEq is defined above).
+    const h26Pool = []; for (let i = 0; i < 400; i++) h26Pool.push(h26key(i));
+    for (const cap of [1, 7, 64, 1000]) {
+        if (h26Fail) break;
+        const tAdd = new A.SpaceSaving(cap, { seed: 5 }), tFrom = new A.SpaceSaving(cap, { seed: 5 }), rAdd = new B.SpaceSaving(cap, { seed: 5 });
+        const F = new Float64Array(2);
+        for (let i = 0; i < 20000 && !h26Fail; i++) {
+            const k = h26Pool[i % h26Pool.length], c = h26cnt(i);
+            tAdd.add(k, c); rAdd.add(k, c); F[0] = k; F[1] = c; tFrom.addFrom(F, 0);
+            h26Checks += 2;
+            if (popOcc(tFrom) !== tFrom.size) h26Fail = 'ss cap ' + cap + ' addFrom WATCHDOG pop!=size@' + i;
+            else if (popOcc(tAdd) !== tAdd.size) h26Fail = 'ss cap ' + cap + ' add WATCHDOG pop!=size@' + i;
+        }
+        if (!h26Fail) h26Fail = ssFullEq(tAdd, rAdd, 'ss cap ' + cap + ' add');
+        if (!h26Fail) h26Fail = ssFullEq(tFrom, rAdd, 'ss cap ' + cap + ' addFrom');
+    }
+
+    // When the ref also has addFrom (DDSketch always; HLL/CMS/SS only post-H2.6), cross-check the
+    // tree's addFrom against the ref's addFrom over a short stream.
+    if (!h26Fail && refHasAddFrom) {
+        const tf = new A.HyperLogLog(12, 7), rf = new B.HyperLogLog(12, 7), F = new Float64Array(1);
+        for (let i = 0; i < 20000; i++) { F[0] = h26key(i); tf.addFrom(F, 0); rf.addFrom(F, 0); h26Checks++; }
+        for (let j = 0; j < tf._reg.length && !h26Fail; j++) if (tf._reg[j] !== rf._reg[j]) h26Fail = 'hll addFrom vs ref addFrom reg[' + j + ']';
+    }
+
+    // Error identity: tree addFrom rejects must equal the ref's add rejects (class + message) and
+    // leave a byte-identical no-op. Only when the ref throws TAGGED on add(Object.create(null)).
+    const refTagged = (() => { try { new B.HyperLogLog(4).add(Object.create(null)); return false; } catch (e) { return /^\[lite-sketch]/.test(e.message); } })();
+    let h26ErrMode = refTagged ? 'run' : 'SKIP(ref pre-F20 untagged)';
+    let h26ErrChecks = 0;
+    if (refTagged) {
+        const F = new Float64Array(2);
+        const badKeys = [1.5, 2 ** 53, -(2 ** 53), Infinity, -Infinity, NaN];
+        const badCounts = [0, 2 ** 32, 1.5, -1, NaN];
+        // HLL: key rejects.
+        { const t = new A.HyperLogLog(8, 7), r = new B.HyperLogLog(8, 7);
+          for (const v of badKeys) { F[0] = v; const m1 = msgOf(() => t.addFrom(F, 0)), m2 = msgOf(() => r.add(v)); h26ErrChecks++; if (m1 !== m2 && !h26Fail) h26Fail = 'hll addFrom err "' + m1 + '" != ref add "' + m2 + '"'; }
+          if (!h26Fail && t.count() !== r.count()) h26Fail = 'hll err-path mutated state'; }
+        // CMS + SS: (key, count) rejects.
+        for (const member of ['CountMinSketch', 'SpaceSaving']) {
+            if (h26Fail) break;
+            const t = member === 'CountMinSketch' ? new A.CountMinSketch(4, 64, { seed: 7 }) : new A.SpaceSaving(8, { seed: 7 });
+            const r = member === 'CountMinSketch' ? new B.CountMinSketch(4, 64, { seed: 7 }) : new B.SpaceSaving(8, { seed: 7 });
+            const cases = [];
+            for (const v of badKeys) cases.push([v, 1]);
+            for (const c of badCounts) cases.push([5, c]);
+            for (const [k, c] of cases) { F[0] = k; F[1] = c; const m1 = msgOf(() => t.addFrom(F, 0)), m2 = msgOf(() => r.add(k, c)); h26ErrChecks++; if (m1 !== m2 && !h26Fail) h26Fail = member + ' addFrom err "' + m1 + '" != ref add "' + m2 + '"'; }
+        }
+        h26Checks += h26ErrChecks;
+    }
+
+    const h26Ok = h26Fail === '';
+    console.log('PARITY H2.6 F5/F6 identity vs ' + ref + ': HLL/CMS/SS add+addFrom+addHashedFrom (keys=' +
+        (h25RefHasF12 ? 'mixed-sign' : 'non-negative') + '; ref-addFrom=' + (refHasAddFrom ? 'yes' : 'no') +
+        '; err-identity=' + h26ErrMode + '/' + h26ErrChecks + ') checks=' + h26Checks +
+        ' diffs=' + (h26Fail || 'identical') + ' | ' + (h26Ok ? 'ok' : 'FAIL'));
+
+    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '' && h25Ok && h26Ok;
     if (!ok) process.exitCode = 1;
 } finally {
     rmSync(dir, { recursive: true, force: true });

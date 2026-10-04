@@ -58,6 +58,22 @@ relative error, and GATES it against theory: RMS relative error `<= ~1.5 *
 O(distinct) while HLL stays a fixed `m` bytes. MEASURED vs THEORETICAL are printed
 side by side (the lite-filter table shape).
 
+## H2.6 amendment (2026-10-04) -- the addFrom family + the F2 hand-inline (F5, F6)
+
+Bit-identical output (the `_reg[]` registers and `count()` match b4e378f over the N9 parity sweep).
+
+1. **`add` is now a typeof wrapper + `_addAt`.** `add(key)` rejects a non-number via `_badKey`, writes
+   `key` into a per-instance `_buf = Float64Array(1)` (a ctor scratch), and calls `_addAt(_buf, 0)`.
+   The wrapper is ~44 bytes, so V8 inlines it into the caller and the key lands in `_buf` UNBOXED.
+   `_addAt(buf, i)` holds the numeric guards (the two-compare safe-range check), the murmur HAND-
+   INLINED into int32 locals (F2; identical bits to `_m3round` / `_m3final`), and the register update.
+   It is > 460 bytes and never inlined -- which is fine, since its arguments are `(object, Smi)`.
+2. **`addFrom(buf, i)`** reads `key = buf[i]` from a caller-owned `Float64Array` (same validation /
+   throws / byte-identical no-op as `add`, with a cold `_badBuf` on a bad buffer / index) -- the zero-
+   box entry for a key `>= 2^31`. **`addHashedFrom(buf, i)`** reads `hi = buf[i] | 0`, `lo = buf[i+1]
+   | 0` from a `Uint32Array` / `Int32Array` (needs `i+1` in bounds; cold `_badHashBuf`). `addHashed` is
+   byte-identical. The class jsdoc now names both siblings.
+
 ## Non-goals
 
 No sparse representation (deferred); no crypto hashing; no serialization format in

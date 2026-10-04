@@ -1259,3 +1259,258 @@ test('QA H2.5 (SS _homeAt/_probeAt over the MAP pool, NEW-CODE ONLY): for every 
         }
     }
 });
+
+// ===========================================================================
+// H2.6 F5 + D1 -- addFrom (the zero-box entry point). Every add / addFrom below
+// runs through the per-op _mapOcc population WATCHDOG (h26Watch): a hash-
+// corrupting mis-port leaks a map entry and FAILs here, long before the load-0.5
+// table can spin a probe loop. D1: addFrom snapshots buf[i], buf[i+1] into _buf,
+// so a Proxy / shared view that changes value between reads cannot split a key
+// from its home. (qa25Pool / qa25Check / qa25Live are defined above.)
+// ===========================================================================
+function h26Watch(s, where) {
+    let n = 0;
+    for (let j = 0; j < s._mapOcc.length; j++) n += s._mapOcc[j];
+    assert.equal(n, s.size, 'watchdog: _mapOcc population ' + n + ' != size ' + s.size + ' after ' + where);
+}
+
+test('H2.6 (SS): add and addFrom build byte-identical pools over mixed-sign keys incl +-(2^53-1) and -0', () => {
+    const keys = [0, -0, 1, -1, 7, 2 ** 30, 2 ** 31, -(2 ** 31), 2 ** 32 - 1, 2 ** 32 + 7, -(2 ** 32 + 7), 2 ** 53 - 1, -(2 ** 53 - 1)];
+    for (const cap of [1, 7, 64]) {
+        const a = new SpaceSaving(cap), b = new SpaceSaving(cap);
+        const F = new Float64Array(3);
+        let t = 0;
+        for (let pass = 0; pass < 3; pass++) for (const k of keys) {   // passes force bumps + evictions
+            const cn = (t++ & 1) ? 2 ** 30 + (t & 7) : 1 + (t & 3);
+            a.add(k, cn); h26Watch(a, 'cap ' + cap + ' a.add');
+            F[1] = k; F[2] = cn; b.addFrom(F, 1); h26Watch(b, 'cap ' + cap + ' b.addFrom');
+        }
+        assert.deepEqual(qa25Pool(b), qa25Pool(a), 'cap ' + cap + ': addFrom pool != add pool');
+    }
+});
+
+test('H2.6 (SS): addFrom rejects a bad buffer / index (needs i and i+1 in range), byte-identical no-op', () => {
+    const s = new SpaceSaving(8); s.add(5, 3); h26Watch(s, 'seed');
+    const before = qa25Pool(s);
+    const F = new Float64Array(2);
+    for (const bad of [new Float32Array(2), new Int32Array(2), [1, 2], new DataView(new ArrayBuffer(16)), null, undefined, {}])
+        assert.throws(() => s.addFrom(bad, 0), (e) => e instanceof TypeError && /\[lite-sketch\] SpaceSaving\.addFrom/.test(e.message), 'buf ' + String(bad));
+    for (const i of [0.5, -1, NaN, Infinity, 1, 2])   // length 2 -> only i = 0 keeps i+1 in bounds
+        assert.throws(() => s.addFrom(F, i), (e) => e instanceof TypeError && /SpaceSaving\.addFrom/.test(e.message), 'i ' + i);
+    assert.deepEqual(qa25Pool(s), before, 'a bad addFrom mutated state');
+});
+
+test('H2.6 (SS): a key or count addFrom would reject throws add\'s exact error, byte-identical no-op', () => {
+    const s = new SpaceSaving(8); s.add(9, 2); h26Watch(s, 'seed');
+    const F = new Float64Array(2);
+    for (const [k, cn] of [[1.5, 1], [2 ** 53, 1], [Infinity, 1], [NaN, 1], [1, 0], [1, 2 ** 32], [5, 1.5], [5, -1]]) {
+        const before = qa25Pool(s);
+        F[0] = k; F[1] = cn;
+        let eAdd = null, eFrom = null;
+        try { s.add(k, cn); } catch (e) { eAdd = e; }
+        try { s.addFrom(F, 0); } catch (e) { eFrom = e; }
+        assert.ok(eFrom, 'addFrom(' + k + ',' + cn + ') did not throw');
+        assert.equal(eFrom.constructor, eAdd.constructor, k + ',' + cn + ' class');
+        assert.equal(eFrom.message, eAdd.message, k + ',' + cn + ' message');
+        assert.deepEqual(qa25Pool(s), before, 'reject ' + k + ',' + cn + ' mutated state');
+    }
+});
+
+test('H2.6 (SS, D1 TEETH): addFrom with a Proxy whose get FLIPS the key between reads stays map-consistent on evict', () => {
+    const s = new SpaceSaving(4);
+    for (let k = 1; k <= 4; k++) { s.add(k * 1000, 1); h26Watch(s, 'fill ' + k); }   // full, distinct keys
+    // A Proxy over a Float64Array (passes instanceof): slot 0 (the key) returns 5000 on the FIRST
+    // read and 6000 after; slot 1 is the count. With D1 the key is snapshotted once, so _addAt's
+    // guard / _homeAt / _probeAt all see 5000 and the map stays self-consistent. With D1 reverted,
+    // _addAt re-reads slot 0 and splits the stored key (5000) from its home (6000) -> a violation.
+    let reads = 0;
+    const target = new Float64Array([5000, 1]);
+    const px = new Proxy(target, { get(t, k) { return k === '0' ? (reads++ === 0 ? 5000 : 6000) : t[k]; } });
+    s.addFrom(px, 0);
+    h26Watch(s, 'proxy addFrom');   // D1 teeth: a leaked map entry trips here
+    assert.equal(qa25Check(s), '', 'D1: a flipping Proxy violated the map/forest invariant');
+    for (let sl = 0; sl < s.size; sl++) {
+        const key = s._key[sl];
+        const idx = s._probe(key, s._hash(key));
+        assert.equal(s._mapSlot[idx], sl, 'D1: slot ' + sl + ' (key ' + key + ') not found by _probe(key, _hash(key))');
+    }
+});
+
+test('H2.6 (SS): _buf is per instance -- interleaved addFrom instances equal solo twins', () => {
+    const x = new SpaceSaving(64), y = new SpaceSaving(64), xs = new SpaceSaving(64), ys = new SpaceSaving(64);
+    const F = new Float64Array(2);
+    for (let k = 0; k < 3000; k++) {
+        F[0] = (k * 2654435761) % (2 ** 40); F[1] = 1 + (k & 7);
+        x.addFrom(F, 0); h26Watch(x, 'x'); xs.addFrom(F, 0); h26Watch(xs, 'xs');
+        F[0] = -((k * 40503) % (2 ** 35)); F[1] = 2 ** 30 + (k & 3);
+        y.addFrom(F, 0); h26Watch(y, 'y'); ys.addFrom(F, 0); h26Watch(ys, 'ys');
+    }
+    assert.deepEqual(qa25Live(x), qa25Live(xs), 'interleaved x != solo');
+    assert.deepEqual(qa25Live(y), qa25Live(ys), 'interleaved y != solo');
+});
+
+// ===========================================================================
+// H2.6 TEETH -- exact HEAD (key,count) error literals (kills a count-first _badArgs
+// mutant). add / addFrom run through the per-op _mapOcc watchdog above (h26Watch).
+// ===========================================================================
+test('H2.6 (SS TEETH): add / addFrom pin HEAD\'s exact (key,count) error class + message (kills a count-first _badArgs)', () => {
+    const sym = Symbol('z');
+    const LITS = [
+        [NaN, 'x', 'TypeError', '[lite-sketch] SpaceSaving.add key must be a safe integer, got NaN'],
+        ['1', NaN, 'TypeError', '[lite-sketch] SpaceSaving.add key must be a safe integer, got 1'],
+        [1, '2', 'RangeError', '[lite-sketch] SpaceSaving count must be an integer in [1, 4294967295], got 2'],
+        [1.5, sym, 'TypeError', '[lite-sketch] SpaceSaving.add key must be a safe integer, got 1.5'],
+        [1, 2 ** 32, 'RangeError', '[lite-sketch] SpaceSaving count must be an integer in [1, 4294967295], got 4294967296'],
+        [1, null, 'RangeError', '[lite-sketch] SpaceSaving count must be an integer in [1, 4294967295], got null'],
+    ];
+    const s = new SpaceSaving(8); s.add(3, 2); h26Watch(s, 'seed');
+    const before = qa25Pool(s);
+    const F = new Float64Array(2);
+    for (const [k, cn, cls, msg] of LITS) {
+        assert.throws(() => s.add(k, cn), (e) => e.constructor.name === cls && e.message === msg, 'add(' + String(k) + ',' + String(cn) + ')');
+        if (typeof k === 'number' && typeof cn === 'number') { F[0] = k; F[1] = cn; assert.throws(() => s.addFrom(F, 0), (e) => e.constructor.name === cls && e.message === msg, 'addFrom(' + String(k) + ',' + String(cn) + ')'); }
+    }
+    assert.deepEqual(qa25Pool(s), before, 'teeth rejects mutated state');
+});
+
+// ===========================================================================
+// QA H2.6 -- boundary matrix for addFrom / estimate / errorOf (SS). Every add /
+// addFrom goes through the per-op _mapOcc watchdog (qa26Add / qa26From wrap
+// h26Watch). Index 0 / 1 / N-2 / N-1 / N / N+1 / -0 / empty / null / undefined /
+// NaN; byteOffset / SharedArrayBuffer / detached / shrunk views; the key x count
+// matrix through addFrom == add; estimate / errorOf on an evicted key; forEach
+// with an evicting addFrom inside the callback; duplicate clear(); interleaved
+// instances; a Proxy that re-enters the same sketch while slot i is read.
+// ===========================================================================
+const qa26Err = (fn) => { try { fn(); return null; } catch (e) { return e.constructor.name + ': ' + e.message; } };
+function qa26Add(s, k, c, where) { try { return s.add(k, c); } finally { h26Watch(s, where || 'add(' + k + ',' + c + ')'); } }
+function qa26From(s, F, i, where) { try { return s.addFrom(F, i); } finally { h26Watch(s, where || 'addFrom(' + F[i] + ',' + F[i + 1] + ')'); } }
+
+test('QA H2.6 (SS): addFrom index matrix 0 / 1 / N-2 accepted == add; N-1 / N / N+1 / empty / -1 / NaN / null / undefined rejected tagged, no-op', () => {
+    const F = new Float64Array([2 ** 40 + 1, 3, 2 ** 31 + 7, 2 ** 31, 9]);
+    const N = F.length;
+    for (const i of [0, 1, N - 2, -0]) {
+        const a = new SpaceSaving(4), b = new SpaceSaving(4);
+        qa26Add(a, F[i], F[i + 1]); qa26From(b, F, i);
+        assert.deepEqual(qa25Pool(b), qa25Pool(a), 'i ' + i);
+    }
+    const s = new SpaceSaving(4); qa26Add(s, 17, 4);
+    const before = qa25Pool(s);
+    for (const i of [N - 1, N, N + 1, -1, NaN, null, undefined, '0', 0.5, Infinity])
+        assert.match(qa26Err(() => qa26From(s, F, i, 'i ' + String(i))), /^TypeError: \[lite-sketch\] SpaceSaving\.addFrom\(buf, i\)/, 'i ' + String(i));
+    for (const len of [0, 1])
+        assert.match(qa26Err(() => qa26From(s, new Float64Array(len), 0, 'len ' + len)), /^TypeError: \[lite-sketch\] SpaceSaving\.addFrom/, 'length ' + len);
+    assert.deepEqual(qa25Pool(s), before, 'rejected index mutated state');
+});
+
+test('QA H2.6 (SS): addFrom over a byteOffset view and a SharedArrayBuffer view == add; detached / shrunk buffers reject, no-op', () => {
+    const base = new Float64Array([0, 0, 0, -(2 ** 33) - 9, 2 ** 31 + 1]);
+    const view = base.subarray(3);
+    assert.equal(view.byteOffset, 24);
+    const S = new Float64Array(new SharedArrayBuffer(16)); S[0] = -(2 ** 33) - 9; S[1] = 2 ** 31 + 1;
+    const a = new SpaceSaving(2), b = new SpaceSaving(2), c = new SpaceSaving(2);
+    qa26Add(a, -(2 ** 33) - 9, 2 ** 31 + 1); qa26From(b, view, view.length - 2); qa26From(c, S, 0);
+    assert.deepEqual(qa25Pool(b), qa25Pool(a), 'view'); assert.deepEqual(qa25Pool(c), qa25Pool(a), 'SAB');
+    assert.equal(b.estimate(-(2 ** 33) - 9), 2 ** 31 + 1);
+    const before = qa25Pool(a);
+    const D = new Float64Array([1, 1]); structuredClone(D.buffer, { transfer: [D.buffer] });
+    assert.match(qa26Err(() => qa26From(a, D, 0, 'detached')), /^TypeError: \[lite-sketch\] SpaceSaving\.addFrom/, 'detached');
+    const rab = new ArrayBuffer(32, { maxByteLength: 32 }); const R = new Float64Array(rab); R[2] = 5; R[3] = 1;
+    rab.resize(24);
+    assert.match(qa26Err(() => qa26From(a, R, 2, 'shrunk')), /^TypeError: \[lite-sketch\] SpaceSaving\.addFrom/, 'shrunk');
+    assert.deepEqual(qa25Pool(a), before, 'detached / shrunk mutated state');
+});
+
+test('QA H2.6 (SS): addFrom key x count matrix == add (error class + message, or full pool), incl -0, +-(2^53-1), 2^53, NaN, counts 0 / 2^32-1 / 2^32 / 1.5', () => {
+    const KEYS = [0, -0, 1, 2 ** 53 - 1, -(2 ** 53 - 1), 2 ** 53, -(2 ** 53), NaN, Infinity, 1.5, 2 ** 31];
+    const COUNTS = [0, 1, 2 ** 31 - 1, 2 ** 31, 2 ** 32 - 1, 2 ** 32, 1.5, NaN, -1, -0, Infinity];
+    const F = new Float64Array(2);
+    for (const k of KEYS) for (const cn of COUNTS) {
+        const a = new SpaceSaving(2), b = new SpaceSaving(2);
+        qa26Add(a, 3, 2); qa26Add(a, 4, 1); qa26Add(b, 3, 2); qa26Add(b, 4, 1);   // full: an accepted add evicts
+        const ea = qa26Err(() => qa26Add(a, k, cn));
+        F[0] = k; F[1] = cn;
+        const eb = qa26Err(() => qa26From(b, F, 0));
+        const lab = '(' + k + ', ' + cn + ')';
+        assert.equal(eb, ea, lab + ': addFrom outcome != add');
+        assert.deepEqual(qa25Pool(b), qa25Pool(a), lab + ': pool');
+        assert.equal(qa25Check(b), '', lab + ': invariant');
+        assert.equal(b.estimate(k), a.estimate(k), lab + ': estimate');
+        assert.equal(b.errorOf(k), a.errorOf(k), lab + ': errorOf');
+    }
+});
+
+test('QA H2.6 (SS): estimate / errorOf on an EVICTED key read 0 / 0 (via _buf + _homeAt), and a re-admitted key carries the min as error', () => {
+    const s = new SpaceSaving(3);
+    const F = new Float64Array(2);
+    for (const [k, c] of [[2 ** 40 + 1, 5], [-(2 ** 33), 7], [11, 9]]) { F[0] = k; F[1] = c; qa26From(s, F, 0); }
+    F[0] = 2 ** 35 + 3; F[1] = 1; qa26From(s, F, 0);           // evicts the min (2^40+1, count 5)
+    assert.equal(s.estimate(2 ** 40 + 1), 0, 'evicted estimate');
+    assert.equal(s.errorOf(2 ** 40 + 1), 0, 'evicted errorOf');
+    assert.equal(s.estimate(2 ** 35 + 3), 6, 'newcomer count = min + count');
+    assert.equal(s.errorOf(2 ** 35 + 3), 5, 'newcomer error = min');
+    F[0] = 2 ** 40 + 1; F[1] = 2 ** 31; qa26From(s, F, 0);     // re-admit: evicts the newcomer (6)
+    assert.equal(s.estimate(2 ** 40 + 1), 2 ** 31 + 6);
+    assert.equal(s.errorOf(2 ** 40 + 1), 6);
+    assert.equal(s.estimate(2 ** 35 + 3), 0); assert.equal(s.errorOf(2 ** 35 + 3), 0);
+    assert.equal(qa25Check(s), '');
+    for (const k of [NaN, Infinity, -Infinity, 1.5, 2 ** 53, -0]) { assert.equal(s.estimate(k), 0, 'est ' + k); assert.equal(s.errorOf(k), 0, 'err ' + k); }
+});
+
+test('QA H2.6 (SS): forEach with an EVICTING addFrom inside the callback, then duplicate clear(), stays consistent', () => {
+    const s = new SpaceSaving(8), t = new SpaceSaving(8);
+    for (let k = 0; k < 8; k++) { qa26Add(s, 2 ** 32 + k, 1 + k); qa26Add(t, 2 ** 32 + k, 1 + k); }
+    const F = new Float64Array(2);
+    let visits = 0, n = 100;
+    s.forEach(() => { visits++; F[0] = -(2 ** 34) - n; F[1] = 1; n++; qa26From(s, F, 0, 'forEach addFrom'); });
+    assert.equal(visits, 8, 'forEach visits size-at-entry entries');
+    for (let m = 100; m < n; m++) qa26Add(t, -(2 ** 34) - m, 1, 'twin');
+    assert.deepEqual(qa25Live(s), qa25Live(t), 'a mid-iteration addFrom != the same adds after iteration');
+    assert.equal(qa25Check(s), '');
+    s.clear(); s.clear();
+    assert.equal(s.size, 0); assert.equal(s.total, 0);
+    const u = new SpaceSaving(8);
+    F[0] = 2 ** 45 + 1; F[1] = 2 ** 31; qa26From(s, F, 0, 'after double clear'); qa26Add(u, 2 ** 45 + 1, 2 ** 31);
+    assert.deepEqual(qa25Live(s), qa25Live(u), 'after a duplicate clear');
+});
+
+test('QA H2.6 (SS): interleaved add / addFrom / estimate / errorOf on two instances never cross-talk through _buf', () => {
+    const x = new SpaceSaving(32), y = new SpaceSaving(32), xs = new SpaceSaving(32), ys = new SpaceSaving(32);
+    const F = new Float64Array(2);
+    for (let t = 0; t < 2000; t++) {
+        const kx = (t * 2654435761) % (2 ** 40), ky = -((t * 40503) % 997) - 2 ** 33, cx = 1 + (t & 7), cy = 2 ** 30 + (t & 3);
+        if (t & 1) qa26Add(x, kx, cx, 'x'); else { F[0] = kx; F[1] = cx; qa26From(x, F, 0, 'x'); }
+        const ey = y.estimate(ky), ry = y.errorOf(ky);
+        assert.equal(ey, ys.estimate(ky), 't ' + t + ' y.estimate'); assert.equal(ry, ys.errorOf(ky), 't ' + t + ' y.errorOf');
+        F[0] = ky; F[1] = cy; qa26From(y, F, 0, 'y');
+        assert.equal(x.estimate(kx), (qa26Add(xs, kx, cx, 'xs'), xs.estimate(kx)), 't ' + t + ' x.estimate');
+        qa26Add(ys, ky, cy, 'ys');
+    }
+    assert.deepEqual(qa25Live(x), qa25Live(xs)); assert.deepEqual(qa25Live(y), qa25Live(ys));
+});
+
+test('QA H2.6 (SS): a Proxy that re-enters the same sketch while slot i (the key) is read still adds the caller (key, count)', () => {
+    const a = new SpaceSaving(8), b = new SpaceSaving(8);
+    qa26Add(a, 999, 2); qa26Add(a, 2 ** 33 + 1, 5);
+    let fired = false;
+    const px = new Proxy(new Float64Array([2 ** 33 + 1, 5]), {
+        get(t, k) { if (k === '0' && !fired) { fired = true; b.add(999, 2); } return t[k]; },
+    });
+    qa26From(b, px, 0, 'proxy');
+    assert.ok(fired);
+    assert.deepEqual(qa25Live(b), qa25Live(a));
+});
+
+test('H2.6 (SS, D1 re-entry): a Proxy that re-enters add() while slot i+1 is read must not overwrite the caller key', () => {
+    // qa finding: reading buf[i+1] through a Proxy that calls b.add(999, 2) re-entrantly used to
+    // clobber _buf[0] mid-copy (est(111)=0, est(999)=7). Reading both slots into locals BEFORE the
+    // _buf stores fixes it: the re-entrant add lands first, then our addFrom lands with key 111.
+    const b = new SpaceSaving(8);
+    let fired = false;
+    const px = new Proxy(new Float64Array([111, 5]), {
+        get(t, k) { if (k === '1' && !fired) { fired = true; b.add(999, 2); } return t[k]; },
+    });
+    b.addFrom(px, 0);
+    h26Watch(b, 'reentry addFrom');   // per-op _mapOcc watchdog
+    assert.deepEqual([b.estimate(111), b.estimate(999), b.total], [5, 2, 7]);
+});

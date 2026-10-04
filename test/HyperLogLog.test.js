@@ -652,3 +652,278 @@ test('QA H2.4 (HLL site consistency, boundary matrix): add(k) == addHashed(mix64
     }
     assert.equal(bad, '', 'add and addHashed(mix64) disagree for: ' + bad);
 });
+
+// ===========================================================================
+// H2.6 F5/F6 -- addFrom / addHashedFrom (the zero-box entry points).
+// addFrom reads buf[i] UNBOXED; addHashedFrom reads two uint32 lanes. Twins vs
+// add / addHashed, tagged rejects with a byte-identical no-op, per-instance _buf.
+// ===========================================================================
+const h26Snap = (s) => Array.from(s._reg);
+const h26Eq = (a, b, m) => assert.deepEqual(Array.from(a._reg), Array.from(b._reg), m);
+
+test('H2.6 (HLL): add and addFrom build byte-identical registers over mixed-sign keys incl +-(2^53-1) and -0', () => {
+    const keys = [0, -0, 1, -1, 7, -7, 2 ** 30, 2 ** 31, -(2 ** 31), 2 ** 32 - 1, 2 ** 32 + 5, -(2 ** 32 + 5), 2 ** 53 - 1, -(2 ** 53 - 1)];
+    for (const seed of [undefined, 42, -3]) {
+        const a = new HyperLogLog(12, seed), b = new HyperLogLog(12, seed);
+        const F = new Float64Array(3);
+        for (const k of keys) { a.add(k); F[1] = k; b.addFrom(F, 1); }
+        h26Eq(a, b, 'seed ' + seed + ': addFrom twin != add');
+    }
+});
+
+test('H2.6 (HLL): addHashedFrom (Uint32Array and Int32Array) equals addHashed (idempotent register max)', () => {
+    const a = new HyperLogLog(12), b = new HyperLogLog(12);
+    const U = new Uint32Array(2), I = new Int32Array(2);
+    for (let t = 0; t < 5000; t++) {
+        const hi = Math.imul(t + 1, 2654435761) >>> 0, lo = Math.imul(t ^ 0x5bd1e995, 40503) >>> 0;
+        a.addHashed(hi, lo);
+        U[0] = hi; U[1] = lo; b.addHashedFrom(U, 0);
+        I[0] = hi; I[1] = lo; b.addHashedFrom(I, 0);   // same 32 bits reinterpreted
+    }
+    h26Eq(a, b, 'addHashedFrom U32/I32 != addHashed');
+});
+
+test('H2.6 (HLL): addFrom rejects a bad buffer / index with a tagged TypeError, byte-identical no-op', () => {
+    const s = new HyperLogLog(10); s.add(123);
+    const before = h26Snap(s);
+    const F = new Float64Array(2);
+    for (const bad of [new Float32Array(2), new Int32Array(2), [1, 2], new DataView(new ArrayBuffer(16)), null, undefined, {}]) {
+        assert.throws(() => s.addFrom(bad, 0),
+            (e) => e instanceof TypeError && /\[lite-sketch\] HyperLogLog\.addFrom/.test(e.message), 'buf ' + String(bad));
+    }
+    for (const i of [0.5, -1, NaN, Infinity, 2]) {   // length 2 -> only i = 0 / 1 are in bounds
+        assert.throws(() => s.addFrom(F, i),
+            (e) => e instanceof TypeError && /HyperLogLog\.addFrom/.test(e.message), 'i ' + i);
+    }
+    assert.deepEqual(h26Snap(s), before, 'a bad addFrom mutated state');
+});
+
+test('H2.6 (HLL): a value addFrom would reject throws add\'s exact error (class + message), byte-identical no-op', () => {
+    const s = new HyperLogLog(10); s.add(5);
+    const before = h26Snap(s);
+    const F = new Float64Array(1);
+    for (const v of [1.5, 2 ** 53, -(2 ** 53), Infinity, -Infinity, NaN]) {
+        F[0] = v;
+        let eAdd = null, eFrom = null;
+        try { s.add(v); } catch (e) { eAdd = e; }
+        try { s.addFrom(F, 0); } catch (e) { eFrom = e; }
+        assert.ok(eFrom, 'addFrom(' + v + ') did not throw');
+        assert.equal(eFrom.constructor, eAdd.constructor, v + ' class');
+        assert.equal(eFrom.message, eAdd.message, v + ' message');
+    }
+    assert.deepEqual(h26Snap(s), before, 'a rejected value mutated state');
+});
+
+test('H2.6 (HLL): addHashedFrom rejects a bad buffer / index (needs i and i+1 in range)', () => {
+    const s = new HyperLogLog(10); const before = h26Snap(s);
+    // QA H2.6: every predicate pins the [lite-sketch] tag -- a bare TypeError also matched HEAD's
+    // "s.addHashedFrom is not a function", so this test passed vacuously on b4e378f.
+    const tagged = (e) => e instanceof TypeError && /^\[lite-sketch\] HyperLogLog\.addHashedFrom\(buf, i\)/.test(e.message);
+    assert.throws(() => s.addHashedFrom(new Float64Array(2), 0), tagged);
+    assert.throws(() => s.addHashedFrom(new Uint32Array(2), 1), tagged);   // i+1 = 2 out of range
+    assert.throws(() => s.addHashedFrom(new Uint32Array(2), -1), tagged);
+    assert.throws(() => s.addHashedFrom(new Uint32Array(2), 0.5), tagged);
+    assert.deepEqual(h26Snap(s), before);
+});
+
+test('H2.6 (HLL): _buf is per instance -- interleaved add instances equal solo twins', () => {
+    const x = new HyperLogLog(12), y = new HyperLogLog(12), xs = new HyperLogLog(12), ys = new HyperLogLog(12);
+    for (let k = 0; k < 3000; k++) {
+        const a = (k * 2654435761) % (2 ** 40), b = -((k * 40503) % (2 ** 35));
+        x.add(a); y.add(b); xs.add(a); ys.add(b);   // x / y interleave; xs / ys are solo
+    }
+    h26Eq(x, xs, 'interleaved x != solo'); h26Eq(y, ys, 'interleaved y != solo');
+});
+
+// ===========================================================================
+// H2.6 TEETH -- exact HEAD error literals (not just add==addFrom equivalence, which
+// a both-sides mutant survives) + addHashedFrom fail-closed on a non-int32 lane.
+// ===========================================================================
+test('H2.6 (HLL TEETH): add / addFrom pin HEAD\'s exact bad-key error class + message', () => {
+    const LITS = [
+        [NaN, 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got NaN'],
+        ['1', 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got 1'],
+        [1.5, 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got 1.5'],
+        [Symbol('z'), 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got Symbol(z)'],
+        [2 ** 53, 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got 9007199254740992'],
+        [-(2 ** 53), 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got -9007199254740992'],
+        [Infinity, 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got Infinity'],
+        [null, 'TypeError', '[lite-sketch] HyperLogLog.add key must be a number, got null'],
+    ];
+    const s = new HyperLogLog(10); s.add(7);
+    const before = Array.from(s._reg);
+    const F = new Float64Array(1);
+    for (const [k, cls, msg] of LITS) {
+        assert.throws(() => s.add(k), (e) => e.constructor.name === cls && e.message === msg, 'add ' + String(k));
+        if (typeof k === 'number') { F[0] = k; assert.throws(() => s.addFrom(F, 0), (e) => e.constructor.name === cls && e.message === msg, 'addFrom ' + String(k)); }
+    }
+    assert.deepEqual(Array.from(s._reg), before, 'teeth rejects mutated state');
+});
+
+test('H2.6 (HLL TEETH): addHashedFrom fails closed on a non-int32 lane (Proxy), byte-identical no-op', () => {
+    const s = new HyperLogLog(10); s.add(42);
+    const before = Array.from(s._reg);
+    for (const v of [undefined, 'x', NaN, 2 ** 40, -1.5, Infinity, null, 1.5]) {
+        const pHi = new Proxy(new Uint32Array([0, 123]), { get(t, k) { return k === '0' ? v : t[k]; } });
+        assert.throws(() => s.addHashedFrom(pHi, 0),
+            (e) => e instanceof TypeError && e.message === '[lite-sketch] HyperLogLog.addHashed lanes must be uint32, got ' + String(v), 'hi=' + String(v));
+        const pLo = new Proxy(new Uint32Array([123, 0]), { get(t, k) { return k === '1' ? v : t[k]; } });
+        assert.throws(() => s.addHashedFrom(pLo, 0),
+            (e) => e instanceof TypeError && /addHashed lanes must be uint32/.test(e.message), 'lo=' + String(v));
+    }
+    assert.deepEqual(Array.from(s._reg), before, 'a bad lane mutated state');
+});
+
+test('H2.6 (HLL TEETH): addHashedFrom rejects an out-of-bounds lane from an overridden-length view', () => {
+    class Evil extends Uint32Array { get length() { return 99; } }   // backing 1, lies as 99
+    const s = new HyperLogLog(10); const before = Array.from(s._reg);
+    assert.throws(() => s.addHashedFrom(new Evil(1), 0),
+        (e) => e instanceof TypeError && /addHashed lanes must be uint32/.test(e.message));
+    assert.deepEqual(Array.from(s._reg), before);
+});
+
+test('H2.6 (HLL): addHashedFrom accepts an Int32Array (negative lanes reinterpreted as uint32) == addHashed', () => {
+    const a = new HyperLogLog(12), b = new HyperLogLog(12);
+    const I = new Int32Array(2);
+    for (let t = 0; t < 3000; t++) {
+        const hi = (t * -2654435761) | 0, lo = (t ^ 0x5bd1e995) | 0;
+        a.addHashed(hi >>> 0, lo >>> 0); I[0] = hi; I[1] = lo; b.addHashedFrom(I, 0);
+    }
+    assert.deepEqual(Array.from(a._reg), Array.from(b._reg));
+});
+
+// ===========================================================================
+// QA H2.6 -- boundary matrix for addFrom / addHashedFrom (HLL). Index 0 / 1 /
+// N-1 / N / N+1 / -0 / empty / null / undefined / NaN / string; views with a
+// byteOffset, a SharedArrayBuffer, a detached buffer (structuredClone transfer)
+// and a shrunk resizable buffer; the value matrix through addFrom == add; a
+// Proxy that re-enters the SAME sketch mid-read; duplicate clear().
+// ===========================================================================
+const qa26Err = (fn) => { try { fn(); return null; } catch (e) { return e.constructor.name + ': ' + e.message; } };
+const qa26BufRe = /^\[lite-sketch\] HyperLogLog\.addFrom\(buf, i\) needs a Float64Array/;
+const qa26HBufRe = /^\[lite-sketch\] HyperLogLog\.addHashedFrom\(buf, i\) needs a Uint32Array or Int32Array/;
+
+test('QA H2.6 (HLL): addFrom index matrix 0 / 1 / N-1 accepted == add; N / N+1 / empty / -1 / NaN / null / undefined / "0" rejected tagged, no-op', () => {
+    const KEYS = [3, 2 ** 31 + 5, -(2 ** 40), 2 ** 53 - 1, -7];
+    const F = new Float64Array(KEYS);
+    const N = F.length;
+    for (const i of [0, 1, N - 1, -0]) {
+        const a = new HyperLogLog(10), b = new HyperLogLog(10);
+        a.add(KEYS[i === 0 ? 0 : i]); b.addFrom(F, i);
+        h26Eq(a, b, 'i ' + i);
+    }
+    const s = new HyperLogLog(10); s.add(77);
+    const before = h26Snap(s);
+    for (const i of [N, N + 1, -1, NaN, null, undefined, '0', 1.5, -Infinity, 2 ** 53])
+        assert.match(qa26Err(() => s.addFrom(F, i)), /^TypeError: \[lite-sketch\] HyperLogLog\.addFrom/, 'i ' + String(i));
+    assert.match(qa26Err(() => s.addFrom(new Float64Array(0), 0)), /^TypeError: /, 'empty buffer');
+    assert.ok(qa26BufRe.test(qa26Err(() => s.addFrom(new Float64Array(0), 0)).slice(11)));
+    assert.deepEqual(h26Snap(s), before, 'a rejected index mutated the registers');
+});
+
+test('QA H2.6 (HLL): addFrom over a byteOffset view, a SharedArrayBuffer view and a grown length-tracking view == add', () => {
+    const base = new Float64Array([0, 0, 0, 2 ** 33 + 1, -(2 ** 31) - 3]);
+    const view = base.subarray(3);                 // byteOffset 24, length 2
+    assert.equal(view.byteOffset, 24);
+    const a = new HyperLogLog(12), b = new HyperLogLog(12);
+    a.add(2 ** 33 + 1); a.add(-(2 ** 31) - 3);
+    b.addFrom(view, 0); b.addFrom(view, view.length - 1);
+    h26Eq(a, b, 'subarray view');
+    const S = new Float64Array(new SharedArrayBuffer(16)); S[0] = 2 ** 33 + 1; S[1] = -(2 ** 31) - 3;
+    const c = new HyperLogLog(12); c.addFrom(S, 0); c.addFrom(S, 1);
+    h26Eq(a, c, 'SharedArrayBuffer view');
+    const rab = new ArrayBuffer(8, { maxByteLength: 32 });
+    const T = new Float64Array(rab);               // length-tracking
+    const d = new HyperLogLog(12);
+    assert.match(qa26Err(() => d.addFrom(T, 1)), /^TypeError: \[lite-sketch\] HyperLogLog\.addFrom/, 'before grow: i 1 out of bounds');
+    rab.resize(16); T[0] = 2 ** 33 + 1; T[1] = -(2 ** 31) - 3;
+    d.addFrom(T, 0); d.addFrom(T, 1);
+    h26Eq(a, d, 'grown length-tracking view');
+});
+
+test('QA H2.6 (HLL): a detached or shrunk buffer rejects tagged with a byte-identical no-op (addFrom and addHashedFrom)', () => {
+    const s = new HyperLogLog(10); s.add(5); s.add(2 ** 40);
+    const before = h26Snap(s);
+    const F = new Float64Array([9, 10]); structuredClone(F.buffer, { transfer: [F.buffer] });
+    assert.equal(F.length, 0, 'detached');
+    assert.match(qa26Err(() => s.addFrom(F, 0)), /^TypeError: \[lite-sketch\] HyperLogLog\.addFrom/);
+    const U = new Uint32Array([1, 2, 3]); structuredClone(U.buffer, { transfer: [U.buffer] });
+    assert.match(qa26Err(() => s.addHashedFrom(U, 0)), /^TypeError: \[lite-sketch\] HyperLogLog\.addHashedFrom/);
+    const rab = new ArrayBuffer(32, { maxByteLength: 32 });
+    const R = new Float64Array(rab); R[3] = 123;
+    rab.resize(16);                                 // R.length 4 -> 2: index 3 is gone
+    assert.match(qa26Err(() => s.addFrom(R, 3)), /^TypeError: \[lite-sketch\] HyperLogLog\.addFrom/);
+    assert.deepEqual(h26Snap(s), before, 'detached / shrunk reject mutated the registers');
+});
+
+test('QA H2.6 (HLL): addFrom value matrix (-0, +-(2^53-1), +-2^53, NaN, +-Infinity, 1.5, 5e-324) == add (error class + message, or registers)', () => {
+    const VALS = [0, -0, 2 ** 53 - 1, -(2 ** 53 - 1), 2 ** 53, -(2 ** 53), NaN, Infinity, -Infinity, 1.5, -1.5, 5e-324, 2 ** 31, -(2 ** 31)];
+    const F = new Float64Array(1);
+    for (const v of VALS) {
+        const a = new HyperLogLog(10), b = new HyperLogLog(10);
+        a.add(11); b.add(11);
+        const ea = qa26Err(() => a.add(v));
+        F[0] = v;
+        const eb = qa26Err(() => b.addFrom(F, 0));
+        assert.equal(eb, ea, 'key ' + v + ': addFrom outcome != add');
+        h26Eq(a, b, 'key ' + v + ': registers');
+    }
+    // -0 and 0 are the same key
+    const z = new HyperLogLog(10), nz = new HyperLogLog(10);
+    F[0] = 0; z.addFrom(F, 0); F[0] = -0; nz.addFrom(F, 0);
+    h26Eq(z, nz, '-0 == 0');
+});
+
+test('QA H2.6 (HLL): addHashedFrom at the end of a Uint32Array / Int32Array: N-2 accepted, N-1 / N / -0 / empty boundaries', () => {
+    for (const Ctor of [Uint32Array, Int32Array]) {
+        const U = new Ctor(5);
+        U[3] = 0x80000001 | 0; U[4] = 7;
+        const a = new HyperLogLog(10), b = new HyperLogLog(10);
+        a.addHashed(0x80000001, 7); b.addHashedFrom(U, U.length - 2);
+        h26Eq(a, b, Ctor.name + ' i = N-2');
+        const c = new HyperLogLog(10); U[0] = 0x80000001 | 0; U[1] = 7; c.addHashedFrom(U, -0);
+        h26Eq(a, c, Ctor.name + ' i = -0');
+        const before = h26Snap(b);
+        for (const i of [U.length - 1, U.length, U.length + 1, -1, NaN, null, undefined])
+            assert.match(qa26Err(() => b.addHashedFrom(U, i)), /^TypeError: \[lite-sketch\] HyperLogLog\.addHashedFrom/, Ctor.name + ' i ' + String(i));
+        assert.ok(qa26HBufRe.test(qa26Err(() => b.addHashedFrom(new Ctor(0), 0)).slice(11)), Ctor.name + ' empty');
+        assert.match(qa26Err(() => b.addHashedFrom(new Ctor(1), 0)), /^TypeError: /, Ctor.name + ' length 1');
+        assert.deepEqual(h26Snap(b), before, Ctor.name + ' rejects mutated the registers');
+        // byteOffset view
+        const V = new Ctor(6).subarray(4); V[0] = 0x80000001 | 0; V[1] = 7;
+        const d = new HyperLogLog(10); d.addHashedFrom(V, 0);
+        h26Eq(a, d, Ctor.name + ' subarray view');
+    }
+});
+
+test('QA H2.6 (HLL): a Proxy that RE-ENTERS the same sketch mid-read still adds the caller key (each slot read once into a local)', () => {
+    const a = new HyperLogLog(12), b = new HyperLogLog(12);
+    a.add(2 ** 33 + 9); a.add(424242);
+    let fired = false;
+    const px = new Proxy(new Float64Array([2 ** 33 + 9]), {
+        get(t, k) { if (k === '0' && !fired) { fired = true; b.add(424242); } return t[k]; },
+    });
+    b.addFrom(px, 0);
+    assert.ok(fired);
+    h26Eq(a, b, 're-entrant addFrom != add, add');
+});
+
+test('QA H2.6 (HLL): duplicate clear() then addFrom / addHashedFrom == a fresh sketch; interleaved add / addFrom on two instances == solo', () => {
+    const s = new HyperLogLog(10), fresh = new HyperLogLog(10);
+    for (let k = 0; k < 500; k++) s.add(k * 7919);
+    s.clear(); s.clear();
+    const F = new Float64Array([2 ** 45 + 3]), U = new Uint32Array([0xdeadbeef, 1]);
+    s.addFrom(F, 0); s.addHashedFrom(U, 0);
+    fresh.add(2 ** 45 + 3); fresh.addHashed(0xdeadbeef, 1);
+    h26Eq(s, fresh, 'after duplicate clear');
+    const x = new HyperLogLog(11), y = new HyperLogLog(11), xs = new HyperLogLog(11), ys = new HyperLogLog(11);
+    const G = new Float64Array(1);
+    for (let k = 0; k < 4000; k++) {
+        const kx = (k * 2654435761) % (2 ** 40), ky = -((k * 40503) % (2 ** 35)) - 1;
+        if (k & 1) x.add(kx); else { G[0] = kx; x.addFrom(G, 0); }
+        G[0] = ky; y.addFrom(G, 0);
+        if (k & 2) y.add(ky + 1); else { G[0] = ky + 1; y.addFrom(G, 0); }
+        xs.add(kx); ys.add(ky); ys.add(ky + 1);
+    }
+    h26Eq(x, xs, 'interleaved x != solo'); h26Eq(y, ys, 'interleaved y != solo');
+});

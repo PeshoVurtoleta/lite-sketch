@@ -187,6 +187,8 @@ new HyperLogLog(p = 14, seed?)   // p in [4, 18]; m = 2^p registers. Throws [lit
 
 hll.add(key) -> this             // HOT, O(1), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + record its register. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key.
 hll.addHashed(hi, lo) -> this    // HOT, O(1), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
+hll.addFrom(buf, i) -> this      // HOT, O(1), 0 library B/op. Add buf[i] UNBOXED from a Float64Array -- the zero-box entry for a key >= 2^31 (add boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws as add.
+hll.addHashedFrom(buf, i) -> this// HOT, O(1), 0 library B/op. Add two uint32 lanes read UNBOXED at buf[i], buf[i+1] (Uint32Array or Int32Array) -- the zero-box sibling of addHashed. Throws on a bad buffer / index, or (addHashed's lane error) on a lane read that is neither uint32 nor int32.
 hll.count() -> number            // COLD, O(m). Estimated distinct count (Ertl's improved estimator -- table-free, full-range).
 hll.merge(other) -> this         // Register-wise max into this. Throws [lite-sketch] on a non-HLL or unequal m OR seed.
 hll.clear() -> this              // Zero the registers; reuse the same allocation.
@@ -212,6 +214,8 @@ CountMinSketch.withAccuracy(epsilon, delta, options?)  // w = ceil(e/epsilon) (p
 
 cms.add(key, count = 1) -> this          // HOT, O(d), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + increment the d cells. count in [1, 2^32-1]. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key, a bad count, or a running total past 2^53-1.
 cms.addHashed(hi, lo, count = 1) -> this // HOT, O(d), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
+cms.addFrom(buf, i) -> this              // HOT, O(d), 0 library B/op. Add buf[i] with count buf[i+1] UNBOXED from a Float64Array -- the zero-box entry for a key or count >= 2^31 (add boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws as add.
+cms.addHashedFrom(buf, i) -> this        // HOT, O(d), 0 library B/op. Add three slots [hi, lo, count] read UNBOXED at buf[i..i+2] (Uint32Array or Int32Array; an Int32Array caps count at 2^31-1). Zero-box sibling of addHashed. Throws on a bad buffer / index / count, or (addHashed's lane error) on a lane read that is neither uint32 nor int32.
 cms.estimate(key) -> number              // HOT, O(d), 0 B/op. The min of the d cells (one-sided over-estimate). NEVER throws -- a key add would reject estimates 0 (never aliases a real key).
 cms.estimateHashed(hi, lo) -> number     // HOT, O(d), 0 B/op. Query form of the pre-hashed path (bad lane -> 0).
 cms.merge(other) -> this                 // Element-wise saturating add. Throws [lite-sketch] on a non-CMS, mismatched d/w/seed, or a running total past 2^53-1. A cross-conservative merge is allowed (this keeps its flag); saturated is carried.
@@ -271,6 +275,7 @@ new SpaceSaving(capacity, options?)      // capacity = k monitored counters, int
 SpaceSaving.withError(epsilon, options?) // k = ceil(1/epsilon); a monitored key's over-count is then <= epsilon*N. epsilon in (0,1). THROWS when unattainable (k > 2^24) -- no silent clamp.
 
 ss.add(key, count = 1) -> this           // HOT, O(1) amortized, 0 B/op. Increment / insert / evict-min. count in [1, 2^32-1]. Throws on a non-safe-integer key, a bad count, or a running total past 2^53-1.
+ss.addFrom(buf, i) -> this               // HOT, O(1) amortized, 0 library B/op. Add buf[i] with count buf[i+1] UNBOXED from a Float64Array -- the zero-box entry for a key or count >= 2^31 (add boxes a non-Smi argument (~16 B) at a non-inlined call). Snapshots both slots (D1). Same validation / throws as add.
 ss.estimate(key) -> number               // HOT, O(1). Monitored count (an upper bound), or 0. NEVER throws.
 ss.errorOf(key) -> number                // HOT, O(1). Over-count bound (true is in [estimate - errorOf, estimate]), or 0. NEVER throws.
 ss.forEach(fn) -> void                   // Alloc-free walk (storage order): fn(key, count, error, ss).
@@ -323,6 +328,8 @@ Every hot op allocates **0 bytes** after construction; the only allocator is the
 | --------------------------- | ----------- |
 | `add(key)`                  | **0** (one two-lane mix into module-scope slots + one register load/compare/store) |
 | `addHashed(hi, lo)`         | **0** (skips the mix; the pre-hashed fast path) |
+| `addFrom(buf, i)`           | **0 library** (reads `buf[i]` UNBOXED; `add(key)` boxes a non-Smi argument (~16 B) at a non-inlined call) |
+| `addHashedFrom(buf, i)`     | **0 library** (reads the uint32 lanes UNBOXED; the zero-box sibling of `addHashed`) |
 | `count()`                   | **0** (an O(m) scan over the register array; a disclosed co-headline, not per-add) |
 | `merge(other)`              | **0** (register-wise max in place) |
 | `clear()`                   | **0** (`fill(0)` over the reused array) |
@@ -334,6 +341,8 @@ CountMinSketch is the same discipline: `add` / `addHashed` / `estimate` are **0 
 DDSketch too: `add` is **0 B/op** -- the log-scale key is a transient double (never stored to the heap), the bin array is a single `Float64Array(maxBins)` allocated once and never re-grown, and both window-extend and lowest-bucket-collapse shift counts *within* that fixed array (a `copyWithin`, no allocation). `quantile` / `merge` / `clear` are cold in-place walks. The torture gate proves `add` at 0 B/op even after collapse.
 
 SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the eviction path (delete the min key from the open-addressing map by backshift, reassign its counter, re-file it in the bucket forest to a new count) touches only preallocated typed-array pools + a free-list, never the heap. The torture gate measures `add` at 0 B/op at steady-state-full, where *every* op evicts. Only `topK` / `heavyHitters` / `merge` allocate (cold, disclosed).
+
+**`addFrom` for keys >= 2^31 on a hot path.** The `add(key)` / `add(key, count)` entry points are 0 **library** B/op, but V8 boxes a non-Smi argument into a ~16 B HeapNumber when it crosses a call it does not inline -- so a key or count `>= 2^31` (e.g. lite-hud's `channelIdx * 2^32 + tag`, or a cumulative-microseconds count) costs the caller's own box. HyperLogLog / CountMinSketch / SpaceSaving each ship an `addFrom(buf, i)` sibling (and HyperLogLog / CountMinSketch an `addHashedFrom(buf, i)`) that reads the value out of a caller-owned `Float64Array` / `Uint32Array` / `Int32Array` slot UNBOXED, identical validation and throws, so a full-range hot path stays at the clean floor (DDSketch's `addFrom` set the precedent in 1.1.0).
 
 **The hash (ADR 0001).** Zero-dep means the package ships its own hash, and accuracy proofs assume it is good. `lite-sketch` ships a two-lane 64-bit-quality non-crypto mix (`Math.imul`, no BigInt -- BigInt allocates), returned through module-scope lane slots so `add` allocates nothing. HLL reads both lanes for `rho`, so its bit-depth does not cap at high cardinality. The **avalanche property** -- a 1-bit input flip flips ~half the output bits -- is a shipped test.
 

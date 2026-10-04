@@ -54,6 +54,17 @@ const merged: HyperLogLog = hll.merge(new HyperLogLog(14));
 const cleared: HyperLogLog = hll.clear();
 void chained; void est; void merged; void cleared;
 
+// addFrom / addHashedFrom: the zero-box entry points -> this (chainable).
+const hllFromBuf = new Float64Array(2);
+const hllFrom: HyperLogLog = hll.addFrom(hllFromBuf, 0);
+const hllHashedFrom: HyperLogLog = hll.addHashedFrom(new Uint32Array(2), 0).addHashedFrom(new Int32Array(2), 0);
+void hllFrom; void hllHashedFrom;
+
+// @ts-expect-error -- addFrom needs a Float64Array, not a Float32Array.
+hll.addFrom(new Float32Array(2), 0);
+// @ts-expect-error -- addHashedFrom needs a Uint32Array | Int32Array, not a Float64Array.
+hll.addHashedFrom(new Float64Array(2), 0);
+
 // @ts-expect-error -- p must be a number.
 new HyperLogLog('14');
 // @ts-expect-error -- add key must be a number.
@@ -108,6 +119,17 @@ const cmsEstHashed: number = cms.estimateHashed(0xdeadbeef, 0x1234);
 const cmsMerged: CountMinSketch = cms.merge(new CountMinSketch(5, 1024));
 const cmsCleared: CountMinSketch = cms.clear();
 void cmsChained; void cmsEst; void cmsEstHashed; void cmsMerged; void cmsCleared;
+
+// addFrom / addHashedFrom: the zero-box entry points -> this (chainable).
+const cmsFromBuf = new Float64Array(2);
+const cmsFrom: CountMinSketch = cms.addFrom(cmsFromBuf, 0);
+const cmsHashedFrom: CountMinSketch = cms.addHashedFrom(new Uint32Array(3), 0).addHashedFrom(new Int32Array(3), 0);
+void cmsFrom; void cmsHashedFrom;
+
+// @ts-expect-error -- addFrom needs a Float64Array, not a Float32Array.
+cms.addFrom(new Float32Array(2), 0);
+// @ts-expect-error -- addHashedFrom needs a Uint32Array | Int32Array, not a Float64Array.
+cms.addHashedFrom(new Float64Array(3), 0);
 
 // @ts-expect-error -- d must be a number.
 new CountMinSketch('5', 1024);
@@ -230,6 +252,16 @@ const ssErrOf: number = ss.errorOf(1);
 const ssMerged: SpaceSaving = ss.merge(new SpaceSaving(1024));
 const ssCleared: SpaceSaving = ss.clear();
 void ssChained; void ssEst; void ssErrOf; void ssMerged; void ssCleared;
+
+// addFrom: the zero-box entry point -> this (chainable). There is no addHashedFrom (no pre-hashed path).
+const ssFromBuf = new Float64Array(2);
+const ssFrom: SpaceSaving = ss.addFrom(ssFromBuf, 0);
+void ssFrom;
+
+// @ts-expect-error -- addFrom needs a Float64Array, not a Float32Array.
+ss.addFrom(new Float32Array(2), 0);
+// @ts-expect-error -- SpaceSaving has no addHashedFrom (it stores key identities).
+ss.addHashedFrom(new Uint32Array(2), 0);
 
 // forEach is alloc-free with a (key, count, error, ss) callback.
 ss.forEach((key: number, count: number, error: number, self: SpaceSaving) => {

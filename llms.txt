@@ -31,7 +31,10 @@ Members share no mutable module state, so a bundler that imports one drops the o
   `Uint8Array(m)` of one-byte registers, `m = 2^p`, `p in [4, 18]`. `add(key)` is
   worst-case O(1), 0 B/op (hash the key over the two-lane mix, pick a register by the
   top p bits, record `rho` = leftmost-1 of the remaining 64-p bits as a running max).
-  `addHashed(hi, lo)` is the pre-hashed fast path. `count()` is a cold O(m) estimator
+  `addHashed(hi, lo)` is the pre-hashed fast path; `addFrom(buf, i)` / `addHashedFrom(buf, i)`
+  are the ZERO-BOX siblings that read the key (resp. the two uint32 lanes) UNBOXED from a
+  caller-owned Float64Array / Uint32Array / Int32Array -- 0 library B/op for a key >= 2^31
+  (`add` boxes a non-Smi argument (~16 B) at a non-inlined call). `count()` is a cold O(m) estimator
   (Ertl's improved estimator, 2017 -- a single table-free formula accurate across the
   whole range, no empirical bias tables), a disclosed co-headline, NOT per-add. `merge(other)` is register-wise max (equal-m-or-throw); `clear()` reuses
   the allocation. Standard error `1.04/sqrt(m)` (statistical, two-sided). Dense-only
@@ -40,7 +43,11 @@ Members share no mutable module state, so a bundler that imports one drops the o
 - `CountMinSketch` -- class. A zero-GC point-query FREQUENCY sketch over a dense
   `Uint32Array(d * w)` counter matrix (d rows x w columns, w a power of two). `add(key,
   count = 1)` / `addHashed(hi, lo, count = 1)` are worst-case O(d), 0 B/op (one increment
-  per row); `estimate(key)` / `estimateHashed(hi, lo)` return the MIN of the d cells -- the
+  per row); `addFrom(buf, i)` / `addHashedFrom(buf, i)` are the ZERO-BOX siblings that read key
+  + count (resp. three slots [hi, lo, count]) UNBOXED from a caller-owned Float64Array /
+  Uint32Array / Int32Array -- 0 library B/op for a key or count >= 2^31 (`add` boxes a non-Smi
+  argument (~16 B) at a non-inlined call; an Int32Array caps count at 2^31-1);
+  `estimate(key)` / `estimateHashed(hi, lo)` return the MIN of the d cells -- the
   one-sided over-estimate while `!saturated` (`f_hat >= f_true`, `f_hat - f_true <= epsilon*N`
   w.p. `1 - delta`, `epsilon = e/w`, `delta = e^-d`; once a counter saturates at 2^32-1 the
   sticky `saturated` getter is set and a query over a saturated key may read low). Conservative update (Estan-Varghese) is the DEFAULT
@@ -73,6 +80,9 @@ Members share no mutable module state, so a bundler that imports one drops the o
   the min-count key and reassign its slot at `count = min + count`, `error = min` (eviction IS the
   algorithm; it NEVER fails at capacity). Guarantee: every key with true freq > N/k is monitored
   (NO false negatives); a monitored key's true count is in `[count - error, count]`; error <= N/k.
+  `addFrom(buf, i)` is the ZERO-BOX sibling (key + count read from a caller-owned Float64Array,
+  both slots snapshotted first; D1) -- 0 library B/op for a key or count >= 2^31 (`add` boxes a
+  non-Smi argument (~16 B) at a non-inlined call); there is no `addHashedFrom` (as there is no addHashed).
   `estimate(key)` / `errorOf(key)` are O(1) (0 if not monitored); `topK(n)` / `heavyHitters(threshold)`
   return sorted entries (COLD, ALLOCATE); `forEach` is alloc-free; `merge(other)` (same-capacity/seed)
   keeps the top-k. `SpaceSaving.withError(epsilon)` sizes k = ceil(1/epsilon). There is deliberately
@@ -109,6 +119,16 @@ Hot surface (add / addHashed are worst-case O(1), zero allocation):
 - addHashed(hi, lo) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
                             hashed with their own good hash; skips the internal mix.
                             Both lanes typeof-guarded as uint32.
+- addFrom(buf, i) -> this    The ZERO-BOX entry point for a key >= 2^31: reads buf[i] UNBOXED
+                            from a caller-owned Float64Array (0 library B/op; `add` boxes a
+                            non-Smi argument (~16 B) at a non-inlined call). Same validation /
+                            throws / no-op-on-reject as add. Throws [lite-sketch] on a
+                            non-Float64Array buf or an out-of-bounds / non-integer i.
+- addHashedFrom(buf, i) -> this  The zero-box sibling of addHashed: two uint32 lanes read
+                            UNBOXED at buf[i], buf[i+1] of a Uint32Array or Int32Array (needs
+                            i+1 in bounds). Throws [lite-sketch] on a bad buffer / index, and
+                            with addHashed's lane error on a lane read that is neither uint32
+                            nor int32 (e.g. through a Proxy), before any write.
 - count() -> number         COLD, O(m): the estimated distinct count via Ertl's IMPROVED
                             estimator (2017) -- a single TABLE-FREE formula
                             (`alpha_inf * m^2 / z`, `alpha_inf = 1/(2 ln 2)`; z folds the
@@ -163,6 +183,16 @@ Hot surface (add / addHashed / estimate are worst-case O(d), zero allocation):
                                   truncate/alias under the 32-bit word split.
 - addHashed(hi, lo, count = 1) -> this  The PRE-HASHED fast path: two uint32 lanes the caller
                                   hashed; skips the internal mix. Both lanes typeof-guarded uint32.
+- addFrom(buf, i) -> this          The ZERO-BOX entry point for a key or count >= 2^31: reads key =
+                                  buf[i], count = buf[i+1] UNBOXED from a caller-owned Float64Array
+                                  (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a
+                                  non-inlined call). Same validation / throws / no-op as add.
+- addHashedFrom(buf, i) -> this    The zero-box sibling of addHashed: three slots [hi, lo, count]
+                                  read UNBOXED at buf[i..i+2] of a Uint32Array or Int32Array (needs
+                                  i+2 in bounds; an Int32Array caps count at 2^31-1). Throws
+                                  [lite-sketch] on a bad buffer / index / count, and with
+                                  addHashed's lane error on a lane read that is neither uint32 nor
+                                  int32 (e.g. through a Proxy), before any write.
 - estimate(key) -> number         The estimated frequency: the MIN of the key's d cells. QUERY,
                                   NEVER throws -- a key `add` would reject (non-integer / non-finite
                                   / out-of-safe-range) returns 0 and never aliases a real key.
@@ -297,6 +327,12 @@ Hot surface (add is amortized O(1), zero allocation):
                                   [1, 2^32-1], or an add that would push the running total past 2^53-1
                                   throws [lite-sketch] (typeof-first, BYTE-IDENTICAL no-op).
                                   (There is NO addHashed -- SpaceSaving stores key identities.)
+- addFrom(buf, i) -> this          The ZERO-BOX entry point for a key or count >= 2^31: reads key =
+                                  buf[i], count = buf[i+1] from a caller-owned Float64Array (0 library
+                                  B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call).
+                                  Both slots are SNAPSHOTTED into the instance scratch before use (D1),
+                                  so a Proxy / SharedArrayBuffer view cannot change a value mid-add.
+                                  Same validation / throws / no-op as add. (No addHashedFrom.)
 - estimate(key) -> number         The estimated frequency (an upper bound), or 0 if not monitored. O(1),
                                   never throws.
 - errorOf(key) -> number          The over-estimate bound (true count in [estimate - errorOf, estimate]),

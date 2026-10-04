@@ -69,6 +69,10 @@ async function countScav(step, warm) {
 class Noop {
     constructor() { this.s = 0; }
     add(k, c) { this.s = (this.s + (k > 0 ? 1 : 2) + (c > 0 ? 1 : 0)) | 0; return this; }
+    // AH-CTRL teeth: a real-bodied addHashed fed uint32 lanes AS ARGS. hi/lo >= 2^31 are boxed
+    // doubles at the call boundary -- the exact box addHashedFrom(buf, i) reads UNBOXED. In ni
+    // it must read >= 12, proving the AHF lanes' ~0 is a real elision, not a dead call.
+    addHashed(hi, lo) { this.s = (this.s + (hi > 0 ? 1 : 2) + (lo > 0 ? 1 : 0)) | 0; return this; }
 }
 
 // N5 POSITIVE CONTROL -- library-independent, carries the OLD suffix shape
@@ -92,18 +96,29 @@ class Ctl {
 async function main() {
     if (laneType === 'scav') {
         // scav <kind: hll|cms|cmsp|cmsest|ss|noop> <kc: small|b30|b31|u32|n31|safe> <warm: fresh|warm>
-        //   [--nc] [--count C | --countv C] [--hit]
+        //   [--nc] [--count C | --countv C] [--hit] [--from] [--hfrom] [--prefill C]
         // --nc pins step in the interpreter (standalone add) via test/lanes/natives.mjs.
         // --count C   a CONSTANT count C (a Smi when C=1, the H2.4 shape; default 1).
         // --countv C  a VARIABLE count read from a Float64Array, CS[i] = C + (i & 7) (the
         //             lite-hud cumulative-microseconds shape; a non-Smi for C >= 2^31).
         // --hit       SS key index i & 511 on SS(1024), so every op is a bump (no evictions).
-        // The count expression is baked into the step closure at setup; the loop never branches.
+        // --from      drive addFrom(F, 0): F[0] = K[i], F[1] = CS?[i] : CNT (N1). The key + count
+        //             cross as (Float64Array, Smi) -- no caller box. A missing addFrom on the
+        //             --lib build prints {"absent":"addFrom"} and exits 0 (the parent FAILs it).
+        // --hfrom     drive addHashedFrom(U, j*stride): a prefilled Uint32Array, hi = 2^31 + j,
+        //             lo = (hi ^ 0x5bd1e995) >>> 0, CMS count slot = 1 (stride 2 HLL / 3 CMS).
+        //             noop runs the AH-CTRL: addHashed(U[j*2], U[j*2+1]) (lanes AS ARGS, boxed).
+        // --prefill C cmsest only: add every ring key with count C first, so estimate returns C
+        //             (>= 2^31 for C = 2^31) and a non-inlined boxed return would show (N1e).
+        // The count/key expressions are baked into the step closure at setup; the loop never branches.
         const kind = argv[1], kc = argv[2], warm = argv[3] === 'warm';
         const nc = argv.indexOf('--nc') >= 0;
         const hit = argv.indexOf('--hit') >= 0;
+        const from = argv.indexOf('--from') >= 0;
+        const hfrom = argv.indexOf('--hfrom') >= 0;
         const countvS = flag('--countv', null);
         const countS = flag('--count', null);
+        const prefillS = flag('--prefill', null);
         const M = await import(MODULE);
         const K = fillKeys(kc);
         // The count source: a Float64Array (variable) or a closure const (constant, Smi for 1).
@@ -116,9 +131,56 @@ async function main() {
             CNT = Number(countS);
         }
         const KM = hit ? 511 : MASK;      // bump-only key window for --hit
+        const F = new Float64Array(2);    // addFrom scratch: F[0] = key, F[1] = count
         let sink = 0;
-        let step;
-        if (kind === 'hll') {
+        let step = null;
+        let absent = null;                // set to a method name when --lib lacks addFrom/addHashedFrom
+        if (hfrom) {
+            // F6: a prefilled uint32-lane buffer. hi = 2^31 + j is a non-Smi uint32; reading it
+            // from the Uint32Array through addHashedFrom is unboxed, while the AH-CTRL passes the
+            // same lanes as plain args (boxed). CMS carries a count-1 slot (stride 3).
+            const stride = (kind === 'cms' || kind === 'cmsp') ? 3 : 2;
+            const U = new Uint32Array(SIZE * stride);
+            for (let j = 0; j < SIZE; j++) {
+                const hi = (2 ** 31 + j) >>> 0;
+                U[j * stride] = hi;
+                U[j * stride + 1] = (hi ^ 0x5bd1e995) >>> 0;
+                if (stride === 3) U[j * stride + 2] = 1;
+            }
+            if (kind === 'hll') {
+                const hll = new M.HyperLogLog(14);
+                if (typeof hll.addHashedFrom !== 'function') absent = 'addHashedFrom';
+                else step = (i) => { const j = i & MASK; hll.addHashedFrom(U, j * 2); sink = (sink + hll._reg[j & 16383]) | 0; };
+            } else if (kind === 'cms' || kind === 'cmsp') {
+                const cms = new M.CountMinSketch(5, 16384, { conservative: kind === 'cms' });
+                if (typeof cms.addHashedFrom !== 'function') absent = 'addHashedFrom';
+                else step = (i) => { const j = i & MASK; cms.addHashedFrom(U, j * 3); sink = (sink + cms._counts[j & 16383]) | 0; };
+            } else {
+                const noop = new Noop();
+                step = (i) => { const j = i & MASK; noop.addHashed(U[j * 2], U[j * 2 + 1]); sink = (sink + noop.s) | 0; };
+            }
+        } else if (from) {
+            // F5: the key (and count) land in a Float64Array slot, read by addFrom(F, 0) -- so a
+            // key / count >= 2^31 crosses as (object, Smi), never as a boxed argument.
+            if (kind === 'hll') {
+                const hll = new M.HyperLogLog(14);
+                if (typeof hll.addFrom !== 'function') absent = 'addFrom';
+                else step = (i) => { F[0] = K[i & MASK]; hll.addFrom(F, 0); sink = (sink + hll._reg[i & 16383]) | 0; };
+            } else if (kind === 'cms' || kind === 'cmsp') {
+                const cms = new M.CountMinSketch(5, 16384, { conservative: kind === 'cms' });
+                if (typeof cms.addFrom !== 'function') absent = 'addFrom';
+                else step = CS
+                    ? (i) => { F[0] = K[i & MASK]; F[1] = CS[i & MASK]; cms.addFrom(F, 0); sink = (sink + cms._counts[i & 16383]) | 0; }
+                    : (i) => { F[0] = K[i & MASK]; F[1] = CNT; cms.addFrom(F, 0); sink = (sink + cms._counts[i & 16383]) | 0; };
+            } else if (kind === 'ss') {
+                const ss = new M.SpaceSaving(1024);
+                if (typeof ss.addFrom !== 'function') absent = 'addFrom';
+                // Sink `_mapOcc` (Uint8Array -> Smi), NOT `_count` (large counts would box in the sink).
+                else step = CS
+                    ? (i) => { F[0] = K[i & KM]; F[1] = CS[i & MASK]; ss.addFrom(F, 0); sink = (sink + ss._mapOcc[i & 1023]) | 0; }
+                    : (i) => { F[0] = K[i & KM]; F[1] = CNT; ss.addFrom(F, 0); sink = (sink + ss._mapOcc[i & 1023]) | 0; };
+            }
+        } else if (kind === 'hll') {
             const hll = new M.HyperLogLog(14);
             step = (i) => { hll.add(K[i & MASK]); sink = (sink + hll._reg[i & 16383]) | 0; };
         } else if (kind === 'cms' || kind === 'cmsp') {
@@ -128,6 +190,9 @@ async function main() {
                 : (i) => { cms.add(K[i & MASK], CNT); sink = (sink + cms._counts[i & 16383]) | 0; };
         } else if (kind === 'cmsest') {
             const cms = new M.CountMinSketch(5, 16384, { conservative: true });
+            // --prefill C: establish counts (>= 2^31 for C = 2^31) BEFORE the window, so estimate's
+            // return is a non-Smi -- a non-inlined boxed return would show up here (N1e / D3 teeth).
+            if (prefillS !== null) { const C = Number(prefillS); for (let i = 0; i < SIZE; i++) cms.add(K[i], C); }
             step = (i) => { sink = (sink + (cms.estimate(K[i & MASK]) > 0 ? 1 : 0)) | 0; };
         } else if (kind === 'ss') {
             const ss = new M.SpaceSaving(1024);
@@ -143,6 +208,7 @@ async function main() {
                 ? (i) => { noop.add(K[i & KM], CS[i & MASK]); sink = (sink + noop.s) | 0; }
                 : (i) => { noop.add(K[i & KM], CNT); sink = (sink + noop.s) | 0; };
         }
+        if (absent) { console.log(JSON.stringify({ absent })); return; }
         if (nc) { const { neverOpt } = await import('./natives.mjs'); neverOpt(step); }
         const scav = await countScav(step, warm);
         console.log(JSON.stringify({ scav, sink: sink & 1 }));

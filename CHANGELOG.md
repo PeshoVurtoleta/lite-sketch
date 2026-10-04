@@ -8,6 +8,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`add` no longer boxes a non-Smi key or count inside the library, and the F2 murmur hand-inline is
+  complete (F5 + F2).** `HyperLogLog` / `CountMinSketch` / `SpaceSaving` `add` is now a typeof-only
+  wrapper that stages its arguments in a per-instance `Float64Array` scratch and defers to a shared
+  `_addAt(buf, i)` (`CountMinSketch.estimate` to `_estimateAt`). The wrappers (44 / 74 / 74 bytes) are
+  small enough that V8 inlines them into the caller, so the key / count land in the scratch unboxed;
+  `_addAt` / `_estimateAt` take `(object, Smi)` and never need inlining, so they carry the murmur
+  HAND-INLINED into int32 locals (the H2.4 deferral and the H2.5 `estimate` per-row fmix deferral,
+  both resolved here -- identical bits to `_m3round` / `_m3final`). In the default tier, young-gen
+  scavenges at 1.6M ops drop: `SpaceSaving.add` of a non-Smi key with count 1 **25 -> 1**, with a
+  variable count `>= 2^31` **25-49 -> 1-2**; `HyperLogLog.add` of an `n31` key **2-24 (bimodal) -> 1**;
+  `CountMinSketch.estimate` of a non-Smi key **1-or-24 (bimodal) -> 0**. `CountMinSketch.add` with a
+  CONSTANT count `2^32-1` and non-Smi keys reads **24 -> 1** at a 120-byte inline cap (the shipped
+  `N3c[cap120/cms.cmax]` lane); in the default tier it reads 0-1 on both builds.
+  In Chrome 154 (no-inline), `HyperLogLog.add` **60-72 -> 0 B/op**, `CountMinSketch.add` with count
+  `2^30` **60-72 -> 0 B/op**, `CountMinSketch.estimate` **120-132 -> 0 B/op**, `SpaceSaving.add` with
+  count `2^30` **36-48 -> 0.2 B/op**; every `addFrom` reads 0. State is **bit-identical** to b4e378f
+  (H2.5) over the shipped `test/parity.mjs` H2.6 section (732,028 checks), negative keys included. A
+  key or count `>= 2^31` passed to `add`
+  itself still costs the CALLER's own argument box at a non-inlined call (~24 scavenges at 1.6M ops);
+  that is exactly what the new `addFrom` / `addHashedFrom` family removes.
 - **`SpaceSaving.add` no longer boxes the key or the count inside the library (F3).** `add`
   routed the per-op work through `_bump(slot, delta)`, `_mapDeleteKey(key)` and
   `_attach(slot, val, hint)` -- each taking a `number` argument, so a key `>= 2^31` or a count
@@ -114,6 +134,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The zero-box `addFrom` / `addHashedFrom` family (F5, F6)** -- five new methods:
+  `HyperLogLog.addFrom(buf, i)` / `addHashedFrom(buf, i)`, `CountMinSketch.addFrom(buf, i)` /
+  `addHashedFrom(buf, i)`, and `SpaceSaving.addFrom(buf, i)`. Each reads the key (and count, or the
+  two uint32 lanes) out of a caller-owned typed array UNBOXED, so a key or count `>= 2^31` stays at
+  **0 library bytes/op** where the plain `add` / `addHashed` boxes the non-Smi argument (~16 B
+  HeapNumber) at a non-inlined call boundary -- the family analog of `DDSketch.addFrom` (1.1.0).
+  `addFrom` takes a `Float64Array` (key = `buf[i]`; for CountMinSketch / SpaceSaving count =
+  `buf[i+1]`); `addHashedFrom` takes a `Uint32Array` or `Int32Array` (HyperLogLog `[hi, lo]`;
+  CountMinSketch three slots `[hi, lo, count]`, an `Int32Array` capping count at `2^31-1`).
+  Validation, throws, and the byte-identical no-op on reject match `add` / `addHashed` exactly -- a
+  non-uint32 / non-int32 lane read (for example through a `Proxy`) throws `addHashed`'s lane error;
+  `SpaceSaving.addFrom` snapshots both slots into an instance scratch before use (D1), so a `Proxy` /
+  `SharedArrayBuffer` view cannot change a value between reads. Every `addFrom` / `addHashedFrom` lane
+  reads **0-2 young-gen scavenges at 1.6M ops** (N1 gate `<= 2`) in Node, default and no-inline, fresh
+  and warm, across 6 key classes x counts `{1, 2^30}` AND a variable count `>= 2^31` (v31), and
+  **0 B/op** in Chrome 154. There is deliberately no `SpaceSaving.addHashed(From)` -- it stores key
+  identities.
 - **`DD_ALPHA_MIN`** -- a named export (`1e-6`), the smallest `alpha` the `DDSketch`
   constructor accepts (`DD_ALPHA_MIN <= alpha < 1`).
 - **`CountMinSketch.saturated`** -- a sticky `boolean` getter (F14/S4), `true` once any counter
@@ -128,6 +165,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`HyperLogLog.add` costs about +1.5 ns/op.** It is now a typeof wrapper over `_addAt`, so it makes
+  one real (non-inlined) call where the 1.1.2 body ran the mix + register update inline (~4.7-6.7 ->
+  ~6.2-7.3 ns/op at load ~6). Zero-GC on a full-range key is worth the nanosecond, and
+  `DDSketch.addFrom` set the precedent; no gate checks throughput, and no README / llms.txt /
+  CHANGELOG line cites ns/op.
 - **`DDSketch` now throws `[lite-sketch]` for `alpha < 1e-6`** (the new `DD_ALPHA_MIN` floor).
   Such an alpha was accepted before -- slowly, and with an unbounded hang below about `1e-10`.
 - **A STRICT `DDSketch` now throws `[lite-sketch]` when merging a COLLAPSED `other`.** Its

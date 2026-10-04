@@ -289,8 +289,8 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | F2 | A3/A4 (H/M) the murmur helpers `_m3round` / `_m3final` (:75, :90) take and return int32 words. In Chrome (31-bit Smis) any word outside +-2^30 boxes, about half of all hash words: no-inline small keys count 1 gives HLL 77, CMS 113, SS 170 B/op. On Node, CMS `lo = a >>> 0` (:621/:715) into `_m3round` boxes for \|key\| >= 2^31 (49 vs 24 no-inline; the -2^31 class 73). | Hand-inline the murmur in every hot body (HLL/CMS/SS add, CMS estimate, SS home). Use `lo = a \| 0`, `hw = ((a / 2^32) \| 0) ^ neg` (with F12's sign fix), `M3_ADD = 0xe6546b64 \| 0`. Replace `Math.abs(key) > MAX` with two compares. H2.4 planner delta: the Node part (int32 words + a `Math.abs` sign split) ships in H2.4; the hand-inline and the two compares move into H2.6's `_addAt`, because hand-inlining into `add` pushes it past V8's 460-byte inline cap (Node default non-Smi keys 0-1 -> 24; see 7.5). | N3 (library delta <= 2) and N6 (Chrome) green. |
 | F3 | A2 (H) SpaceSaving doubles crossing calls: `_mapDeleteKey(this._key[sl])` (:1572), `_hash(mkey[j])` per backshift step (:1815), `_attach(slot, val, hint)` (:1564/:1579/:1851), `_bump(slot, count)` (:1552), and `lo` -> `_m3round` (:1543/:1547). A per-key COUNT passing 2^31 boxes, which is exactly lite-hud's cumulative-microseconds case. No-inline 2^31 keys read 192 (~8 boxes/op, 125 B/op by sampler). | `_attach(slot, hint)` reads `_count[slot]` itself. `_homeAt(arr, i)` returns `h & mask` (always a Smi). `_probeAt(arr, i, home)` reads the key from the array. Eviction deletes via `_probeAt(_key, sl, _homeAt(_key, sl))`. Inline the bump path. | SS no-inline 2^31 keys 192 -> 24 (the caller box only). SS small keys with count 2^30: 24 -> 0. H2.5 delta (done): on HEAD after H2.4 the no-inline 2^31 lane reads 98-99 (the 192 was the pre-H2.4 1.1.2 number), nc 49, df 25; the tree reads 24-25 / 0. `_homeAt` IS F2's "SS home" hand-inline, done here. |
 | F4 | A4 (M) CMS `_applyCons(base, ...)` / `_applyPlain(base, ...)` (:635-636) and per-row `_m3final` (:669/:693/:730) pass doubles. | `base` goes into an Int32Array(1) scratch and `count` into a Float64Array(1) scratch. The apply helpers take no arguments, and the per-row fmix is inlined. | CMS -2^31 keys 73 -> 24 and estimate no-inline 49 -> 24. H2.5 delta (done): the keys gate was already met by H2.4's int32 hash words; the remaining Node box was a VARIABLE count >= 2^31 crossing `_applyCons` / `_applyPlain` in df (24-25 -> 0-1, cons + plain). The `estimate` per-row fmix inline moves to H2.6 (364 -> 422 would crowd the 460 cap); the count scratch is `Float64Array(1)`. |
-| F5 | A5 (H for consumers) a key or count outside Smi range passed to `add(...)` is boxed by the CALLER at a non-inlined boundary (24 at 8N on Node, 12 B in Chrome). lite-hud's CMS key `channelIdx * 2^32 + tag` is >= 2^32 for every channel >= 1, so it ALWAYS boxes. | `add(key[, count])` validates, writes into a per-instance Float64Array scratch, and calls a shared `_addAt(buf, i)`. New `addFrom(buf, i)`: HLL reads key = buf[i]; CMS / SS read key = buf[i], count = buf[i+1]. Same validation and same throws (byte-identical no-op), like DDSketch.addFrom (1.1.0). CMS / SS `estimate` also go through the scratch. | N1: every addFrom lane <= 2 at 8N on Node (default + no-inline, fresh + warm, 6 key classes x counts {1, 2^30}). N6: 0 in Chrome. |
-| F6 | A12 (L) the `addHashed` contract (uint32 lanes, :337/:649): any lane >= 2^31 boxes at the boundary (HLL addHashed 30, CMS 4). | `addHashedFrom(Uint32Array\|Int32Array, i)`, or accept int32 lanes. | An addHashedFrom lane at 0. |
+| F5 | A5 (H for consumers) a key or count outside Smi range passed to `add(...)` is boxed by the CALLER at a non-inlined boundary (24 at 8N on Node, 12 B in Chrome). lite-hud's CMS key `channelIdx * 2^32 + tag` is >= 2^32 for every channel >= 1, so it ALWAYS boxes. | `add(key[, count])` validates, writes into a per-instance Float64Array scratch, and calls a shared `_addAt(buf, i)`. New `addFrom(buf, i)`: HLL reads key = buf[i]; CMS / SS read key = buf[i], count = buf[i+1]. Same validation and same throws (byte-identical no-op), like DDSketch.addFrom (1.1.0). CMS / SS `estimate` also go through the scratch. | N1: every addFrom lane <= 2 at 8N on Node (default + no-inline, fresh + warm, 6 key classes x counts {1, 2^30}). N6: 0 in Chrome. H2.6 delta (q1 pre-measured, pending qa): shipped as `_addAt` x3 + `addFrom` x3 + CMS `_estimateAt` (D3); addFrom 0-2 at 1.6M ops (N1 gate <= 2), SS add non-Smi 25 -> 1, CMS constant count 2^32-1 24 -> 1 at the cap120 lane (0-1 in the default tier), Chrome ni add 60-72 -> 0. |
+| F6 | A12 (L) the `addHashed` contract (uint32 lanes, :337/:649): any lane >= 2^31 boxes at the boundary (HLL addHashed 30, CMS 4). | `addHashedFrom(Uint32Array\|Int32Array, i)`, or accept int32 lanes. | An addHashedFrom lane at 0. H2.6 delta (q1 pre-measured, pending qa): shipped `addHashedFrom` on HLL (2-slot [hi, lo]) and CMS (3-slot [hi, lo, count], D2; an Int32Array caps count at 2^31-1); AHF lanes 0-2 at 1.6M ops (gate <= 2). |
 | F7 | A9 (M) `SpaceSaving.forEach` passes key / count / error as callback arguments: 3130 B/call at k=64 (no-inline, 2^31 keys and counts). | `topKInto(outKeys, outCounts, outErrors, n)` (the old 1.2 backlog N2) or `snapshotInto`. Document `forEach`'s per-entry boxes. | A topKInto lane at 0. |
 | F8 | A10 (M, doc) `SpaceSaving.merge` allocates fresh O(k) state per call (a Map, 2 objects per key, an array, 3 closures): 18.0 KB/call at k=64, 282.5 KB at k=1024. llms.txt:283 says "bounded cold scratch". A11 (L): HLL `count` (16.8 B/call default, 111 no-inline) and DD `quantile` (5 / 16 B) box their returns. | Fix the merge wording (or reuse a preallocated scratch). Document the returned-double boxes, and add `countInto` / `quantileInto` if a consumer needs a 0 B/op render. | The docs state the bytes, or the Into lanes are at 0. |
 | F9 | A6 + A7 (H, harness) the perf gate's `maxScavenges: 64` (PerfGate.test.mjs:226) admits ~2.7 boxes/op, and its only mustFail allocates ~528 B/op. The torture `SCAV_BOX = 48` (torture.mjs:303) admits 1.6 boxes/op and pins F1 as "acceptable". The comments at torture.mjs:288-299 and PerfGate:215-225 misattribute the floor. torture.mjs:335-341 says the add-box teeth "live in lite-hud", but they reproduce here. | Lower `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. Add the N4 one-box mustFail. Fix the comments. | N4 trips. All lanes pass at the new thresholds after F1-F5/N7. |
@@ -316,13 +316,13 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 
 | id | gate | fails on 1.1.2 |
 | --- | --- | --- |
-| N1 | Float64Array-fed scaling lanes in a child process with `--max-semi-space-size=4`, default AND `--max-inlined-bytecode-size=0`. Each of the 4 addFrom x 6 key classes (small, 2^30+, 2^31+, 2^32-1, -2^31, 2^53-1) x counts {1, 2^30} x fresh/warm must read <= 2 at 8N. | HLL / CMS / SS (no addFrom). DD passes. |
+| N1 | Float64Array-fed scaling lanes in a child process with `--max-semi-space-size=4`, default AND `--max-inlined-bytecode-size=0`. Each of the 4 addFrom x 6 key classes (small, 2^30+, 2^31+, 2^32-1, -2^31, 2^53-1) x counts {1, 2^30} x fresh/warm must read <= 2 at 8N. | HLL / CMS / SS (no addFrom). DD passes. H2.6 delta (pending qa): the gate ships (240 addFrom lanes + AHF + N1e); q1 pre-measured min 0-2 (gate <= 2); FAILs `=ABSENT` on HEAD via `--lib`. |
 | N2 | `add` lanes with Smi-range arguments (small and 2^30+ keys, counts 1 and 2^30), default + no-inline: <= 2. | HLL small 12-13; SS count 2^30 24 |
 | N3 | Library-only delta: `add` with keys >= 2^31 minus a no-op baseline receiving the same arguments must be <= 2. | SS 192 vs 24, CMS 49/73 vs 24, HLL 72-104 vs 24 |
 | N4 | A calibrated one-box mustFail (Float64Array -> fractional value -> ring store) must read >= 12 at 8N. It ships with `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. | HLL add-stream 6, HLL addHashed 30, SS evict 12 (harness, fixed by N7) |
 | N5 | Deopt-loop gate: a `--trace-deopt` child shows <= 3 `add` deopts per lane. | HLL 416-461 |
 | N6 | Headless Chrome lane (`--enable-precise-memory-info` + gc(), default and no-inline): addFrom 0, and `add` <= 12 B per non-Smi argument. Node cannot replace this lane: it never sees 31-bit-Smi boxes. | HLL 77, CMS 113, SS 170 B/op |
-| N7 | Driver rule: drivers pass `add` only Smi-range values; full-range keys go only through `addFrom`. | the SS evict / HLL addHashed drivers pass `v >>> 0` |
+| N7 | Driver rule: drivers pass `add` only Smi-range values; full-range keys go only through `addFrom`. | the SS evict / HLL addHashed drivers pass `v >>> 0` -- H2.6 delta (pending qa): torture `ahStep` / `chStep` and PerfGate `addHashedStream` move to `addHashedFrom`, and the PerfGate SS evict driver to `addFrom`; the F9 thresholds stay untouched (H2.8). |
 | N8 | Query lanes: SS.forEach with entries >= 2^31 and a non-inlined callback; the Into APIs at 0. | forEach 3130 B/call |
 | N9 | Parity against `git show HEAD:Sketch.js` (the audit's `parity.mjs` shape): bit-identical estimates across all members, edges, and merges. | n/a (new) |
 
@@ -395,8 +395,8 @@ grows until H2.8, which owns the 1.2.0 trinity. The order follows the dependenci
 | H2.3 (done) | F13, F14, F15, F16 (S4, S5, S6) + F20: counting honesty (estimate guard, `saturated`, count cap, withX throws) and the `String(x)` thrower fix | validation only, no restructure |
 | H2.4 (done) | F12 (S1) + the F2 Node part (int32 hash words, `Math.abs` sign split) at all six sites, N9 parity, N3 lanes. The F2 hand-inline moved to H2.6 (7.5 planner delta) | hash sites |
 | H2.5 (done) | F3 + F4: argument-free SpaceSaving and CMS helpers, N3 count lanes. SS home's F2 hand-inline landed here (`_homeAt`) | SS / CMS internals |
-| **H2.6** | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7, plus the F2 murmur hand-inline inside `_addAt` (moved from H2.4) and the CMS `estimate` per-row fmix inline (moved from H2.5) | public API (additive) |
-| H2.7 | F7, F8, F18, F21: `topKInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
+| H2.6 (done) | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7, plus the F2 murmur hand-inline inside `_addAt` (moved from H2.4) and the CMS `estimate` per-row fmix inline (moved from H2.5) | public API (additive) |
+| **H2.7** | F7, F8, F18, F21: `topKInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
 | H2.8 | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
 
 ### 7.2 H2.1 spec -- F1 + the lane harness  [DONE, committed 980e4fe]
@@ -1091,7 +1091,7 @@ hand-inline in `_addAt` removes it. Chrome default is unchanged.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 
-### 7.6 H2.5 spec -- argument-free SpaceSaving + CMS helpers (F3, F4) + N3 count lanes  [DONE 2026-10-04, awaiting maintainer commit]
+### 7.6 H2.5 spec -- argument-free SpaceSaving + CMS helpers (F3, F4) + N3 count lanes  [DONE, committed b4e378f]
 
 Result: the reviewer REJECTED once (doc truth only), then APPROVED; qa found e1-e7 PASS.
 - **Rejection (doc truth):** the `_hash` / `_probe` / class jsdoc and ADR 0005 described one home in
@@ -1342,3 +1342,238 @@ Reviewer focus:
 
 RISK: the G2 / G4 margins are +1-2 over the caller-box floor, so a 3/3-high rep set false-FAILs about
 1% of runs. If that happens, classify the reps with `--trace-turbo-inlining`; never raise the limit.
+
+### 7.7 H2.6 spec -- the addFrom / addHashedFrom family (F5, F6) + the F2 hand-inline in _addAt + N1 + N7  [DONE 2026-10-04, awaiting maintainer commit]
+
+Result: the reviewer REJECTED once (6 blockers), APPROVED after the fixes, and APPROVED a post-qa fix;
+qa found f1-f3 and f5-f7 PASS. The f4 and f8 "FAILs" are unmeasurable figures, not gate failures (below).
+- **Rejection:**
+  - **Gate without teeth:** a `_badArgs` checking the count first passed every test. TEETH tests now
+    pin HEAD's exact class + message for six (key, count) pairs in CMS and SS, plus HLL bad keys.
+  - **Fail-open addHashedFrom:** a Proxy over a Uint32Array, or a subclass overriding `length`, fed
+    undefined / NaN / 2^40 / -1.5 lanes that were coerced to int32 and written. Each lane is now read
+    once and rejected through addHashed's `_badLane` unless uint32 or int32, before any write (bytecode
+    277 / 306; f6's bound relaxed to < 460 by the orchestrator).
+  - **Mislabelled lane:** the CMS constant 2^32-1 lane ran under `--max-inlined-bytecode-size=120`;
+    it is now `N3c[cap120/...]`, F5 wrapper-size teeth (HEAD 24, tree 1; 0-1 on both builds in the
+    default tier). An F2 revert (CMS `_addAt` back on the helpers) is NOT gated in Node; F2's win is
+    Chrome no-inline B/op.
+  - **Doc truth:** CHANGELOG numbers now cite the shipped gates; the N1e and hll/n31 comments and ADR
+    0001's "every copy" claim are corrected.
+- **Post-qa fix (reviewed):** SS `addFrom` (D1) wrote `_buf[0]` before reading `buf[i+1]`, so a Proxy
+  re-entering `add` on the same sketch replaced the key (est 0 vs 5). Both slots are now read into
+  locals before the scratch write (SS addFrom 110 bytes); a regression test fails on the old form.
+- **Numbers (scavenges at 1.6M ops, min of 3 where gated):**
+  - N1: all 240 addFrom lanes <= 2 on rep 1 in 5 runs (histogram ~{0:185, 1:50, 2:3}); AHF 0 (8/8);
+    AH-CTRL 49; N1e 0.
+  - Tightened / new teeth: G2 SS add df non-Smi 1 (HEAD 24-25); cap120 cmax 1 (HEAD 24); hll/n31 df 1
+    (HEAD 2-24).
+  - `--lib HEAD` FAILs 256 gates (248 ABSENT + 4 G2 + 3 cmax + 1 hll/n31), exit 1, no unhandled
+    rejection. Every H2.1-H2.5 gate holds. Stable over 3 runs at N3_JOBS=4 and 1 at N3_JOBS=1.
+  - Each of the 6 f7 mutants FAILs a gate or test; so do the count-first `_badArgs`, the fail-open
+    lane and the two-store addFrom mutants.
+  - 301 tests (0 todo). Parity: the H2.6 section reports 732,028 checks with 0 diffs, against HEAD
+    and against e805ac8. Torture ok x4 (scAh / scCh now 0 through addHashedFrom), perf 9/9, witness sha1
+    2ed81a8b on tree and HEAD.
+  - Bytecode: add 44 / 74 / 74; CMS estimate 40; addFrom 65 / 71 / 110; addHashedFrom 277 / 306;
+    `_addAt` 624-751 and `_estimateAt` 883 (never inlined, (object, Smi) arguments). Byte-identical vs
+    HEAD: addHashed, estimateHashed, merges, the apply helpers, the murmur helpers, SS map helpers.
+  - `npm run lanes` 26-27 s at N3_JOBS=4, 94 s serial.
+- **Known gaps (recorded, not fixed):**
+  - f4: the committed parity runner stops at the first diff, so the M3_ADD+1 mutant's diff count
+    (93,099) is measured only by the scratch `h26/par.mjs`; the runner does FAIL it.
+  - f8: PerfGate prints pass / fail only, so the two new driver reads are not recorded; torture's
+    scAh / scCh measure the same addHashedFrom path at 0.
+  - The add-message TEETH tests also call addFrom, so they FAIL on HEAD for a second reason; the
+    literals were checked against HEAD by hand and by the reviewer.
+  - Bytecode sizes and the byte-identical list are checked in scratch only (no committed gate); the
+    cap120 lane is the only committed wrapper-size guard.
+  - The SS hit-ring fresh-window transient (2-3 in df, first 200k ops) stays ungated.
+
+Why now:
+- F5 is lite-hud's case. Its CMS key `ch*2^32 + tag` is a non-Smi on every channel >= 1, and its count
+  passes 2^31. Today both are boxed by the caller at any non-inlined `add`. H2.5 made every helper
+  argument-free, so the only remaining step is the entry point.
+- The H2.4 deferral (F2 hand-inline) and the H2.5 deferral (CMS `estimate` per-row fmix) both resolve
+  inside `_addAt` / `_estimateAt`. Their arguments are (object, Smi), so it does not matter that they
+  are > 460 bytes and never inlined.
+
+Pre-measured (HEAD b4e378f, Node 26.8.2, Chrome 154). The prototypes are in scratchpad `h26/`
+(`facts.md`); the chosen one is q1 (orchestrator DECISION). Scavenges at 8N, min of 3; the floor is in
+brackets.
+
+| lane | HEAD | q1 |
+| --- | --- | --- |
+| addFrom HLL / CMS / CMSp / SS, 6 kc, counts, fresh+warm, df + ni [0] | absent | 0-1 / 0-1 / 0-1 / 0-2 |
+| addFrom nc [driver's own read box 24 / 49] | absent | 24-25 / 49-50 |
+| SS add c1 non-Smi, df [noop ni 24] | 25 | 1 |
+| SS add variable c2^31, df | 25-49 | 1-2 |
+| HLL add n31, df | 2 | 0-1 |
+| CMS estimate non-Smi keys, df | 1 or 24 (bimodal) | 0 |
+| CMS add constant c2^32-1, small/b31/n31/safe, df | 0/9/9/9 | 0/1/1/1 |
+| every add, ni / nc, non-Smi | caller floor | caller floor (delta 0-1) |
+
+- **Chrome ni B/op:** HLL add 60-72 -> 0, CMS add c30 60-72 -> 0, CMS est 120-132 -> 0, SS add c30
+  36-48 -> 0.2, every addFrom 0. N6's targets already hold; the gate stays H2.8.
+- **ns/op df:** HLL add 4.7-6.7 -> 6.2-7.3 (one real call; accepted). CMS add 47 -> 49, CMS est
+  24 -> 25, SS add 95 -> 92, SS est 16 -> 18. No README / llms / CHANGELOG line cites ns/op, and there is
+  no `benchmark/` dir.
+- **Parity:** q1 vs HEAD shows 0 diffs over 350,841 checks, incl. negative keys. The `M3_ADD+1` mutant
+  gives 93,099 diffs. Error identity holds for 15 bad keys x 13 counts x 2 members + 12 bad counts.
+- **Bytecode (HEAD -> q1):**
+  - `add`: HLL 335 -> 44 (+ `_addAt` 624), CMS 378 -> 74 (+ 719), SS 790 -> 74 (+ 751).
+  - CMS `estimate` 364 -> 35 (+ `_estimateAt` 853). SS `estimate` 88 -> 103.
+  - New: `addFrom` 65 / 71, `addHashedFrom` 197 / 204.
+- **Known transient (not gated):** SS add / addFrom on a 512-key HIT ring with a variable count >= 2^31
+  reads 2-3 in df, all of it in the first 200k ops (tier-up of the 751-byte `_addAt`). Steady state is
+  0, there is no deopt loop, and `--no-maglev` reads the same. No N1 lane uses the hit ring, and G4 is
+  ni-only.
+
+Planner deltas to q1 (accepted by the orchestrator):
+- **D1 (fail-closed):** SS `_addAt` reads `buf[i]` three times (the guard, `_homeAt`, `_probeAt`). A
+  `Proxy` over a Float64Array, or a SharedArrayBuffer view a worker writes, passes `instanceof` and can
+  change value between reads, storing a key under another key's home. Fix: SS `addFrom` copies
+  `buf[i]`, `buf[i+1]` into `this._buf` and calls `_addAt(this._buf, 0)`. HLL / CMS read each slot once.
+- **D2 (guard parity):** CMS `addHashedFrom` uses addHashed's count guard verbatim
+  (`!Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT`).
+- **D3 (zero-box):** `_estimateAt` writes `mn` into `this._buf[1]` and returns nothing; `estimate`
+  returns `b[1]`. Otherwise a cell min >= 2^31 boxes on the non-inlined return in df.
+- **CMS addHashedFrom shape:** 3 slots `[hi, lo, count]`, i.e. `addHashed(hi, lo, count)` with every
+  argument read unboxed; a fixed count of 1 would push a counted stream's count back across a call. An
+  Int32Array caps count at 2^31-1 (documented).
+
+Hot body vs cold path:
+- **Hot bytes change in:**
+  - `add` on HLL / CMS / SS becomes a typeof-only wrapper that writes `_buf` and calls `_addAt(buf, 0)`.
+  - New `_addAt` x3: numeric guards with the two-compare range check, then the murmur hand-inlined
+    (k1 / k2 computed once and folded into both lanes, `M3_ADD`), then the member's update.
+  - CMS `estimate` becomes a wrapper plus `_estimateAt` (per-row fmix inlined).
+  - SS `estimate` / `errorOf` go through `_buf` + `_homeAt` / `_probeAt`; SS evict re-probes with
+    `_probeAt(this._key, sl, home)`.
+  - New: `addFrom` x3 and `addHashedFrom` (HLL, CMS).
+- **Byte-identical:** `addHashed` x2, `estimateHashed`, every `merge`, `_applyCons` / `_applyPlain`;
+  `mix64` / `_m3round` / `_m3final` / `hashString` / `saltRow`; SS `_hash` / `_probe` / `_homeAt` /
+  `_probeAt` / `_mapDelete` / `_attach` / `_detach`; every existing throw message.
+- **Cold path:** the ctor gains `_buf` (HLL Float64Array(1), CMS / SS Float64Array(2)); module const
+  `M3_ADD`; cold throwers `_badArgs` (CMS / SS; replays HEAD's guard order), `_badBuf` x3 and
+  `_badHashBuf` x2 (DDSketch `_badBuf`'s shape and wording).
+- **Zero-box:** the wrappers (<= 74 bytes) inline into the caller, so key and count land in `_buf`
+  unboxed. `_addAt` / `_estimateAt` take (object, Smi) and return `this` / nothing (D3). In ni / nc the
+  caller still boxes its own non-Smi argument to `add`; that is what addFrom exists for.
+
+Out of scope: N6, the F9 thresholds (`SCAV_BOX` 48, `maxScavenges` 64), F19's sweep of existing
+"0 B/op" lines, the Sketch.js header :8 (all H2.8). Returned-double boxes in ni and the Into APIs (F8,
+H2.7). An `estimateFrom`. SS addHashed(From). demo/ drivers. Any semantics change.
+
+**Tasks**
+- **T1 (coder, Sketch.js HLL):** `M3_ADD` after `ODD_CONST`; ctor `_buf` after `_hist`; `add` becomes the
+  q1 wrapper; add `addFrom`, `_addAt`, `addHashedFrom` (`buf[i] | 0`, `buf[i+1] | 0`, needs
+  `i + 1 < length`); `_badBuf` / `_badHashBuf` before `_badKey`. Jsdoc: `addFrom` gets a full
+  DDSketch.addFrom-style block; add's "murmur INLINED into int32 locals" text moves onto `_addAt`; the
+  class jsdoc names addFrom / addHashedFrom.
+- **T2 (coder, Sketch.js CMS):** ctor `_buf` after `_cnt`; `add` becomes the wrapper plus `_badArgs`
+  (replays HEAD add's guards exactly); `addFrom` (`i + 1 < length`) and `_addAt` (`_base` / `_cnt`
+  written only after all three guards); `addHashedFrom` 3-slot with D2; `estimate` becomes the wrapper
+  plus `_estimateAt` with D3; throwers; jsdoc as T1.
+- **T3 (coder, Sketch.js SS):** ctor `_buf` after `_mapSlot`; `add` wrapper plus `_badArgs`; `addFrom`
+  with D1; `_addAt` from q1 (the evict re-probe comes AFTER `_key[sl] = key`); `estimate` / `errorOf`
+  via `_buf`; `_badBuf`. Class jsdoc: THREE home copies become TWO (`_hash` serves merge placement and
+  the tests; `_homeAt` serves every hot site incl. estimate / errorOf).
+- **T4 (coder, test/lanes/lane.mjs + test/lanes.mjs):**
+  - lane.mjs: `--from` (`F[0] = K[i & MASK]`, `F[1] = CS ? CS[..] : CNT`, then `addFrom(F, 0)`);
+    `--hfrom` (a prefilled Uint32Array of stride 2 / 3, `hi = 2^31 + j`, `lo = (hi ^ 0x5bd1e995) >>> 0`,
+    then `addHashedFrom(U, j * stride)`; CMS count slot 1); `--prefill C` (cmsest: every key added with
+    count C first); a missing method prints `{"absent": name}` and exits 0.
+  - lanes.mjs: `scavJob` carries `warm`. ABSENT resolves to a FAIL gate valued `ABSENT`, never a crash,
+    never rerun.
+  - **N1** `N1[mode/member.cnt/kc/warm]`: HLL (24), CMS / CMSp / SS x {c1, c30, v31} (72 each), over
+    6 kc x fresh/warm x {df, ni}, <= 2. Rep 1; any lane > 2 is rerun up to 3 and gated on the min. nc is
+    NOT gated: the never-optimized caller boxes its own `K[..]` / `CS[..]` reads (the driver's box).
+  - **AHF** `[mode/hll|cms/warm]` <= 2 (8 lanes). AH-CTRL: a Noop `addHashed(U[j], U[j+1])` in ni must
+    read >= 12 (3 reps).
+  - **Tighten (never loosen):** G2 `N3[df/ss/kc]` from live noop + 2 to `<= 2`; `N3[df/hll/n31]` to `<= 2`.
+  - **New:** `N3c[cap120/cms.cmax/b31|n31|safe]` (constant count 2^32-1, under
+    `--max-inlined-bytecode-size=120`) <= 2 -- F5 wrapper-size teeth (HEAD 24 -> tree 1); the F2 murmur
+    revert is NOT gated in Node (the default tier reads 0-1 on both builds). And
+    `N1e[df/cmsest.c31/small|b31]` (prefill 2^31) <= 2, whose teeth is the D3 revert only (HEAD passes
+    it). Both min-of-3.
+  - Cost: 248 rep-1 + 18 three-rep children = 266, about +20-25 s at N3_JOBS=4 and +80-90 s serial; qa
+    records the real figure.
+- **T5 (coder, N7 drivers; thresholds untouched):** torture.mjs `ahStep` (:116-121) and `chStep`
+  (:162-167): `x = (x + 0x9e3779b1) | 0` into a Uint32Array(2) / (3) (count 1), then `addHashedFrom`,
+  same uint32 bits as HEAD. PerfGate `addHashedStream` (:60-67): the same. PerfGate :183
+  `ss.add(v >>> 0)` becomes `KB[0] = v >>> 0; ss.addFrom(KB, 0)` (`KB[1] = 1` in setup). Fix only the
+  comment lines that describe these drivers (torture :304-308, PerfGate :218-221).
+- **T6 (coder, tests; SS adds and addFroms go through a per-op `_mapOcc` watchdog):**
+  - Per member, `addFrom` rejects with TypeError, the exact literal message and a byte-identical
+    snapshot: Float32Array / Int32Array / Array / DataView / null; i = 0.5 / -1 / NaN / Infinity /
+    length; i = length - 1 for 2-slot buffers. Value rejects through `addFrom` give `add`'s error and a
+    no-op.
+  - `addHashedFrom` rejects with the same matrix: Float64Array; i = length - 1 (HLL) / length - 2
+    (CMS); count 0 / Int32 -1 / Proxy NaN -> `_badCount`; a total overflow -> `_badTotal`.
+  - Twins built via add vs addFrom over mixed-sign keys (incl. +-2^53-1 and -0) are equal. U32 and I32
+    `addHashedFrom` equal `addHashed`.
+  - HEAD add error literals cut from `git show HEAD:Sketch.js` BEFORE the edit (e.g. `add(NaN,'x')`,
+    `add('1',NaN)`, `add(1,'2')`, `add(1.5,Symbol())`, `add(1,2**32)`, `add(1,null)`).
+  - `_buf` is per instance, and interleaved instances equal solo twins.
+  - SS evict with a Proxy whose `get` flips the key after the first read: every slot is found by
+    `_probe(k, _hash(k))`. It must FAIL with D1 reverted.
+  - test/types: the new signatures, plus `@ts-expect-error` for a Float32Array to `addFrom` and a
+    Float64Array to `addHashedFrom`.
+- **T7 (coder, test/parity.mjs), new "H2.6 F5/F6" section:** tree `add` / `addFrom` / CMS `estimate`
+  vs ref `add` / `estimate` for HLL p 4/12/18, CMS cons + plain, full SS pools; `addHashedFrom` (U32 +
+  I32) vs ref `addHashed`; error identity + a no-op snapshot after every reject. Ref-aware: negative keys
+  only when `refHasF12`; error identity only when the ref throws TAGGED on `add(Object.create(null))`,
+  else print SKIP; also compare against the ref's own `addFrom` when it has one.
+- **T8 (coder, docs; never VERSION):**
+  - d.ts: HLL / CMS / SS `addFrom` and HLL / CMS `addHashedFrom`, worded like DD.addFrom's zero-box text:
+    "0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call"; the CMS Int32 count
+    cap.
+  - README: API reference lines after each add / addHashed (the SS NOTE stays); two allocation-table
+    rows; the quick note "addFrom for keys >= 2^31 on a hot path".
+  - llms.txt: the header, the HLL / CMS sections and the SS block.
+  - CHANGELOG `[Unreleased]`: **Added** the 5 methods with N1 numbers; **Fixed** (F5 + F2 complete) the
+    df and Chrome deltas above and CMS cmax 9 -> 1, state bit-identical to b4e378f; **Changed** HLL add
+    +~1.5 ns/op.
+  - Dated H2.6 amendments: ADR 0001 (the deferral is resolved; the copies list), ADR 0002 (wrapper +
+    `_addAt`), ADR 0003 (`_badArgs`, `_estimateAt` + D3, 3-slot + why), ADR 0005 (three copies -> two,
+    re-probe from `_key`, D1).
+  - ROADMAP: the F5 / F6 / N1 / N7 row deltas and the 7.1 row. The orchestrator writes the Result block
+    after qa.
+
+**Assertions (qa; f1-f3 and f5 also run against `git show HEAD:Sketch.js` via `--lib` and must FAIL
+there)**
+- f1: all 240 N1 lanes min <= 2, every rep printed. `--lib HEAD`: all 248 N1 + AHF gates `=ABSENT`
+  FAIL, exit 1, GATE line printed, no unhandled rejection.
+- f2: AHF <= 2 (0 expected). AH-CTRL >= 12 on both builds. N1e <= 2 (0 expected); q1's
+  `return this._estimateAt(b, 0)` FAILs it.
+- f3: G2 <= 2 (tree 1, HEAD 24-25 FAIL x4); cmax <= 2 at cap120 (tree 1, HEAD 24 FAIL x3); hll/n31 <= 2
+  (tree 0-1). Every other H2.1-H2.5 gate unchanged and green on both builds. Stable over 3 runs at
+  N3_JOBS=4 and 1 at N3_JOBS=1.
+- f4: `node test/parity.mjs`: H2.6 section 0 diffs over >= 350,000 checks; error identity all
+  identical; state byte-identical after every reject. `parity.mjs e805ac8` exits 0. The M3_ADD+1 mutant
+  shows >= 90,000 diffs.
+- f5: `npm test` = 251 + new, 0 todo. On HEAD every addFrom / addHashedFrom test FAILs and the
+  add-literal tests pass. The watchdog never trips.
+- f6 (bytecode): wrappers 44 / 74 / 74; CMS est <= 50; addFrom <= 110 (SS 104 with D1's copy);
+  addHashedFrom < 460 (the orchestrator relaxed this bound for the lane validation); all < 460.
+  `_addAt` / `_estimateAt` > 460, accepted (object, Smi). The byte-identical list holds against HEAD.
+- f7: each mutant FAILs >= 1 new gate or test: `_badArgs` checks the count first; addFrom via
+  `this.add(buf[i], buf[i+1])` (N1 ni); HEAD's SS add body restored (G2); addHashedFrom via
+  `addHashed(... >>> 0)` (AHF ni); D1 reverted (the Proxy test); D3 reverted (N1e).
+- f8: torture `ok` x3 (9 lanes at 0 B/op; SCAV_CLEAN 0; scAh / scCh 0 with the limit 48 unchanged;
+  maxMajor 0, maxPauseMs 4; `tracker.size()` back to 0 over the build-fill-clear cycles incl. `_buf`;
+  arrayBuffers delta <= 0; N7 DD <= 2). Perf 9/9 (64 unchanged; record the two new reads), witness sha1
+  2ed81a8b, test:types green, ASCII-only, pack 7 files, VERSION '1.1.2'.
+
+Reviewer focus:
+- Is every reject's class and message HEAD's? Is `count = 1` defaulted in the wrapper?
+- Are `_buf` / `_base` / `_cnt` written only after validation (`_buf` before is fine: it is scratch)?
+- Do the inlined murmur's constants equal `_m3round` / `_m3final` (M3_ADD low bits, rotl 15/13, `^ 8`,
+  k1 from `a | 0`, k2 from `hiw ^ (neg << 31)`)?
+- Does any double cross a non-inlined hot call or return?
+- Stale jsdoc: add's "inlined murmur" text, the SS "THREE copies" text, estimate's `_hash` text.
+- Is any limit raised?
+
+RISK: the N1 SS lanes read 0-2 against <= 2. If all three reps read 3, classify them with chunk.mjs /
+`--trace-turbo-inlining` (fresh-window tier-up); never raise the limit.

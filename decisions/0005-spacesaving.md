@@ -133,6 +133,27 @@ through a `number`-typed helper boxed a `HeapNumber` for values `>= 2^31`.
    errorOf / merge (cold) -- passes the home `_hash(key) & _mask`; only the tests pass a raw `_hash`.
    A qa identity test pins `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
 
+## H2.6 amendment (2026-10-04) -- the addFrom family; three home copies -> two (F5)
+
+Bit-identical output over the N9 parity sweep (full pools, merge, post-merge adds, negative keys).
+
+1. **THREE home copies become TWO.** The H2.5 amendment carried the map home in three copies --
+   `_hash`, `add`'s own inline mix, and `_homeAt`. `add` is now a typeof wrapper that stages key +
+   count in `_buf` and calls `_addAt(_buf, 0)`, and `_addAt` takes the home from `_homeAt`, so `add`'s
+   inline mix DISAPPEARS. Two copies remain: `_hash` (the reference, used by `merge` placement and the
+   tests) and `_homeAt(arr, i)` (every hot site -- `_addAt`'s insert / bump / evict, `estimate`,
+   `errorOf`, the evicted-key delete probe, and the backshift). The qa identity test still pins
+   `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
+2. **`addFrom(buf, i)` + D1.** `_addAt` reads `buf[i]` three times (the range guard, `_homeAt`,
+   `_probeAt`), so a `Proxy` over a `Float64Array`, or a `SharedArrayBuffer` view a worker mutates,
+   could change the value between reads and store a key under another key's home. `addFrom` therefore
+   COPIES `buf[i]`, `buf[i+1]` into `_buf` and runs `_addAt(_buf, 0)` on that snapshot (HyperLogLog /
+   CountMinSketch read each slot once, so they do not copy). `estimate` / `errorOf` also route through
+   `_buf`.
+3. **Eviction re-probes from `_key`.** After `_key[sl] = key`, the newcomer is re-probed via
+   `_probeAt(this._key, sl, home)` -- reading OUR stored copy, never the caller's buffer, so a caller
+   buffer is read only before any write.
+
 ## Non-goals
 
 No sliding-window / decay variant (a future member); no serialization format in the

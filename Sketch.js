@@ -47,6 +47,8 @@ const FMIX_C2 = 0xc2b2ae35 | 0;
 const LANE_SALT = 0x85ebca6b | 0;
 /** Large ODD constant for per-row salting (Count-Min's d rows, M2): h_i = mix(h ^ i*ODD_CONST). */
 const ODD_CONST = 0x9e3779b1 | 0;
+/** murmur3's round constant 0xe6546b64 as an int32 (same low 32 bits; keeps the inlined body pure int32). */
+const M3_ADD = 0xe6546b64 | 0;
 
 /**
  * The two output lanes of the last mix64 / hashString call. Written by the mixer,
@@ -252,7 +254,9 @@ function hllTau(x) {
  * Hot path (`add` / `addHashed`, 0 B/op): the top p bits of the 64-bit hash pick a
  * register j; rho is the leftmost-1 position of the remaining 64 - p bits; a single
  * `reg[j] = max(reg[j], rho)`. `add` mixes the numeric key; `addHashed` takes two
- * caller-supplied uint32 lanes and skips the mix (the pre-hashed fast path).
+ * caller-supplied uint32 lanes and skips the mix (the pre-hashed fast path). `addFrom(buf,
+ * i)` / `addHashedFrom(buf, i)` are the ZERO-BOX siblings that read the key (resp. the two
+ * lanes) from a caller-owned typed array, so a key >= 2^31 never boxes at the call boundary.
  *
  * Cold path: `count()` is O(m) (a disclosed co-headline, NOT per-add) -- Ertl's
  * improved estimator (2017), a single table-free formula accurate across the whole
@@ -290,6 +294,7 @@ export class HyperLogLog {
         // count() itself allocates nothing -- it is a cold O(m) co-headline either way).
         this._q = 64 - p;
         this._hist = new Int32Array(this._q + 2);
+        this._buf = new Float64Array(1);   // add() scratch: the key crosses _addAt as buf[0], never as an argument
     }
 
     /** Precision p. O(1). */
@@ -302,41 +307,81 @@ export class HyperLogLog {
     get seed() { return this._seed >>> 0; }
 
     /**
-     * Add a SAFE-INTEGER key. HOT, 0 B/op. Hashes the key to two lanes, picks register j
-     * from the top p bits, computes rho over the 64 - p bit suffix, stores the max.
-     * Fails closed: a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key
-     * throws `[lite-sketch]` (byte-identical no-op) -- the typeof guard runs FIRST. The hot
-     * body distinguishes the FULL magnitude (low word + high word + sign), so the accepted
-     * domain is every safe integer |key| <= 2^53 - 1, matching CountMinSketch / SpaceSaving;
-     * a non-integer or an Infinity would truncate/alias under the 32-bit word split, so both
-     * fail closed.
-     *
-     * The two-lane murmur is INLINED here (identical math to mix64) so the lanes are
-     * pure LOCALS (int32), which TurboFan keeps in registers -- it never writes the
-     * module HASH_HI / HASH_LO slots on the hot path, so a uint32 >= 2^31 lane never
-     * boxes a HeapNumber into a slot. That is what keeps add at a true 0 scavenges
-     * (mix64 / hashHi / hashLo remain the standalone hash for external callers).
+     * Add a SAFE-INTEGER key. HOT, 0 B/op. A thin typeof wrapper: it rejects a non-number
+     * FIRST (a byte-identical `[lite-sketch]` no-op), writes the key into the per-instance
+     * `_buf` scratch, and defers the hash + register update to `_addAt(_buf, 0)` -- so the
+     * key never crosses an inner call boundary as a (boxable) argument. The accepted domain
+     * is every safe integer |key| <= 2^53 - 1 (the full magnitude: low word + high word +
+     * sign), matching CountMinSketch / SpaceSaving; a NaN / +-Infinity / non-integer /
+     * out-of-safe-range key throws `[lite-sketch]` in `_addAt`. For a key >= 2^31 on a hot
+     * path, `addFrom(buf, i)` avoids even the caller's own argument box.
      * @param {number} key a safe integer, |key| <= 2^53 - 1
      * @returns {HyperLogLog} this
      */
     add(key) {
-        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
-            Math.abs(key) > 9007199254740991) return this._badKey(key);
+        if (typeof key !== 'number') return this._badKey(key);
+        const b = this._buf;
+        b[0] = key;
+        return this._addAt(b, 0);
+    }
+
+    /**
+     * Add the SAFE-INTEGER key at `buf[i]` of a caller-owned `Float64Array` -- the ZERO-BOX
+     * entry point for a hot-path key >= 2^31. HOT, 0 B/op. Identical validation, throws,
+     * byte-identical-no-op-on-reject, and register update as `add(key)`; it differs ONLY in
+     * how the key crosses the call boundary: `add(bigKey)` boxes its tagged argument into a
+     * ~16 B HeapNumber per call when V8 does not inline the call, whereas `addFrom` crosses
+     * as (object, Smi) and reads `buf[i]` as an UNBOXED double in a local. A consumer whose
+     * keys exceed the Smi range (e.g. a 53-bit composite id) writes each key into a scratch
+     * slot and calls `addFrom(scratch, i)` to stay at 0 library B/op.
+     *
+     * Fails closed BEFORE any state write: a non-Float64Array `buf`, or a non-integer /
+     * out-of-bounds `i`, throws a tagged TypeError; then the value rejects exactly as `add`
+     * (a non-integer / out-of-safe-range key throws `[lite-sketch]`).
+     * @param {Float64Array} buf a caller-owned Float64Array holding the key.
+     * @param {number} i an in-bounds index into `buf`.
+     * @returns {HyperLogLog} this
+     */
+    addFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || !Number.isInteger(i) ||
+            i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        return this._addAt(buf, i);
+    }
+
+    /**
+     * @private The one add body: the key = `buf[i]` is read UNBOXED into a local and never
+     * crosses another call. Shared by `add` (via `_buf`) and `addFrom` (via the caller's
+     * buffer). Numeric guards use the two-compare range check (`!Number.isInteger(key) ||
+     * key > 2^53-1 || key < -(2^53-1)`; NaN / Infinity fail isInteger), then the two-lane
+     * murmur is HAND-INLINED (identical bits to `_m3round` / `_m3final`): the two mixed
+     * blocks k1 (from `a | 0`) and k2 (from `hiw ^ (neg << 31)`) are lane-independent, so
+     * each is computed once and folded into both lanes. The lanes stay pure int32 LOCALS
+     * (never the module HASH_HI / HASH_LO slots), so a uint32 >= 2^31 lane never boxes a
+     * HeapNumber on the hot path -- that holds add at a true 0 scavenges (mix64 / hashHi /
+     * hashLo remain the standalone hash for external callers). Over the 460-byte V8 inline
+     * cap, so it is never inlined -- and never needs to be: its arguments are (object, Smi).
+     */
+    _addAt(buf, i) {
+        const key = buf[i];
+        if (!Number.isInteger(key) || key > 9007199254740991 || key < -9007199254740991) return this._badKey(key);
         const neg = key < 0 ? 1 : 0;
         const a = Math.abs(key);
-        const lo = a | 0;
-        // High word: 0 for the common case (|key| < 2^32, incl. every int32 id) so the hot
-        // body stays PURE int32 -- the float divide runs ONLY for a genuine > 32-bit key.
-        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
-        const s = this._seed;
-        let h = s;
-        h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ (neg << 31));
-        h = _m3final(h ^ 8);                       // HI lane (int32 local)
-        let g = s ^ LANE_SALT;
-        g = _m3round(g, lo);
-        g = _m3round(g, hiw ^ (neg << 31));
-        g = _m3final(g ^ 8);                       // LO lane (int32 local)
+        // The murmur3 body, hand-inlined (identical bits to _m3round / _m3final): the two
+        // mixed blocks are lane-independent, so each is computed once and folded into both lanes.
+        let k1 = Math.imul(a | 0, HASH_C1);
+        k1 = Math.imul((k1 << 15) | (k1 >>> 17), HASH_C2);
+        let k2 = Math.imul((a < 4294967296 ? 0 : ((a / 4294967296) | 0)) ^ (neg << 31), HASH_C1);
+        k2 = Math.imul((k2 << 15) | (k2 >>> 17), HASH_C2);
+        let h = this._seed ^ k1;
+        h = (Math.imul((h << 13) | (h >>> 19), 5) + M3_ADD) | 0;
+        h ^= k2;
+        h = (Math.imul((h << 13) | (h >>> 19), 5) + M3_ADD) ^ 8;
+        h ^= h >>> 16; h = Math.imul(h, FMIX_C1); h ^= h >>> 13; h = Math.imul(h, FMIX_C2); h ^= h >>> 16;    // HI lane
+        let g = this._seed ^ LANE_SALT ^ k1;
+        g = (Math.imul((g << 13) | (g >>> 19), 5) + M3_ADD) | 0;
+        g ^= k2;
+        g = (Math.imul((g << 13) | (g >>> 19), 5) + M3_ADD) ^ 8;
+        g ^= g >>> 16; g = Math.imul(g, FMIX_C1); g ^= g >>> 13; g = Math.imul(g, FMIX_C2); g ^= g >>> 16;    // LO lane
         const p = this._p;
         const j = h >>> (32 - p);
         const hiSuf = h << p;
@@ -364,6 +409,42 @@ export class HyperLogLog {
         const rho = hiSuf !== 0
             ? Math.clz32(hiSuf) + 1
             : (32 - p) + Math.clz32(lo) + 1;
+        if (rho > this._reg[j]) this._reg[j] = rho;
+        return this;
+    }
+
+    /**
+     * Add a PRE-HASHED key from two uint32 lanes read UNBOXED at `buf[i]`, `buf[i+1]` of a
+     * caller-owned `Uint32Array` or `Int32Array` -- the zero-box sibling of `addHashed`.
+     * HOT, 0 B/op. Same register index + rho + store as `addHashed`; lanes are read as int32
+     * (`buf[i] | 0`), so an Int32Array lane is reinterpreted bit-for-bit as the uint32 lane.
+     * Fails closed BEFORE any write: a non-Uint32Array/Int32Array `buf`, or a non-integer /
+     * out-of-bounds `i` (needs `i` and `i+1` in range), throws a tagged TypeError; a lane that is
+     * neither a uint32 nor an int32 (e.g. from a Proxy or an overridden-`length` view) is
+     * addHashed's lane error.
+     * @param {Uint32Array|Int32Array} buf a caller-owned lane buffer.
+     * @param {number} i an index with `i` and `i+1` in bounds.
+     * @returns {HyperLogLog} this
+     */
+    addHashedFrom(buf, i) {
+        if (!(buf instanceof Uint32Array || buf instanceof Int32Array) || !Number.isInteger(i) ||
+            i < 0 || i + 1 >= buf.length) return this._badHashBuf(buf, i);
+        // Read each lane ONCE into a local, then validate BEFORE any state write: a Proxy over a
+        // typed array (passes instanceof) or a subclass with an overridden `length` can yield a
+        // non-int32 lane (undefined / 'x' / NaN / 2^40 / -1.5 / an out-of-bounds undefined). A
+        // uint32 (`(x>>>0)===x`) OR an int32 (`(x|0)===x`, the Int32Array reinterpret) is legal;
+        // anything else is addHashed's lane error (fail closed, byte-identical no-op).
+        const hi = buf[i];
+        if (!((hi >>> 0) === hi || (hi | 0) === hi)) return this._badLane(hi);
+        const lo = buf[i + 1];
+        if (!((lo >>> 0) === lo || (lo | 0) === lo)) return this._badLane(lo);
+        const hw = hi | 0, lw = lo | 0;   // bit-identical to addHashed's uint32 lanes (>>>/<<< read the same 32 bits)
+        const p = this._p;
+        const j = hw >>> (32 - p);
+        const hiSuf = hw << p;
+        const rho = hiSuf !== 0
+            ? Math.clz32(hiSuf) + 1
+            : (32 - p) + Math.clz32(lw) + 1;
         if (rho > this._reg[j]) this._reg[j] = rho;
         return this;
     }
@@ -419,6 +500,20 @@ export class HyperLogLog {
     clear() {
         this._reg.fill(0);
         return this;
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-sketch] HyperLogLog.addFrom(buf, i) needs a Float64Array and an in-bounds integer index, got ' +
+            _describe(buf) + ', ' + _describe(i));
+    }
+
+    /** @private Cold thrower for a bad addHashedFrom buffer/index. */
+    _badHashBuf(buf, i) {
+        throw new TypeError(
+            '[lite-sketch] HyperLogLog.addHashedFrom(buf, i) needs a Uint32Array or Int32Array and an integer index with i and i+1 in bounds, got ' +
+            _describe(buf) + ', ' + _describe(i));
     }
 
     /** @private Cold thrower for a bad key (_describe runs no user code -- F20). */
@@ -493,7 +588,9 @@ const CMS_KNOWN_OPTS = Object.freeze({ seed: true, conservative: true });
  * (the standard cheap per-row salt), and the d chosen flat indices are staged in a
  * pre-allocated `Int32Array(d)` scratch (`_idx`) so conservative update touches each
  * cell twice with zero allocation. `add` mixes a numeric key; `addHashed` takes two
- * caller-supplied uint32 lanes and skips the mix.
+ * caller-supplied uint32 lanes and skips the mix. `addFrom(buf, i)` / `addHashedFrom(buf,
+ * i)` are the ZERO-BOX siblings that read the key + count (resp. hi, lo, count) from a
+ * caller-owned typed array, so a key or count >= 2^31 never boxes at the call boundary.
  *
  * Fail closed: a bad d / w / seed / conservative / unknown option throws
  * `[lite-sketch]` at the ctor door BEFORE any allocation (no half-built instance);
@@ -567,7 +664,8 @@ export class CountMinSketch {
         this._counts = new Uint32Array(d * cw);
         this._idx = new Int32Array(d);  // pre-allocated per-row flat-index scratch (0-alloc conservative update)
         this._base = new Int32Array(1); // F4: per-instance base lane (int32 slot; argument-free _apply*)
-        this._cnt = new Float64Array(1);// F4: per-instance count (f64 slot; a count >= 2^31 never crosses as an arg)
+        this._cnt = new Float64Array(1);   // F4: per-instance count (f64 slot; a count >= 2^31 never crosses as an arg)
+        this._buf = new Float64Array(2);   // add / estimate scratch: key, count cross _addAt as buf[0..1]; _estimateAt writes the min to buf[1] (D3)
         this._total = 0;
         this._saturated = false;        // sticky: set on any CMS_MAX_COUNT clamp; while false, estimate is one-sided
     }
@@ -636,45 +734,86 @@ export class CountMinSketch {
     get delta() { return Math.exp(-this._d); }
 
     /**
-     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 B/op.
-     * Hashes the key to a base lane, then increments one cell per row (conservative or
-     * plain per the ctor flag). Fails closed: a non-number / NaN / +-Infinity / non-integer
-     * / out-of-safe-range key, or an out-of-range count, throws `[lite-sketch]` -- the typeof
-     * guards run FIRST. The hot body distinguishes the FULL magnitude (low word + high word +
-     * sign), so the accepted domain is every safe integer |key| <= 2^53 - 1, matching
-     * HyperLogLog / SpaceSaving; a non-integer or an Infinity would truncate/alias under
-     * the 32-bit word split, so both fail closed. An add that would push the running `total` past 2^53-1
-     * throws tagged (F15/S5) -- the aggregate stays exact -- as a byte-identical no-op.
-     *
-     * The two-lane murmur is INLINED (identical math to mix64) into int32 LOCALS so it
-     * never writes the module HASH_HI / HASH_LO slots (a uint32 >= 2^31 lane never boxes
-     * a HeapNumber on the hot path). base = (hi ^ lo) | 0 folds both lanes.
+     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 B/op. A thin
+     * typeof wrapper: it rejects a non-number key OR count FIRST (via `_badArgs`, which replays
+     * add's exact guard order so the thrown class + message are byte-identical), writes key and
+     * count into the per-instance `_buf` scratch, and defers to `_addAt(_buf, 0)` -- so neither
+     * the key nor a count >= 2^31 crosses an inner call as a (boxable) argument. The accepted
+     * domain is every safe integer |key| <= 2^53 - 1 (the full magnitude: low word + high word +
+     * sign), matching HyperLogLog / SpaceSaving; an out-of-range count, or an add that would push
+     * the running `total` past 2^53-1 (F15/S5, the aggregate stays exact), throws `[lite-sketch]`
+     * in `_addAt`. For a key or count >= 2^31 on a hot path, `addFrom(buf, i)` avoids even the
+     * caller's own argument box.
      * @param {number} key a safe integer, |key| <= 2^53 - 1
      * @param {number} [count=1] a positive integer in [1, 2^32-1].
      * @returns {CountMinSketch} this
      */
     add(key, count = 1) {
-        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
-            Math.abs(key) > 9007199254740991) return this._badKey(key);
-        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT) {
-            return this._badCount(count);
-        }
+        if (typeof key !== 'number' || typeof count !== 'number') return this._badArgs(key, count);
+        const b = this._buf;
+        b[0] = key;
+        b[1] = count;
+        return this._addAt(b, 0);
+    }
+
+    /**
+     * Add the key at `buf[i]` with the count at `buf[i+1]`, both read UNBOXED from a
+     * caller-owned `Float64Array` -- the ZERO-BOX entry point for a key or count >= 2^31.
+     * HOT, 0 B/op. Identical validation, throws, byte-identical-no-op-on-reject, and cell
+     * update as `add(key, count)`; it differs ONLY in how the values cross the call boundary:
+     * `add(bigKey, bigCount)` boxes each tagged argument into a ~16 B HeapNumber per call when
+     * V8 does not inline the call, whereas `addFrom` crosses as (object, Smi) and reads both
+     * slots as UNBOXED doubles. A consumer with full-range keys / counts (e.g. lite-hud's
+     * `ch*2^32 + tag` key and cumulative-microsecond count) writes them into a scratch and
+     * calls `addFrom(scratch, i)` to stay at 0 library B/op.
+     *
+     * Fails closed BEFORE any state write: a non-Float64Array `buf`, or a non-integer /
+     * out-of-bounds `i` (needs `i` and `i+1` in range), throws a tagged TypeError; then the
+     * key / count reject exactly as `add`.
+     * @param {Float64Array} buf a caller-owned Float64Array holding `[..., key, count, ...]`.
+     * @param {number} i an index with `i` and `i+1` in bounds (key at `i`, count at `i+1`).
+     * @returns {CountMinSketch} this
+     */
+    addFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || !Number.isInteger(i) ||
+            i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        return this._addAt(buf, i);
+    }
+
+    /**
+     * @private The one add body: key = `buf[i]`, count = `buf[i+1]`, read UNBOXED into locals
+     * that never cross another call. Shared by `add` (via `_buf`) and `addFrom` (via the
+     * caller's buffer). Guards (two-compare key range, count range, running-total ceiling) run
+     * BEFORE any write, so `_base` / `_cnt` are untouched on every rejection. Then the two-lane
+     * murmur is HAND-INLINED (identical bits to `_m3round` / `_m3final`): the two mixed blocks
+     * k1 (from `a | 0`) and k2 (from `hiw ^ (neg << 31)`) are lane-independent, computed once
+     * and folded into both lanes, and `base = (h ^ g)` into `_base[0]`, `count` into `_cnt[0]`,
+     * so the argument-free `_applyCons` / `_applyPlain` touch each cell with no boxed argument.
+     * Over the 460-byte V8 inline cap, so it is never inlined -- its arguments are (object, Smi).
+     */
+    _addAt(buf, i) {
+        const key = buf[i], count = buf[i + 1];
+        if (!Number.isInteger(key) || key > 9007199254740991 || key < -9007199254740991) return this._badKey(key);
+        if (!Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT) return this._badCount(count);
         if (this._total + count > 9007199254740991) return this._badTotal(count);
         const neg = key < 0 ? 1 : 0;
         const a = Math.abs(key);
-        const lo = a | 0;
-        // High word: 0 for |key| < 2^32 (incl. every int32 id) so the hot body stays PURE
-        // int32; the float divide runs ONLY for a genuine > 32-bit key.
-        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
-        const s = this._seed;
-        let h = s;
-        h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ (neg << 31));
-        h = _m3final(h ^ 8);                        // HI lane (int32 local)
-        let g = s ^ LANE_SALT;
-        g = _m3round(g, lo);
-        g = _m3round(g, hiw ^ (neg << 31));
-        g = _m3final(g ^ 8);                        // LO lane (int32 local)
+        // The murmur3 body, hand-inlined (identical bits to _m3round / _m3final): the two
+        // mixed blocks are lane-independent, so each is computed once and folded into both lanes.
+        let k1 = Math.imul(a | 0, HASH_C1);
+        k1 = Math.imul((k1 << 15) | (k1 >>> 17), HASH_C2);
+        let k2 = Math.imul((a < 4294967296 ? 0 : ((a / 4294967296) | 0)) ^ (neg << 31), HASH_C1);
+        k2 = Math.imul((k2 << 15) | (k2 >>> 17), HASH_C2);
+        let h = this._seed ^ k1;
+        h = (Math.imul((h << 13) | (h >>> 19), 5) + M3_ADD) | 0;
+        h ^= k2;
+        h = (Math.imul((h << 13) | (h >>> 19), 5) + M3_ADD) ^ 8;
+        h ^= h >>> 16; h = Math.imul(h, FMIX_C1); h ^= h >>> 13; h = Math.imul(h, FMIX_C2); h ^= h >>> 16;    // HI lane
+        let g = this._seed ^ LANE_SALT ^ k1;
+        g = (Math.imul((g << 13) | (g >>> 19), 5) + M3_ADD) | 0;
+        g ^= k2;
+        g = (Math.imul((g << 13) | (g >>> 19), 5) + M3_ADD) ^ 8;
+        g ^= g >>> 16; g = Math.imul(g, FMIX_C1); g ^= g >>> 13; g = Math.imul(g, FMIX_C2); g ^= g >>> 16;    // LO lane
         this._base[0] = h ^ g;
         this._cnt[0] = count;
         if (this._conservative) return this._applyCons();
@@ -698,6 +837,43 @@ export class CountMinSketch {
         }
         if (this._total + count > 9007199254740991) return this._badTotal(count);
         this._base[0] = hi ^ lo;
+        this._cnt[0] = count;
+        if (this._conservative) return this._applyCons();
+        return this._applyPlain();
+    }
+
+    /**
+     * Add a PRE-HASHED key from three slots read UNBOXED at `buf[i]`, `buf[i+1]`, `buf[i+2]`
+     * of a caller-owned `Uint32Array` or `Int32Array` -- hi, lo and count -- the zero-box
+     * sibling of `addHashed(hi, lo, count)`. HOT, 0 B/op. Same base + row increment as
+     * `addHashed`; a fixed count of 1 would push a counted stream's count back across the call,
+     * so count rides the third slot. NOTE: an Int32Array caps count at 2^31 - 1 (a larger count
+     * needs a Uint32Array). Fails closed BEFORE any write: a non-Uint32Array/Int32Array `buf`,
+     * or a non-integer / out-of-bounds `i` (needs `i`..`i+2` in range), throws a tagged
+     * TypeError; a lane that is neither a uint32 nor an int32 (e.g. from a Proxy or an
+     * overridden-`length` view) is addHashed's lane error; an out-of-range count throws
+     * `[lite-sketch]`; and an add that would push the running `total` past 2^53-1 (F15/S5)
+     * throws tagged (byte-identical no-op).
+     * @param {Uint32Array|Int32Array} buf a caller-owned buffer holding `[..., hi, lo, count, ...]`.
+     * @param {number} i an index with `i`..`i+2` in bounds.
+     * @returns {CountMinSketch} this
+     */
+    addHashedFrom(buf, i) {
+        if (!(buf instanceof Uint32Array || buf instanceof Int32Array) || !Number.isInteger(i) ||
+            i < 0 || i + 2 >= buf.length) return this._badHashBuf(buf, i);
+        // Read each slot ONCE, then validate in addHashed's order (hi, lo, count) BEFORE any write:
+        // a Proxy over a typed array (passes instanceof) or a subclass with an overridden `length`
+        // can yield a non-int32 lane (undefined / 'x' / NaN / 2^40 / -1.5 / an out-of-bounds
+        // undefined). A uint32 (`(x>>>0)===x`) OR an int32 (`(x|0)===x`) lane is legal; anything
+        // else is addHashed's lane error (D2: count uses addHashed's guard verbatim). Fail closed.
+        const hi = buf[i];
+        if (!((hi >>> 0) === hi || (hi | 0) === hi)) return this._badLane(hi);
+        const lo = buf[i + 1];
+        if (!((lo >>> 0) === lo || (lo | 0) === lo)) return this._badLane(lo);
+        const count = buf[i + 2];
+        if (!Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT) return this._badCount(count);
+        if (this._total + count > 9007199254740991) return this._badTotal(count);
+        this._base[0] = (hi | 0) ^ (lo | 0);
         this._cnt[0] = count;
         if (this._conservative) return this._applyCons();
         return this._applyPlain();
@@ -766,34 +942,57 @@ export class CountMinSketch {
      * over-estimate). HOT, 0 B/op. NEVER throws -- a key that `add` would REJECT (a
      * non-number / NaN / +-Infinity / non-integer / out-of-safe-range key) returns 0
      * (fail-closed: an un-addable key has frequency 0, and never aliases a real key).
+     * A typeof wrapper: it writes the key into `_buf[0]`, runs `_estimateAt(_buf, 0)` (which
+     * deposits the cell-min into `_buf[1]`, D3), and returns `_buf[1]` -- so the min, a uint32
+     * that may be >= 2^31, never boxes a HeapNumber on the non-inlined return from `_estimateAt`.
      * @param {number} key
      * @returns {number}
      */
     estimate(key) {
-        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
-            Math.abs(key) > 9007199254740991) return 0;
+        if (typeof key !== 'number') return 0;
+        const b = this._buf;
+        b[0] = key;
+        this._estimateAt(b, 0);
+        return b[1];
+    }
+
+    /**
+     * @private The one estimate body: key = `buf[i]`, read UNBOXED. Hand-inlines the two-lane
+     * murmur and the per-row fmix (identical bits to `_m3round` / `_m3final`), walks the d cells
+     * for their minimum, and writes it into `this._buf[1]` (D3) rather than returning it -- a
+     * min >= 2^31 would box on the non-inlined return. A rejected key writes 0. Returns nothing.
+     */
+    _estimateAt(buf, i) {
+        const key = buf[i];
+        if (!Number.isInteger(key) || key > 9007199254740991 || key < -9007199254740991) { this._buf[1] = 0; return; }
         const neg = key < 0 ? 1 : 0;
         const a = Math.abs(key);
-        const lo = a | 0;
-        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
-        const s = this._seed;
-        let h = s;
-        h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ (neg << 31));
-        h = _m3final(h ^ 8);
-        let g = s ^ LANE_SALT;
-        g = _m3round(g, lo);
-        g = _m3round(g, hiw ^ (neg << 31));
-        g = _m3final(g ^ 8);
-        const base = (h ^ g) | 0;
+        // The murmur3 body, hand-inlined (identical bits to _m3round / _m3final): the two
+        // mixed blocks are lane-independent, so each is computed once and folded into both lanes.
+        let k1 = Math.imul(a | 0, HASH_C1);
+        k1 = Math.imul((k1 << 15) | (k1 >>> 17), HASH_C2);
+        let k2 = Math.imul((a < 4294967296 ? 0 : ((a / 4294967296) | 0)) ^ (neg << 31), HASH_C1);
+        k2 = Math.imul((k2 << 15) | (k2 >>> 17), HASH_C2);
+        let h = this._seed ^ k1;
+        h = (Math.imul((h << 13) | (h >>> 19), 5) + M3_ADD) | 0;
+        h ^= k2;
+        h = (Math.imul((h << 13) | (h >>> 19), 5) + M3_ADD) ^ 8;
+        h ^= h >>> 16; h = Math.imul(h, FMIX_C1); h ^= h >>> 13; h = Math.imul(h, FMIX_C2); h ^= h >>> 16;    // HI lane
+        let g = this._seed ^ LANE_SALT ^ k1;
+        g = (Math.imul((g << 13) | (g >>> 19), 5) + M3_ADD) | 0;
+        g ^= k2;
+        g = (Math.imul((g << 13) | (g >>> 19), 5) + M3_ADD) ^ 8;
+        g ^= g >>> 16; g = Math.imul(g, FMIX_C1); g ^= g >>> 13; g = Math.imul(g, FMIX_C2); g ^= g >>> 16;    // LO lane
+        const base = h ^ g;
         const d = this._d, w = this._w, mask = this._mask, counts = this._counts;
         let mn = 0xffffffff;
-        for (let i = 0; i < d; i++) {
-            const x = _m3final((base ^ Math.imul(i, ODD_CONST)) | 0);
-            const v = counts[i * w + (x & mask)];
+        for (let r = 0; r < d; r++) {
+            let x = base ^ Math.imul(r, ODD_CONST);
+            x ^= x >>> 16; x = Math.imul(x, FMIX_C1); x ^= x >>> 13; x = Math.imul(x, FMIX_C2); x ^= x >>> 16;
+            const v = counts[r * w + (x & mask)];
             if (v < mn) mn = v;
         }
-        return mn;
+        this._buf[1] = mn;
     }
 
     /**
@@ -853,6 +1052,27 @@ export class CountMinSketch {
         this._total = 0;
         this._saturated = false;
         return this;
+    }
+
+    /** @private Cold: replay add's original guard order for a non-number key or count. */
+    _badArgs(key, count) {
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            Math.abs(key) > 9007199254740991) return this._badKey(key);
+        return this._badCount(count);
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-sketch] CountMinSketch.addFrom(buf, i) needs a Float64Array and an integer index with i and i+1 in bounds, got ' +
+            _describe(buf) + ', ' + _describe(i));
+    }
+
+    /** @private Cold thrower for a bad addHashedFrom buffer/index. */
+    _badHashBuf(buf, i) {
+        throw new TypeError(
+            '[lite-sketch] CountMinSketch.addHashedFrom(buf, i) needs a Uint32Array or Int32Array and an integer index with i..i+2 in bounds, got ' +
+            _describe(buf) + ', ' + _describe(i));
     }
 
     /** @private Cold thrower for a bad key (_describe runs no user code -- F20). */
@@ -1585,15 +1805,19 @@ const SS_DEFAULT_SEED = HLL_DEFAULT_SEED;
  *     "null is not zero"), `_mapSlot` (Int32Array), `_mask = M - 1`. Linear probe with
  *     Knuth BACKSHIFT deletion (no tombstones), so an eviction's map-delete keeps the probe
  *     invariants exact. The map's canonical home is `_hash(storedKey) & _mask` for EVERY entry,
- *     computed in THREE BIT-IDENTICAL, site-tested copies: `_hash` (the reference, used by
- *     estimate / errorOf / merge placement and the tests), `add`'s inline HI-lane mix (the hot
- *     insert / bump / evict path), and `_homeAt(arr, i)` (the evicted-key delete probe and the
- *     backshift, reading the key from a buffer so it never boxes a HeapNumber crossing a call). An
- *     identity test pins `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
+ *     computed in TWO BIT-IDENTICAL, site-tested copies: `_hash(key)` (the reference, used by
+ *     `merge` placement and the tests) and `_homeAt(arr, i)` (every hot site -- `_addAt`'s insert /
+ *     bump / evict, estimate / errorOf, the evicted-key delete probe and the backshift -- reading
+ *     the key from a buffer so a key >= 2^31 never boxes a HeapNumber crossing a call). An identity
+ *     test pins `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
  *
- * Hot path (`add`, 0 B/op amortized): the HI-lane murmur is INLINED into int32 LOCALS exactly
- * like `HyperLogLog.add` -- it never writes the module HASH_HI / HASH_LO slots, so a uint32
- * >= 2^31 home never boxes a HeapNumber. A `add` is one of three O(1)-amortized cases:
+ * Hot path (`add` / `addFrom`, 0 B/op amortized): `add` is a typeof wrapper that stages key +
+ * count in the `_buf` scratch and runs `_addAt(_buf, 0)`; `addFrom(buf, i)` copies them from a
+ * caller-owned Float64Array into `_buf` (D1: a Proxy / shared view could change value between the
+ * three reads) and runs `_addAt(_buf, 0)` -- the ZERO-BOX entry for a key or count >= 2^31. `_addAt`
+ * takes the key's home via `_homeAt(buf, i)` (the HI-lane murmur hand-inlined into int32 locals,
+ * never the module HASH_HI / HASH_LO slots) and probes with `_probeAt`, so no key crosses a call as
+ * a boxed argument. A `add` is one of three O(1)-amortized cases:
  * monitored -> bump (detach + re-attach one slot, the target bucket is the immediate next in
  * sorted order for a unit add); free slot -> insert at count with error 0; full -> evict the
  * min key (map-delete via backshift, reassign the slot, move it from bucket `min` to bucket
@@ -1685,6 +1909,7 @@ export class SpaceSaving {
         this._mapKey = new Float64Array(M);
         this._mapOcc = new Uint8Array(M);
         this._mapSlot = new Int32Array(M);
+        this._buf = new Float64Array(2);   // add / estimate scratch
         this._mask = M - 1;
         // scalars
         this._size = 0;
@@ -1725,45 +1950,86 @@ export class SpaceSaving {
     }
 
     /**
-     * Add a numeric key with a positive integer `count` (default 1). HOT, 0 B/op amortized.
-     * Hashes the key to one lane, probes the map, then dispatches: monitored -> bump; free
-     * slot -> insert (count, error 0); full -> evict the min-count key and reassign its slot
-     * to the newcomer at `count = min + count`, `error = min`. NEVER fails at capacity.
-     *
-     * The HI-lane murmur is INLINED (identical math to mix64) into int32 LOCALS so it never
-     * writes the module HASH_HI / HASH_LO slots (a uint32 >= 2^31 home never boxes a
-     * HeapNumber on the hot path).
-     *
-     * Fails closed: a non-number / NaN / non-integer / out-of-safe-range key or a count
-     * outside [1, 2^32-1] throws `[lite-sketch]` (typeof guards FIRST), and an add that would
-     * push the running `total` past 2^53-1 throws (F15/S5, the aggregate stays exact), each a
-     * byte-identical no-op.
+     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 B/op amortized.
+     * A thin typeof wrapper: it rejects a non-number key OR count FIRST (via `_badArgs`, which
+     * replays add's exact guard order so the thrown class + message are byte-identical), writes
+     * key and count into the per-instance `_buf` scratch, and defers to `_addAt(_buf, 0)` -- so
+     * neither the key nor a count >= 2^31 crosses an inner call as a (boxable) argument. The
+     * accepted domain is every safe integer |key| <= 2^53 - 1; a non-integer / out-of-safe-range
+     * key, a count outside [1, 2^32-1], or an add that would push the running `total` past 2^53-1
+     * (F15/S5, the aggregate stays exact), throws `[lite-sketch]` as a byte-identical no-op. For a
+     * key or count >= 2^31 on a hot path, `addFrom(buf, i)` avoids even the caller's own box.
      * @param {number} key   a safe integer, |key| <= 2^53 - 1
      * @param {number} [count=1] a positive integer in [1, 2^32-1]
      * @returns {SpaceSaving} this
      */
     add(key, count = 1) {
-        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
-            Math.abs(key) > 9007199254740991) return this._badKey(key);
-        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 4294967295) {
-            return this._badCount(count);
-        }
+        if (typeof key !== 'number' || typeof count !== 'number') return this._badArgs(key, count);
+        const b = this._buf;
+        b[0] = key;
+        b[1] = count;
+        return this._addAt(b, 0);
+    }
+
+    /**
+     * Add the key at `buf[i]` with the count at `buf[i+1]`, both read from a caller-owned
+     * `Float64Array` -- the ZERO-BOX entry point for a key or count >= 2^31. HOT, 0 B/op
+     * amortized. Identical validation, throws, byte-identical-no-op-on-reject, and dispatch
+     * (bump / insert / evict) as `add(key, count)`; it differs ONLY in how the values cross the
+     * call boundary: `add(bigKey, bigCount)` boxes each tagged argument into a ~16 B HeapNumber
+     * per call when V8 does not inline the call, whereas `addFrom` reads both slots UNBOXED.
+     *
+     * Both slots are read into LOCALS and then COPIED into `_buf`, and `_addAt(_buf, 0)` runs on
+     * that snapshot (D1): `_addAt` reads the key three times (the range guard, `_homeAt`,
+     * `_probeAt`), and a Proxy over a Float64Array or a SharedArrayBuffer view a worker rewrites
+     * could pass `instanceof` yet change value between reads, storing a key under another key's
+     * home. Reading both slots into locals FIRST also survives a re-entrant read: a Proxy whose
+     * read of slot `i` or `i+1` calls back into add/addFrom on THIS sketch completes before our
+     * `_buf` stores, so the key/count that crossed `addFrom` are the ones used. Fails closed
+     * BEFORE any write: a non-Float64Array `buf`, or
+     * a non-integer / out-of-bounds `i` (needs `i` and `i+1` in range), throws a tagged
+     * TypeError; then the key / count reject exactly as `add`.
+     * @param {Float64Array} buf a caller-owned Float64Array holding `[..., key, count, ...]`.
+     * @param {number} i an index with `i` and `i+1` in bounds (key at `i`, count at `i+1`).
+     * @returns {SpaceSaving} this
+     */
+    addFrom(buf, i) {
+        if (!(buf instanceof Float64Array) || !Number.isInteger(i) ||
+            i < 0 || i + 1 >= buf.length) return this._badBuf(buf, i);
+        // Read BOTH slots into locals BEFORE touching `_buf` (D1): a Proxy / shared view whose read
+        // of slot i or i+1 re-enters add/addFrom on THIS sketch would otherwise overwrite `_buf[0]`
+        // between our two stores. Snapshotting into locals first lets any re-entry complete, then our
+        // scratch writes are the last word -- the key/count that crossed addFrom are the ones used.
+        const k = buf[i], c = buf[i + 1];
+        const b = this._buf;
+        b[0] = k;
+        b[1] = c;
+        return this._addAt(b, 0);
+    }
+
+    /**
+     * @private The one add body: key = `buf[i]`, count = `buf[i+1]`, read UNBOXED into locals.
+     * Shared by `add` and `addFrom`, which both pass the `_buf` snapshot. Guards (two-compare
+     * key range, count range, running-total ceiling) run BEFORE any write. The map home comes
+     * from `_homeAt(buf, i)` (the HI-lane murmur hand-inlined into int32 locals, identical bits
+     * to `_hash`) and the probe from `_probeAt(buf, i, home)`, so the key never crosses `_probe`
+     * as a (boxable) argument. Dispatches: monitored -> bump (read `prevB` BEFORE `_detach`);
+     * free slot -> insert (count, error 0); full -> evict the min-count key, reassign its slot at
+     * `count = min + count`, `error = min`, and RE-PROBE the newcomer via `_probeAt(this._key,
+     * sl, home)` AFTER `this._key[sl] = key` -- reading OUR stored copy, so a caller buffer is
+     * read only before any write. NEVER fails at capacity (eviction IS the algorithm). Over the
+     * 460-byte V8 inline cap, never inlined -- its arguments are (object, Smi).
+     */
+    _addAt(buf, i) {
+        const key = buf[i], count = buf[i + 1];
+        if (!Number.isInteger(key) || key > 9007199254740991 || key < -9007199254740991) return this._badKey(key);
+        if (!Number.isInteger(count) || count < 1 || count > 4294967295) return this._badCount(count);
         if (this._total + count > 9007199254740991) return this._badTotal(count);
-        // inline HI-lane murmur into an int32 local (the map needs one lane).
-        const neg = key < 0 ? 1 : 0;
-        const a = Math.abs(key);
-        const lo = a | 0;
-        const hiw = a < 4294967296 ? 0 : ((a / 4294967296) | 0);
-        const s = this._seed;
-        let h = s;
-        h = _m3round(h, lo);
-        h = _m3round(h, hiw ^ (neg << 31));
-        h = _m3final(h ^ 8);                        // HI lane (int32 local); == _hash(key)
-        const home = h & this._mask;                // canonical home (a Smi; never crosses _probe as a double)
-        const i = this._probe(key, home);
-        if (this._mapOcc[i] === 1) {                // monitored -> bump (inlined: no count crosses a call)
-            const sl = this._mapSlot[i];
-            const prevB = this._bPrev[this._cBucket[sl]];   // read BEFORE _detach moves the slot's bucket
+        const home = this._homeAt(buf, i);
+        const j0 = this._probeAt(buf, i, home);
+        if (this._mapOcc[j0] === 1) {                // monitored -> bump
+            const sl = this._mapSlot[j0];
+            const prevB = this._bPrev[this._cBucket[sl]];
             this._count[sl] += count;
             this._detach(sl);
             this._attach(sl, prevB);
@@ -1775,27 +2041,24 @@ export class SpaceSaving {
             this._key[sl] = key;
             this._count[sl] = count;
             this._error[sl] = 0;
-            this._mapOcc[i] = 1;
-            this._mapKey[i] = key;
-            this._mapSlot[i] = sl;
+            this._mapOcc[j0] = 1;
+            this._mapKey[j0] = key;
+            this._mapSlot[j0] = sl;
             this._attach(sl, -1);
             this._total += count;
             return this;
         }
-        // FULL -> evict the min-count key, reassign its slot to the newcomer.
         const minB = this._minBucket;
         const sl = this._bHead[minB];
         const m = this._bVal[minB];
-        // remove the evicted key from the map; its home + probe is recomputed arg-free (no double crosses).
         this._mapDelete(this._probeAt(this._key, sl, this._homeAt(this._key, sl)));
         this._key[sl] = key;
         this._error[sl] = m;
-        const nv = m + count;
-        this._count[sl] = nv;
-        const prevB = this._bPrev[minB];            // value < m < nv (a valid lower hint)
+        this._count[sl] = m + count;
+        const prevB = this._bPrev[minB];
         this._detach(sl);
         this._attach(sl, prevB);
-        const j = this._probe(key, home);           // re-probe: the map shifted during delete
+        const j = this._probeAt(this._key, sl, home);   // re-probe the newcomer from OUR copy of the key
         this._mapOcc[j] = 1;
         this._mapKey[j] = key;
         this._mapSlot[j] = sl;
@@ -1811,7 +2074,9 @@ export class SpaceSaving {
      */
     estimate(key) {
         if (typeof key !== 'number' || key !== key) return 0;
-        const i = this._probe(key, this._hash(key) & this._mask);
+        const b = this._buf;
+        b[0] = key;
+        const i = this._probeAt(b, 0, this._homeAt(b, 0));
         return this._mapOcc[i] === 1 ? this._count[this._mapSlot[i]] : 0;
     }
 
@@ -1823,7 +2088,9 @@ export class SpaceSaving {
      */
     errorOf(key) {
         if (typeof key !== 'number' || key !== key) return 0;
-        const i = this._probe(key, this._hash(key) & this._mask);
+        const b = this._buf;
+        b[0] = key;
+        const i = this._probeAt(b, 0, this._homeAt(b, 0));
         return this._mapOcc[i] === 1 ? this._error[this._mapSlot[i]] : 0;
     }
 
@@ -2153,6 +2420,20 @@ export class SpaceSaving {
             if (bn >= 0) this._bPrev[bn] = bp;
             this._bFree[this._bFreeTop++] = b;
         }
+    }
+
+    /** @private Cold: replay add's original guard order for a non-number key or count. */
+    _badArgs(key, count) {
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            Math.abs(key) > 9007199254740991) return this._badKey(key);
+        return this._badCount(count);
+    }
+
+    /** @private Cold thrower for a bad addFrom buffer/index. */
+    _badBuf(buf, i) {
+        throw new TypeError(
+            '[lite-sketch] SpaceSaving.addFrom(buf, i) needs a Float64Array and an integer index with i and i+1 in bounds, got ' +
+            _describe(buf) + ', ' + _describe(i));
     }
 
     /** @private Cold thrower for a bad key (_describe runs no user code -- F20). */

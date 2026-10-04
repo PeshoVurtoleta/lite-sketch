@@ -112,12 +112,16 @@ async function main() {
     const addBytes = Math.max(0, Math.round(addBpc));
     const addOk = addBytes === 0;
 
-    // addHashed(hi, lo): the pre-hashed fast path (skips the mix).
-    let ahHi = 0, ahSink = 0;
+    // addHashedFrom(buf, i): the pre-hashed fast path (skips the mix), reading two uint32 lanes
+    // from a caller-owned Uint32Array -- so a lane >= 2^31 crosses UNBOXED (F6). Same uint32 bits
+    // as HEAD's addHashed(hi, lo) driver: the Uint32Array store applies ToUint32 to the int32 x.
+    let ahX = 0, ahSink = 0;
+    const ahBuf = new Uint32Array(2);
     const ahStep = () => {
-        ahHi = (ahHi + 0x9e3779b1) >>> 0;
-        hll.addHashed(ahHi, (ahHi ^ 0x5bd1e995) >>> 0);
-        ahSink = (ahSink + hll._reg[ahHi & (M - 1)]) | 0;
+        ahX = (ahX + 0x9e3779b1) | 0;
+        ahBuf[0] = ahX; ahBuf[1] = ahX ^ 0x5bd1e995;
+        hll.addHashedFrom(ahBuf, 0);
+        ahSink = (ahSink + hll._reg[ahX & (M - 1)]) | 0;
     };
     const ahRes = measureAllocs(ahStep, { iterations: 100000, batches: 8 });
     const ahBpc = ahRes.bytesPerCall === null ? 0 : ahRes.bytesPerCall;
@@ -158,12 +162,17 @@ async function main() {
     const cpBytes = Math.max(0, Math.round(cpBpc));
     const cpOk = cpBytes === 0;
 
-    // cms.addHashed: the pre-hashed fast path (skips the mix).
-    let chHi = 0, chSink = 0;
+    // cms.addHashedFrom: the pre-hashed fast path (skips the mix), reading hi / lo / count from a
+    // caller-owned Uint32Array (count slot = 1) -- lanes >= 2^31 cross UNBOXED (F6). Same uint32
+    // bits as HEAD's addHashed(hi, lo) driver.
+    let chX = 0, chSink = 0;
+    const chBuf = new Uint32Array(3);
+    chBuf[2] = 1;   // count slot
     const chStep = () => {
-        chHi = (chHi + 0x9e3779b1) >>> 0;
-        cmsC.addHashed(chHi, (chHi ^ 0x5bd1e995) >>> 0);
-        chSink = (chSink + cmsC._counts[chHi & (CW - 1)]) | 0;
+        chX = (chX + 0x9e3779b1) | 0;
+        chBuf[0] = chX; chBuf[1] = chX ^ 0x5bd1e995;
+        cmsC.addHashedFrom(chBuf, 0);
+        chSink = (chSink + cmsC._counts[chX & (CW - 1)]) | 0;
     };
     const chRes = measureAllocs(chStep, { iterations: 100000, batches: 8 });
     const chBpc = chRes.bytesPerCall === null ? 0 : chRes.bytesPerCall;
@@ -301,21 +310,25 @@ async function main() {
     //     SS evict, SS bump -- are driven to EXACTLY 0 scavenges: their hot bodies keep every
     //     hash word an int32 SMI (base = (h ^ g) | 0, and HLL's register suffix is now the
     //     signed int32 `h << p`), so nothing boxes.
-    //   * TWO lanes carry a small, pinned floor from a uint32 >= 2^31 boxed double -- both the
-    //     addHashed CALLER contract (the uint32-lane artifact, F6, a later session):
-    //       - HyperLogLog addHashed / CountMinSketch addHashed: the caller passes uint32 lanes
-    //         (hi/lo >= 2^31) as args, boxed at the call boundary -- the disclosed caller-side
-    //         artifact, not a library allocation.
-    //     HLL ADD used to sit on this floor too (~4 over 2e6 in this driver). That was NOT the
-    //     suffix widening but a Maglev DEOPT LOOP on `hiSuf = (h << p) >>> 0` ("not int32"):
-    //     Maglev assumed the uint32 suffix was an int32, the >= 2^31 half deopted and recompiled,
-    //     and the deopted tiers boxed every uint32 / double temporary (the audit's non-inlined
-    //     closure shape shows hundreds of such deopts -- see test/lanes.mjs N5). H2.1 changed it
-    //     to `h << p` (clz32 reads the same 32 bits and `!== 0` is unchanged), the deopt loop is
-    //     gone, and HLL add is now 0 -- so scAdd moved from SCAV_BOX to SCAV_CLEAN below.
-    //     Floor 48 is ~7-12x the measured ~4-7 (HLL addHashed and CMS addHashed) over 2e6, well
-    //     under the perf gate's disclosed 64, and astronomically under a real per-op allocator (the
-    //     perf gate's mustFail control shows thousands). A regression trips this immediately.
+    //   * The two addHashed lanes now drive addHashedFrom (F6, H2.6): the caller stages the uint32
+    //     hi/lo lanes (and a count-1 slot for CMS) in a Uint32Array and passes (buf, i), so a lane
+    //     >= 2^31 is read UNBOXED inside the library -- the boxed-double caller artifact the old
+    //     addHashed(hi, lo) driver disclosed is GONE. HyperLogLog addHashedFrom and CountMinSketch
+    //     addHashedFrom now read ~0 scavenges, so all nine lanes sit at the clean floor. NOTE: plain
+    //     addHashed(hi, lo) is no longer driven by torture at all -- both the alloc B/op and the SCAV
+    //     labels below read addHashedFrom; addHashed's own byte-for-byte behavior is covered by the
+    //     node:test suite and test/parity.mjs.
+    //     HLL ADD used to sit on a boxed-double floor too (~4 over 2e6 in an earlier driver). That
+    //     was NOT the suffix widening but a Maglev DEOPT LOOP on `hiSuf = (h << p) >>> 0` ("not
+    //     int32"): Maglev assumed the uint32 suffix was an int32, the >= 2^31 half deopted and
+    //     recompiled, and the deopted tiers boxed every uint32 / double temporary (the audit's
+    //     non-inlined closure shape shows hundreds of such deopts -- see test/lanes.mjs N5). H2.1
+    //     changed it to `h << p` (clz32 reads the same 32 bits and `!== 0` is unchanged), the deopt
+    //     loop is gone, and HLL add is now 0 -- so scAdd moved from SCAV_BOX to SCAV_CLEAN below.
+    //     SCAV_BOX (48) is RETAINED unchanged as disclosed headroom for the two addHashed lanes
+    //     (now ~0 under addHashedFrom); it is astronomically under a real per-op allocator (the
+    //     perf gate's mustFail control shows thousands) and is recalibrated in H2.8. A regression
+    //     trips the clean lanes immediately.
     const SCAV_HOT = 2000000;
     const SCAV_CLEAN = 0;    // int32-clean lanes: exactly 0 (transient churn isolated away)
     const SCAV_BOX = 48;     // uint32 >= 2^31 boxed-double lanes: pinned floor (see above)
@@ -392,9 +405,9 @@ async function main() {
     console.log(
         'GATE leak=size ' + gateLive + '/0 findings=' + gateFindings +
         ' | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) +
-        ' | alloc=' + addBytes + ' B/op (HyperLogLog add) ' + ahBytes + ' B/op (HyperLogLog addHashed) ' +
+        ' | alloc=' + addBytes + ' B/op (HyperLogLog add) ' + ahBytes + ' B/op (HyperLogLog addHashedFrom) ' +
         ccBytes + ' B/op (CountMinSketch add cons) ' + cpBytes + ' B/op (CountMinSketch add plain) ' +
-        chBytes + ' B/op (CountMinSketch addHashed) ' + ceBytes + ' B/op (CountMinSketch estimate) ' +
+        chBytes + ' B/op (CountMinSketch addHashedFrom) ' + ceBytes + ' B/op (CountMinSketch estimate) ' +
         ddBytes + ' B/op (DDSketch add) ' +
         ssEBytes + ' B/op (SpaceSaving add evict) ' + ssBBytes + ' B/op (SpaceSaving add bump)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
@@ -402,8 +415,8 @@ async function main() {
         ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
     console.log(
         'SCAV/2e6 (minor GCs per hot method; clean floor=' + SCAV_CLEAN + ' box floor=' + SCAV_BOX + '): ' +
-        'HLL add=' + scAdd + ' HLL addHashed=' + scAh + ' | ' +
-        'CMS add cons=' + scCc + ' plain=' + scCp + ' addHashed=' + scCh + ' estimate=' + scCe + ' | ' +
+        'HLL add=' + scAdd + ' HLL addHashedFrom=' + scAh + ' | ' +
+        'CMS add cons=' + scCc + ' plain=' + scCp + ' addHashedFrom=' + scCh + ' estimate=' + scCe + ' | ' +
         'DD add=' + scDd + ' | SS evict=' + scSsE + ' bump=' + scSsB +
         ' | ' + (scavOk ? 'ok' : 'FAIL'));
     console.log(
@@ -425,10 +438,10 @@ async function main() {
         for (const f of ddFindings) console.error('  dd finding ' + f.kind + ':' + f.reason);
         for (const f of ssFindings) console.error('  ss finding ' + f.kind + ':' + f.reason);
         if (!addOk) console.error('  alloc ' + addBytes + ' B/op HyperLogLog add (raw ' + addBpc + ')');
-        if (!ahOk) console.error('  alloc ' + ahBytes + ' B/op HyperLogLog addHashed (raw ' + ahBpc + ')');
+        if (!ahOk) console.error('  alloc ' + ahBytes + ' B/op HyperLogLog addHashedFrom (raw ' + ahBpc + ')');
         if (!ccOk) console.error('  alloc ' + ccBytes + ' B/op CountMinSketch add cons (raw ' + ccBpc + ')');
         if (!cpOk) console.error('  alloc ' + cpBytes + ' B/op CountMinSketch add plain (raw ' + cpBpc + ')');
-        if (!chOk) console.error('  alloc ' + chBytes + ' B/op CountMinSketch addHashed (raw ' + chBpc + ')');
+        if (!chOk) console.error('  alloc ' + chBytes + ' B/op CountMinSketch addHashedFrom (raw ' + chBpc + ')');
         if (!ceOk) console.error('  alloc ' + ceBytes + ' B/op CountMinSketch estimate (raw ' + ceBpc + ')');
         if (!ddOk) console.error('  alloc ' + ddBytes + ' B/op DDSketch add (raw ' + ddBpc + ')');
         if (!ssEOk) console.error('  alloc ' + ssEBytes + ' B/op SpaceSaving add evict (raw ' + ssEBpc + ')');
@@ -436,8 +449,8 @@ async function main() {
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         if (!scavOk) console.error('  scavenge floor exceeded (clean<=' + SCAV_CLEAN + ' box<=' + SCAV_BOX +
-            '): HLL add=' + scAdd + ' addHashed=' + scAh + ' CMS cons=' + scCc + ' plain=' + scCp +
-            ' addHashed=' + scCh + ' estimate=' + scCe + ' DD=' + scDd + ' SS evict=' + scSsE + ' bump=' + scSsB);
+            '): HLL add=' + scAdd + ' addHashedFrom=' + scAh + ' CMS cons=' + scCc + ' plain=' + scCp +
+            ' addHashedFrom=' + scCh + ' estimate=' + scCe + ' DD=' + scDd + ' SS evict=' + scSsE + ' bump=' + scSsB);
         process.exitCode = 1;
     }
 }
