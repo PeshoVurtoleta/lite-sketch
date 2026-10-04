@@ -216,10 +216,13 @@ const mustFailAlloc = {
 // AND addHashed, gc major 0). This perf gate proves the other invariants strictly -- NO old-gen GC,
 // NO arrayBuffer growth (grows delta 0: the register bank never resizes), flat throughput, and the
 // mustFail teeth catch a real allocator -- and allows a SMALL scavenge floor. That floor is a V8
-// artifact of hashing: a uint32 hash lane >= 2^31 is a boxed double, and V8's transient handling of
-// those (e.g. passing uint32 lanes as addHashed args across a not-yet-inlined call) registers a few
-// young-gen scavenges that net to 0 B/op (torture) and never reach old gen. It is NOT a per-op heap
-// allocation (that would be thousands of scavenges + a tripped teeth, as the mustFail control shows).
+// artifact of the addHashed CALLER contract: a uint32 hash lane >= 2^31 is a boxed double, and
+// passing those lanes as addHashed args across a not-yet-inlined call registers a few young-gen
+// scavenges that net to 0 B/op (torture) and never reach old gen (F6, a later session). HLL add
+// USED to add to this floor; that was NOT the suffix widening but a Maglev deopt loop on
+// `hiSuf = (h << p) >>> 0` ("not int32"), fixed in H2.1 by `h << p` (clz32 reads the same bits), so
+// HLL add is now 0 scavenges. It is NOT a per-op heap allocation (that would be thousands of
+// scavenges + a tripped teeth, as the mustFail control shows). The value 64 is recalibrated in H2.8.
 zgcSuite({
     N: 200000,
     k: 8,

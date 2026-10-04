@@ -309,7 +309,8 @@ the output bits across both lanes.
 - npm run witness   -- the accuracy witness (measured error vs the theoretical bound)
 - npm run torture   -- the 0 B/op leak + GC-profiler gate on add (node --expose-gc)
 - npm run test:perf -- flat-throughput perf gate + a must-allocate control
-- npm run verify    -- test + test:types + torture + witness + test:perf (the release gate)
+- npm run lanes     -- child-process scavenge/deopt lanes (HLL add <= 2, N5 deopts <= 3, teeth control)
+- npm run verify    -- test + test:types + torture + witness + test:perf + lanes (the release gate)
 
 ## Roadmap
 

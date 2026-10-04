@@ -285,18 +285,24 @@ async function main() {
     // method: force a full GC, then count minor GCs (scavenges) over a hot loop.
     //
     // Result (isolated + written reasons, measured stable over SCAV_HOT=2e6):
-    //   * The SIX int32-clean lanes -- CMS add cons/plain, CMS estimate, DD add, SS evict,
-    //     SS bump -- are driven to EXACTLY 0 scavenges: their hot bodies keep every hash
-    //     word an int32 SMI (base = (h ^ g) | 0), so nothing boxes.
-    //   * THREE lanes carry a small, pinned floor from a uint32 >= 2^31 boxed double:
-    //       - HyperLogLog add / addHashed: the register-suffix `hiSuf = (h << p) >>> 0` is a
-    //         uint32 local that is >= 2^31 about half the time -> a transient HeapNumber that
-    //         nets to 0 B/op (phase 2a) and never reaches old gen. This is IN the byte-identical
-    //         hot body (widening it would be a feature), so the floor is pinned, not removed.
-    //       - CountMinSketch addHashed: the caller passes uint32 lanes (hi/lo >= 2^31) as args,
-    //         boxed at the call boundary -- the disclosed caller-side artifact.
-    //     Floor 48 is ~3x the measured ~15 (HLL) / ~7 (CMS addHashed) over 2e6, well under the
-    //     perf gate's disclosed 64, and astronomically under a real per-op allocator (the
+    //   * The SEVEN int32-clean lanes -- HLL add, CMS add cons/plain, CMS estimate, DD add,
+    //     SS evict, SS bump -- are driven to EXACTLY 0 scavenges: their hot bodies keep every
+    //     hash word an int32 SMI (base = (h ^ g) | 0, and HLL's register suffix is now the
+    //     signed int32 `h << p`), so nothing boxes.
+    //   * TWO lanes carry a small, pinned floor from a uint32 >= 2^31 boxed double -- both the
+    //     addHashed CALLER contract (the uint32-lane artifact, F6, a later session):
+    //       - HyperLogLog addHashed / CountMinSketch addHashed: the caller passes uint32 lanes
+    //         (hi/lo >= 2^31) as args, boxed at the call boundary -- the disclosed caller-side
+    //         artifact, not a library allocation.
+    //     HLL ADD used to sit on this floor too (~4 over 2e6 in this driver). That was NOT the
+    //     suffix widening but a Maglev DEOPT LOOP on `hiSuf = (h << p) >>> 0` ("not int32"):
+    //     Maglev assumed the uint32 suffix was an int32, the >= 2^31 half deopted and recompiled,
+    //     and the deopted tiers boxed every uint32 / double temporary (the audit's non-inlined
+    //     closure shape shows hundreds of such deopts -- see test/lanes.mjs N5). H2.1 changed it
+    //     to `h << p` (clz32 reads the same 32 bits and `!== 0` is unchanged), the deopt loop is
+    //     gone, and HLL add is now 0 -- so scAdd moved from SCAV_BOX to SCAV_CLEAN below.
+    //     Floor 48 is ~7-12x the measured ~4-7 (HLL addHashed and CMS addHashed) over 2e6, well
+    //     under the perf gate's disclosed 64, and astronomically under a real per-op allocator (the
     //     perf gate's mustFail control shows thousands). A regression trips this immediately.
     const SCAV_HOT = 2000000;
     const SCAV_CLEAN = 0;    // int32-clean lanes: exactly 0 (transient churn isolated away)
@@ -351,8 +357,8 @@ async function main() {
     SINK = (SINK + ddFracSink) | 0;
 
     const scavOk =
-        scAdd <= SCAV_BOX && scAh <= SCAV_BOX && scCh <= SCAV_BOX &&
-        scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&
+        scAh <= SCAV_BOX && scCh <= SCAV_BOX &&                                 // addHashed caller-boxed lanes (F6)
+        scAdd <= SCAV_CLEAN && scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&
         scDd <= SCAV_CLEAN && scSsE <= SCAV_CLEAN && scSsB <= SCAV_CLEAN &&
         scDdFrom <= SCAV_CLEAN;   // N7: addFrom on FRACTIONAL input stays at the clean floor (the delta-0 proof)
 

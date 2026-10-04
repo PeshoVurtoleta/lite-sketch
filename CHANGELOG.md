@@ -6,7 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **HyperLogLog `add` / `addHashed` no longer deopt-loop on register suffixes `>= 2^31`.**
+  The register suffix was computed as `(h << p) >>> 0`, a uint32 that is `>= 2^31` about
+  half the time. Maglev assumed it was an int32, so that half deopted (`not int32`) and
+  recompiled in a loop (hundreds of deopts per run), and the deopted tiers boxed every
+  uint32 / double temporary -- about 0.5 box per op even on small keys (12-13 young-gen
+  scavenges at 1.6M ops; Chrome ~14 B/op). The suffix is now `h << p` (a signed int32):
+  `Math.clz32` reads the same 32 bits and `!== 0` has the same truth value, so the
+  deopt loop is gone and `add` is 0 scavenges / 0 B/op for **Smi-range keys**
+  (`|key| < 2^31` on Node, whose Smis are 32-bit; Chrome's Smis are 31-bit). A key
+  `>= 2^31` still costs boxes from two separate causes, both fixed later in 1.2.0:
+  the caller boxes the argument itself at a non-inlined call (~24 scavenges at 1.6M
+  ops; only `addFrom` removes it), and the library boxes `lo = a >>> 0` into
+  `_m3round` (the other ~25 of the 49 seen with no inlining; removed by hand-inlining
+  the murmur). Output is **bit-identical** --
+  the `_reg[]` registers and `count()` match the prior release exactly at p = 4, 12, 18
+  over 600k mixed (positive, negative, `> 2^32`) keys plus the `addHashed` lanes.
+
+### Added
+
+- **`npm run lanes`** -- a child-process scavenge/deopt lane harness
+  (`test/lanes.mjs` + `test/lanes/lane.mjs`), now part of `npm run verify`. One child
+  per lane under `--max-semi-space-size=4` (default and no-inline) gates HyperLogLog
+  `add` at `<= 2` scavenges, the `--trace-deopt` audit shape at `<= 3` `not int32`
+  deopts, and a no-op teeth control at `>= 12`. `--lib <path>` runs the lanes against
+  another build for a revert-check.
 
 ## [1.1.2] - 2026-09-23
 

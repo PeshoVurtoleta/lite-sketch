@@ -55,7 +55,9 @@ const ODD_CONST = 0x9e3779b1 | 0;
  * always SMIs and never box a HeapNumber (a uint32 >= 2^31 is a boxed double, and
  * storing that to a module slot allocates per op). The bit pattern is the full 32-bit
  * hash; readers recover the unsigned value with `>>> 0` at the boundary, and `add`'s
- * `>>> (32-p)` / `(x << p) >>> 0` / `clz32` are bit-identical on the signed slot.
+ * `>>> (32-p)` / `(x << p)` / `clz32` are bit-identical on the signed slot (the suffix
+ * `x << p` stays a signed int32: `clz32` reads the same 32 bits and `!== 0` has the same
+ * truth value as the old `(x << p) >>> 0`, so no `>>> 0` coercion is needed).
  */
 let HASH_HI = 0;
 let HASH_LO = 0;
@@ -317,7 +319,7 @@ export class HyperLogLog {
         g = _m3final(g ^ 8);                       // LO lane (int32 local)
         const p = this._p;
         const j = h >>> (32 - p);
-        const hiSuf = (h << p) >>> 0;
+        const hiSuf = h << p;
         const rho = hiSuf !== 0
             ? Math.clz32(hiSuf) + 1
             : (32 - p) + Math.clz32(g) + 1;
@@ -338,7 +340,7 @@ export class HyperLogLog {
         if (typeof lo !== 'number' || (lo >>> 0) !== lo) return this._badLane(lo);
         const p = this._p;
         const j = hi >>> (32 - p);
-        const hiSuf = (hi << p) >>> 0;
+        const hiSuf = hi << p;
         const rho = hiSuf !== 0
             ? Math.clz32(hiSuf) + 1
             : (32 - p) + Math.clz32(lo) + 1;

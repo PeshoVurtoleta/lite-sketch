@@ -434,3 +434,160 @@ test('clear: after fill + clear, count ~0 and every register is zero', () => {
     assert.ok(h.count() <= 1, 'count after clear ' + h.count());
     for (let i = 0; i < h.m; i++) assert.equal(h._reg[i], 0);
 });
+
+// --- H2.1 / F1: the signed register suffix `h << p` --------------------------
+// F1 replaced `hiSuf = (h << p) >>> 0` with `h << p` in add + addHashed. The oracle
+// below is the OLD unsigned form (via expected()); these cases pin that the signed
+// suffix feeds clz32 and `!== 0` identically for every edge, register and tier.
+
+// rho exactly as the 1.1.2 body computed it (unsigned suffix) and as H2.1 does (signed).
+function rhoOld(h, g, p) {
+    const s = (h << p) >>> 0;
+    return s !== 0 ? Math.clz32(s) + 1 : (32 - p) + Math.clz32(g) + 1;
+}
+function rhoNew(h, g, p) {
+    const s = h << p;
+    return s !== 0 ? Math.clz32(s) + 1 : (32 - p) + Math.clz32(g) + 1;
+}
+const EDGE_LO = [0, 1, -1, 0x80000000 | 0, 0x7fffffff, 0x40000000];
+
+test('F1: signed suffix `h << p` gives the same rho and the same `!== 0` branch as `(h << p) >>> 0` (edges x p in [4, 18])', () => {
+    for (let p = 4; p <= 18; p++) {
+        const edges = [
+            0, 1, -1, 0x80000000 | 0, 0x7fffffff, 0x40000000, 2, 3,
+            1 << (31 - p),              // suffix MSB = bit 31 after the shift -> rho 1, signed suffix < 0
+            (1 << (31 - p)) - 1,        // every suffix bit below the MSB set
+            (1 << (31 - p)) | 1,        // MSB + LSB of the suffix
+            -(1 << (32 - p)),           // top p bits all ones, suffix 0 -> LO-lane branch
+            1 << (32 - p),              // lowest index bit only, suffix 0
+            (1 << (32 - p)) - 1,        // index 0, suffix all ones
+            -(1 << (32 - p)) | 1,       // last register, suffix LSB only -> rho 32 - p
+            0xdeadbeef | 0, 0x9e3779b1 | 0, 0x55555555, 0xaaaaaaaa | 0,
+        ];
+        for (const h of edges) {
+            const so = (h << p) >>> 0, sn = h << p;
+            assert.equal(sn !== 0, so !== 0, 'branch p=' + p + ' h=' + h);
+            assert.equal(Math.clz32(sn), Math.clz32(so), 'clz32 p=' + p + ' h=' + h);
+            for (const g of EDGE_LO) {
+                assert.equal(rhoNew(h, g, p), rhoOld(h, g, p), 'rho p=' + p + ' h=' + h + ' g=' + g);
+                assert.ok(rhoNew(h, g, p) >= 1 && rhoNew(h, g, p) <= 64 - p + 1, 'rho range p=' + p);
+            }
+        }
+        // the two named edges have known rho: suffix MSB set -> 1; suffix LSB only -> 32 - p
+        assert.equal(rhoNew(1 << (31 - p), 0, p), 1, 'suffix MSB p=' + p);
+        assert.equal(rhoNew(1, 0, p), 32 - p, 'suffix LSB p=' + p);
+        assert.equal(rhoNew(-(1 << (32 - p)), 0, p), 64 - p + 1, 'all-zero suffix p=' + p);
+    }
+});
+
+test('F1: addHashed with hi bit 31 set lands the reference j / rho in exactly ONE register (p in [4, 18])', () => {
+    for (let p = 4; p <= 18; p++) {
+        const m = 1 << p;
+        const his = [
+            0x80000000, 0xffffffff, 0x80000001,
+            (0x80000000 | (1 << (31 - p))) >>> 0,      // suffix MSB -> rho 1, j = m/2
+            (0x80000000 | 1) >>> 0,                    // suffix LSB -> rho 32 - p
+            (~0 << (32 - p)) >>> 0,                    // j = m - 1 (the N-1 register), suffix 0 -> LO branch
+            ((~0 << (32 - p)) | (1 << (31 - p))) >>> 0, // j = m - 1, rho 1
+            0xdeadbeef, 0x9e3779b1, 0xaaaaaaaa,
+        ];
+        for (const hi of his) {
+            for (const lo of [0, 1, 0x7fffffff, 0x80000000, 0xffffffff]) {
+                const h = new HyperLogLog(p);
+                const exp = expected(hi, lo, p);
+                assert.ok(exp.j >= 0 && exp.j < m, 'j range');
+                assert.equal(h.addHashed(hi, lo), h);
+                let nz = 0;
+                for (let r = 0; r < m; r++) if (h._reg[r] !== 0) nz++;
+                assert.equal(nz, 1, 'exactly one register written p=' + p + ' hi=' + hi + ' lo=' + lo);
+                assert.equal(h._reg[exp.j], exp.rho, 'reg[j] p=' + p + ' hi=' + hi + ' lo=' + lo);
+            }
+        }
+        // named expectations at the register boundaries
+        const top = new HyperLogLog(p);
+        top.addHashed((~0 << (32 - p)) >>> 0, 0);
+        assert.equal(top._reg[m - 1], 64 - p + 1, 'reg[m-1] all-zero suffix p=' + p);
+        const half = new HyperLogLog(p);
+        half.addHashed((0x80000000 | (1 << (31 - p))) >>> 0, 0);
+        assert.equal(half._reg[m >>> 1], 1, 'reg[m/2] suffix MSB p=' + p);
+    }
+});
+
+test('F1: hi-lane boundary matrix 2^31-1 / 2^31 / 2^31+1 / 2^32-1 accepted; 2^32 / 2^32+1 / -1 / NaN / null / undefined / 1.5 rejected byte-identically; -0 behaves as 0', () => {
+    const p = 10;
+    for (const hi of [2 ** 31 - 1, 2 ** 31, 2 ** 31 + 1, 2 ** 32 - 1]) {
+        const h = new HyperLogLog(p);
+        h.addHashed(hi, 0);
+        const exp = expected(hi, 0, p);
+        assert.equal(h._reg[exp.j], exp.rho, 'hi=' + hi);
+    }
+    const h = new HyperLogLog(p);
+    for (let i = 0; i < 5000; i++) h.addHashed((i * 2654435761) >>> 0, (i * 40503) >>> 0);
+    const snap = Array.from(h._reg);
+    for (const bad of [2 ** 32, 2 ** 32 + 1, -1, NaN, null, undefined, 1.5, -(2 ** 31), Infinity]) {
+        assert.throws(() => h.addHashed(bad, 0), liteSketch, 'hi=' + String(bad));
+        assert.throws(() => h.addHashed(0x80000000, bad), liteSketch, 'lo=' + String(bad));
+    }
+    assert.deepEqual(Array.from(h._reg), snap, 'rejections left the registers byte-identical');
+    const a = new HyperLogLog(p), b = new HyperLogLog(p);
+    a.addHashed(-0, -0); b.addHashed(0, 0);
+    assert.deepEqual(Array.from(a._reg), Array.from(b._reg), '-0 lanes == 0 lanes');
+    assert.equal(a._reg[0], 64 - p + 1);
+});
+
+test('F1: optimized-tier parity -- 200k sign-bit addHashed lanes + 100k add keys match the unsigned-suffix oracle register-for-register (p 4/12/18)', () => {
+    for (const p of [4, 12, 18]) {
+        const m = 1 << p;
+        const h = new HyperLogLog(p);
+        const oracle = new Uint8Array(m);
+        for (let i = 0; i < 200000; i++) {
+            const hi = ((Math.imul(i, 0x9e3779b1) | 0x80000000) >>> 0) ^ ((i & 1) << (31 - p));
+            const lo = Math.imul(i ^ 0x5bd1e995, 0x85ebca6b) >>> 0;
+            h.addHashed(hi >>> 0, lo);
+            const e = expected(hi >>> 0, lo, p);
+            if (e.rho > oracle[e.j]) oracle[e.j] = e.rho;
+        }
+        const ka = new HyperLogLog(p);
+        const ko = new Uint8Array(m);
+        for (let i = 0; i < 100000; i++) {
+            const key = i % 3 === 0 ? i : i % 3 === 1 ? -i * 7 : 2 ** 33 + i;
+            ka.add(key);
+            mix64(key, ka.seed);
+            const e = expected(hashHi(), hashLo(), p);
+            if (e.rho > ko[e.j]) ko[e.j] = e.rho;
+        }
+        let d = 0, dk = 0;
+        for (let r = 0; r < m; r++) { if (h._reg[r] !== oracle[r]) d++; if (ka._reg[r] !== ko[r]) dk++; }
+        assert.equal(d, 0, 'addHashed register diffs at p=' + p);
+        assert.equal(dk, 0, 'add register diffs at p=' + p);
+    }
+});
+
+test('F1: duplicate sign-bit writes and a double clear() are idempotent', () => {
+    const p = 8;
+    const h = new HyperLogLog(p);
+    const hi = (0x80000000 | (1 << (31 - p))) >>> 0;
+    h.addHashed(hi, 0).addHashed(hi, 0);
+    const exp = expected(hi, 0, p);
+    assert.equal(h._reg[exp.j], exp.rho);
+    assert.equal(h.clear(), h);
+    assert.equal(h.clear(), h);
+    for (let r = 0; r < h.m; r++) assert.equal(h._reg[r], 0);
+    h.addHashed(hi, 0);
+    assert.equal(h._reg[exp.j], exp.rho, 'writes after a double clear land normally');
+});
+
+// ADVERSARIAL (pre-existing in 1.1.2, found by H2.1 qa, NOT an F1 regression): the cold
+// thrower formats the rejected lane with String(x), which runs caller code. A null-proto
+// object makes String() throw an UNTAGGED TypeError, a throwing toString replaces the
+// tagged error, and a toString that re-enters addHashed mutates the receiver during a
+// "byte-identical" rejection. Pinned as todo so verify stays green until a fix session.
+test('ADVERSARIAL: a rejected lane never runs caller code (tagged throw, receiver untouched)', { todo: 'thrower calls String(x): null-proto / throwing / re-entrant toString escape the tag' }, () => {
+    const h = new HyperLogLog(4);
+    assert.throws(() => h.addHashed(Object.create(null), 0), liteSketch, 'null-proto lane');
+    assert.throws(() => h.add(Object.create(null)), liteSketch, 'null-proto key');
+    assert.throws(() => h.addHashed({ toString() { throw new Error('boom'); } }, 0), liteSketch, 'throwing toString');
+    const snap = Array.from(h._reg);
+    assert.throws(() => h.addHashed({ toString() { h.addHashed(0, 0); return 'x'; } }, 0), liteSketch);
+    assert.deepEqual(Array.from(h._reg), snap, 're-entrant toString mutated the receiver');
+});

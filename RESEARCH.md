@@ -6,7 +6,8 @@ identity, the analytical anchor, the benchmark, the roster, the honesty hook, th
 sibling boundaries, a reference member, the central design call, the demo, the path,
 the open questions. ASCII-only (`->`, `<=`, `x`, "approx" -- never Unicode).
 
-Status: PROPOSED / user-approved 2026-09-22, greenlit 2026-09-23. Not yet coded.
+Status: SHIPPED (1.0.0 -> 1.1.2). Originally PROPOSED / user-approved 2026-09-22, greenlit 2026-09-23.
+The audits are in sections 12 (1.0.0) and 13 (1.1.2, 2026-10-04).
 This document + ROADMAP.md are the pre-code research pass, to be read and settled
 before the first member session.
 
@@ -349,5 +350,49 @@ not for fractional latencies, which are DDSketch's primary use. Remedy: ROADMAP.
 (N7, `addFrom(buf, i)`), plus a fractional-input scaling lane with an add(value) control. This is
 the same class of blind spot as N6: measureAllocs cannot see transient allocation.
 
-MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+---
 
+## 13. The 2026-10-04 final-sweep audit of 1.1.2 -- the record behind ROADMAP section 7
+
+Two parallel read-only audits of 1a2673e, triggered by lite-hud M3's step-0 probe failing on the
+published 1.1.2. The allocation method: scavenges at N=200k and 8N under `--max-semi-space-size=4`,
+inputs from a Float64Array, one lane per process, fresh and warm, default and
+`--max-inlined-bytecode-size=0`, plus a heap sampling profiler (bytes/op per function), deopt
+traces, and headless Chrome 154 (31-bit Smis, precise memory). One 16 B box per op reads 24 at 8N.
+Probes and the prototype are in the lite-hud session scratchpad (`sketch-alloc/`, `sketch-fc/`).
+
+### 13.1 Why the 1.1.0 gates passed
+
+- **The thresholds were above one box per op.** Perf `maxScavenges: 64` is about 2.7 boxes/op, and
+  torture `SCAV_BOX = 48` about 1.6. The only mustFail allocated ~528 B/op, so the gate's teeth were
+  calibrated against a signal ~30x too large.
+- **The documented "pinned floor" was a bug.** HLL's floor was attributed to an unavoidable cost. It
+  was a Maglev deopt loop on `(h << p) >>> 0` (416-461 deopts per run), removed by one line.
+- **The drivers fed int32 closure keys, count 1, at inlined sites.** No lane used keys or counts
+  >= 2^31, Float64Array-fed inputs, a no-inline process or a browser.
+- **Node has 32-bit Smis.** Half of every murmur word boxes in Chrome and never on this Node.
+
+### 13.2 Lessons (new for the suite)
+
+1. **`x >>> 0` in a hot body is a deopt hazard.** When V8 speculated int32 and the value reaches
+   2^31, the function deopts and recompiles in a loop, and the lower tiers box every temporary.
+   Prefer signed `| 0` arithmetic when only the bits matter (`clz32` is sign-agnostic).
+2. **A "pinned floor" needs a measured cause, not a guessed one.** Before tolerating a scavenge
+   floor, find the allocating function (sampling profiler) and the tier (deopt trace).
+3. **Accumulated values leave Smi range even when inputs do not.** SpaceSaving's per-key counts
+   pass 2^31 from ordinary microsecond weights, and every helper that receives the count as an
+   argument then boxes. Pass slots, not values.
+4. **The hash is the browser's problem.** Murmur words are uniform over 32 bits, so with 31-bit Smis
+   about half of them box at every non-inlined helper boundary. Hand-inline the mix in hot bodies.
+5. **Sign folding into a hash must use a free bit.** XOR-ing the sign into bit 0 of the high word
+   aliases `-(H*2^32+L)` with `(H^1)*2^32+L`. Use a bit the magnitude can never set (bit 31,
+   since hiw < 2^21).
+6. **Guard both doors of a pair.** F1/F2 (1.1.0) fixed `add` and left `estimate` aliasing the
+   same rejected keys.
+7. **A merge must merge the honesty flags too.** `collapsed` (and, after F14, `saturated`) are part
+   of the accuracy claim, so a merge that drops them launders a degraded sketch into a "hard alpha"
+   one.
+8. **A constructor's fix-up loop needs an iteration cap.** A loop that "nudges until correct" turns
+   into a hang where floating point stops moving the value (K > 2^53).
+
+MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

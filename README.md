@@ -357,6 +357,7 @@ SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the e
 - `npm run witness` -- the accuracy witness (measured error vs the theoretical bound).
 - `npm run torture` -- the `0 B/op` leak + GC-profiler gate on `add` (`node --expose-gc`).
 - `npm run test:perf` -- flat-throughput perf gate + a must-allocate control that the gate catches.
+- `npm run lanes` -- per-op scavenge + deopt lanes in child processes (one per lane, `--max-semi-space-size=4`), gating `HyperLogLog.add` at `<= 2` scavenges, the `--trace-deopt` audit shape at `<= 3` `not int32` deopts, and a teeth control at `>= 12`.
 
 ## What this is not
 
