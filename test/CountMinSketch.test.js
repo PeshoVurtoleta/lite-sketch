@@ -850,3 +850,204 @@ for (const conservative of [false, true]) {
         assert.equal(bad, '', 'estimate != estimateHashed(mix64) for: ' + bad);
     });
 }
+
+// ===========================================================================================
+// H2.5 F4 -- argument-free CMS helpers (_applyCons/_applyPlain read _base/_cnt; per-row fmix
+// hand-inlined). Parity-type: passes on HEAD too (behavior byte-identical). The FAIL-on-HEAD
+// teeth are test/lanes.mjs. The interleave test also proves _base/_cnt are PER-INSTANCE.
+// ===========================================================================================
+const H25_ODD = 0x9e3779b1 | 0, H25_FC1 = 0x85ebca6b | 0, H25_FC2 = 0xc2b2ae35 | 0;
+function h25fmix32(h) {
+    h = h ^ (h >>> 16); h = Math.imul(h, H25_FC1); h = h ^ (h >>> 13); h = Math.imul(h, H25_FC2); h = h ^ (h >>> 16);
+    return h;
+}
+// The d columns a key with lanes (hi, lo) fills: base = (hi ^ lo)|0, col_i = fmix(base ^ i*ODD) & (w-1).
+function h25cols(hi, lo, d, w) {
+    const base = (hi ^ lo) | 0;
+    const cols = [];
+    for (let i = 0; i < d; i++) cols.push(h25fmix32((base ^ Math.imul(i, H25_ODD)) | 0) & (w - 1));
+    return cols;
+}
+function h25cmsEqual(a, b, keys, label) {
+    let d = 0;
+    for (let i = 0; i < a._counts.length; i++) if (a._counts[i] !== b._counts[i]) d++;
+    assert.equal(d, 0, label + ': _counts drift');
+    assert.equal(a.total, b.total, label + ': total');
+    assert.equal(a.saturated, b.saturated, label + ': saturated');
+    for (const k of keys) assert.equal(a.estimate(k), b.estimate(k), label + ': estimate(' + k + ')');
+}
+
+test('H2.5 F4 (CMS add fills exactly the reference fmix32 columns): add(k, 2^31+5) at (7,64), ' +
+    'cons + plain, then add(k, 2^31) saturates to 2^32-1', () => {
+    for (const conservative of [true, false]) {
+        const s = new CountMinSketch(7, 64, { conservative });
+        const k = 12345;
+        mix64(k, s.seed);
+        const cols = h25cols(hashHi(), hashLo(), 7, 64);
+        s.add(k, 2 ** 31 + 5);
+        for (let i = 0; i < 7; i++) {
+            assert.equal(s._counts[i * 64 + cols[i]], 2 ** 31 + 5, 'cons=' + conservative + ' row ' + i + ' cell');
+        }
+        let nz = 0;
+        for (let j = 0; j < s._counts.length; j++) if (s._counts[j] !== 0) nz++;
+        assert.equal(nz, 7, 'cons=' + conservative + ': exactly d cells set');
+        assert.equal(s.estimate(k), 2 ** 31 + 5, 'cons=' + conservative + ': estimate pre-saturate');
+        assert.equal(s.saturated, false);
+        s.add(k, 2 ** 31);                                   // pushes every cell past 2^32-1
+        assert.equal(s.estimate(k), 2 ** 32 - 1, 'cons=' + conservative + ': estimate saturated');
+        assert.equal(s.saturated, true, 'cons=' + conservative + ': saturated flag');
+    }
+});
+
+test('H2.5 F4 (CMS addHashed fills exactly the reference fmix32 columns): addHashed(hi,lo,2^31+5) ' +
+    'at (7,64), cons + plain, then addHashed(hi,lo,2^31) saturates', () => {
+    for (const conservative of [true, false]) {
+        const s = new CountMinSketch(7, 64, { conservative });
+        const hi = 0xdeadbeef, lo = 0x12345678;
+        const cols = h25cols(hi, lo, 7, 64);
+        s.addHashed(hi, lo, 2 ** 31 + 5);
+        for (let i = 0; i < 7; i++) {
+            assert.equal(s._counts[i * 64 + cols[i]], 2 ** 31 + 5, 'cons=' + conservative + ' row ' + i + ' cell');
+        }
+        let nz = 0;
+        for (let j = 0; j < s._counts.length; j++) if (s._counts[j] !== 0) nz++;
+        assert.equal(nz, 7, 'cons=' + conservative + ': exactly d cells set');
+        assert.equal(s.estimateHashed(hi, lo), 2 ** 31 + 5, 'cons=' + conservative + ': estimate pre-saturate');
+        assert.equal(s.saturated, false);
+        s.addHashed(hi, lo, 2 ** 31);
+        assert.equal(s.estimateHashed(hi, lo), 2 ** 32 - 1, 'cons=' + conservative + ': estimate saturated');
+        assert.equal(s.saturated, true, 'cons=' + conservative + ': saturated flag');
+    }
+});
+
+test('H2.5 F4 (CMS interleaved instances == solo twins): _base/_cnt are PER-INSTANCE, so ' +
+    'time-interleaving two sketches gives the same state as building each alone', () => {
+    for (const conservative of [true, false]) {
+        const a = new CountMinSketch(7, 64, { conservative });
+        const b = new CountMinSketch(7, 64, { conservative });
+        const aSolo = new CountMinSketch(7, 64, { conservative });
+        const bSolo = new CountMinSketch(7, 64, { conservative });
+        // mix of add (hashed-internally) and addHashed, counts incl. >= 2^31.
+        const aOps = [['k', 11, 2 ** 31 + 1], ['k', 22, 2 ** 30], ['k', 11, 3], ['h', 7, 9, 2 ** 32 - 1]];
+        const bOps = [['k', 44, 2 ** 31 + 7], ['h', 3, 5, 5], ['k', 55, 2 ** 31], ['k', 11, 2 ** 30]];
+        const apply = (s, op) => (op[0] === 'k' ? s.add(op[1], op[2]) : s.addHashed(op[1], op[2], op[3]));
+        const n = Math.max(aOps.length, bOps.length);
+        for (let i = 0; i < n; i++) {
+            if (i < aOps.length) { apply(a, aOps[i]); apply(aSolo, aOps[i]); }
+            if (i < bOps.length) { apply(b, bOps[i]); apply(bSolo, bOps[i]); }
+        }
+        h25cmsEqual(a, aSolo, [11, 22, 44, 55], 'cons=' + conservative + ' a');
+        h25cmsEqual(b, bSolo, [11, 22, 44, 55], 'cons=' + conservative + ' b');
+    }
+});
+
+// ===========================================================================================
+// QA H2.5 -- boundary tests a mis-port of the argument-free helpers / inlined per-row fmix would
+// fail. All but the last pass on HEAD too (parity-type); the last is NEW-CODE ONLY (_base/_cnt).
+// ===========================================================================================
+test('QA H2.5 (CMS d=1/w=1, d=32, count 2^32-1 via addHashed): every row fills exactly the reference ' +
+    'column at 2^32-1 WITHOUT saturating; one more unit clamps and sets saturated (cons + plain)', () => {
+    // lanes chosen for adversarial bases: hi^lo = 0, = int32 min (-2^31), = -1, and a generic pair
+    const lanes = [[0x12345678, 0x12345678], [0x80000000, 0], [0xffffffff, 0], [0, 0xffffffff], [0xdeadbeef, 0x0badf00d]];
+    for (const [d, w] of [[1, 1], [32, 1], [32, 1024], [1, 4096]]) {
+        for (const conservative of [true, false]) {
+            for (const [hi, lo] of lanes) {
+                const tag = 'd=' + d + ' w=' + w + ' cons=' + conservative + ' lanes=' + hi + ',' + lo;
+                const s = new CountMinSketch(d, w, { conservative });
+                const cols = h25cols(hi, lo, d, w);
+                s.addHashed(hi, lo, 4294967295);
+                let nz = 0;
+                for (let j = 0; j < s._counts.length; j++) if (s._counts[j] !== 0) nz++;
+                assert.equal(nz, d, tag + ': exactly d cells');
+                for (let i = 0; i < d; i++) assert.equal(s._counts[i * w + cols[i]], 4294967295, tag + ' row ' + i);
+                assert.equal(s.saturated, false, tag + ': 2^32-1 exactly is NOT a clamp');
+                assert.equal(s.estimateHashed(hi, lo), 4294967295, tag);
+                s.addHashed(hi, lo, 1);
+                assert.equal(s.saturated, true, tag + ': the next unit clamps');
+                assert.equal(s.estimateHashed(hi, lo), 4294967295, tag + ': clamped');
+                assert.equal(s.total, 4294967296, tag + ': total stays exact past the cell clamp');
+            }
+        }
+    }
+});
+
+test('QA H2.5 (CMS rejected add/addHashed between valid adds): the reject leaves _counts / total / ' +
+    'saturated byte-identical, and the NEXT valid add is unaffected by the reject (== a twin that never ' +
+    'saw it) -- counts differ op-to-op so a stale count / base would show', () => {
+    for (const conservative of [true, false]) {
+        const s = new CountMinSketch(7, 64, { conservative });
+        const twin = new CountMinSketch(7, 64, { conservative });
+        const ops = [
+            ['k', 2 ** 31, 2 ** 31 + 5], ['h', 0x80000000, 1, 3], ['k', -(2 ** 53 - 1), 1],
+            ['k', 9, 2 ** 32 - 1], ['h', 5, 6, 2 ** 30], ['k', 2 ** 31, 7],
+        ];
+        const rejects = [
+            () => s.add(123456789, 0), () => s.add(123456789, 2 ** 32), () => s.add(1.5, 99),
+            () => s.add(2 ** 53, 99), () => s.add(NaN, 99), () => s.addHashed(2 ** 32, 1, 99),
+            () => s.addHashed(1, -1, 99), () => s.addHashed(1, 1, 2 ** 31 + 0.5),
+        ];
+        const apply = (x, op) => (op[0] === 'k' ? x.add(op[1], op[2]) : x.addHashed(op[1], op[2], op[3]));
+        for (let i = 0; i < ops.length; i++) {
+            for (const bad of rejects) {
+                const before = cmsSnap(s);
+                assert.throws(bad, liteSketch, 'cons=' + conservative + ' op ' + i);
+                cmsUnchanged(before, s, 'cons=' + conservative + ' op ' + i);
+            }
+            apply(s, ops[i]); apply(twin, ops[i]);
+            assert.deepEqual(Array.from(s._counts), Array.from(twin._counts), 'cons=' + conservative + ' op ' + i + ': stale scratch');
+            assert.equal(s.total, twin.total);
+            assert.equal(s.saturated, twin.saturated);
+        }
+        // total-ceiling reject: push total to 2^53-1 - 2 on a scratch twin pair via merge doubling
+        const a = new CountMinSketch(2, 4, { conservative: false });
+        a.addHashed(1, 2, 4294967295);
+        for (let r = 0; r < 21; r++) a.merge(a);              // total = (2^32-1) * 2^21 < 2^53-1
+        const room = MAX_SAFE - a.total;
+        const before = cmsSnap(a);
+        assert.throws(() => a.add(77, Math.min(room + 1, 4294967295)), (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+        cmsUnchanged(before, a, 'total-ceiling reject');
+    }
+});
+
+test('QA H2.5 (CMS plain merge then add with counts >= 2^31): merge(a, b) then add == one sketch fed ' +
+    'the whole stream (plain merge is exact; the scratch is not touched by merge)', () => {
+    const a = new CountMinSketch(5, 128, { conservative: false });
+    const b = new CountMinSketch(5, 128, { conservative: false });
+    const all = new CountMinSketch(5, 128, { conservative: false });
+    for (let i = 0; i < 300; i++) {
+        const k = (i & 1) ? -(2 ** 31) - i : 2 ** 32 + i, c = [1, 2 ** 31 + (i & 7), 2 ** 30][i % 3];
+        ((i & 2) ? a : b).add(k, c); all.add(k, c);
+    }
+    a.merge(b);
+    for (let i = 0; i < 50; i++) { a.add(2 ** 31 + i, 2 ** 31 + 1); all.add(2 ** 31 + i, 2 ** 31 + 1); }
+    a.addHashed(0xffffffff, 1, 2 ** 31); all.addHashed(0xffffffff, 1, 2 ** 31);
+    assert.deepEqual(Array.from(a._counts), Array.from(all._counts));
+    assert.equal(a.total, all.total);
+    assert.equal(a.saturated, all.saturated);
+});
+
+test('QA H2.5 (CMS _base/_cnt scratch, NEW-CODE ONLY): per-instance Int32Array(1) / Float64Array(1); ' +
+    'a rejected add never writes them; a valid add leaves exactly (hi^lo)|0 and the count', () => {
+    for (const conservative of [true, false]) {
+        const s = new CountMinSketch(4, 1024, { conservative });
+        const t = new CountMinSketch(4, 1024, { conservative });
+        assert.ok(s._base instanceof Int32Array && s._base.length === 1);
+        assert.ok(s._cnt instanceof Float64Array && s._cnt.length === 1);
+        assert.notEqual(s._base, t._base);
+        assert.notEqual(s._cnt, t._cnt);
+        s.addHashed(0x80000000, 0, 2 ** 32 - 1);
+        assert.equal(s._base[0], -2147483648);
+        assert.equal(s._cnt[0], 4294967295);
+        assert.equal(t._cnt[0], 0, 'twin scratch untouched');
+        for (const bad of [() => s.add(5, 0), () => s.add(0.5, 3), () => s.addHashed(1, 2, 2 ** 32), () => s.addHashed(-1, 2, 3)]) {
+            assert.throws(bad, liteSketch);
+            assert.equal(s._base[0], -2147483648, 'cons=' + conservative + ': reject wrote _base');
+            assert.equal(s._cnt[0], 4294967295, 'cons=' + conservative + ': reject wrote _cnt');
+        }
+        mix64(-7, s.seed);
+        const hi = hashHi(), lo = hashLo();
+        s.add(-7, 2 ** 31 + 9);
+        assert.equal(s._base[0], (hi ^ lo) | 0, 'cons=' + conservative + ': add base == (hi^lo)|0 of mix64');
+        assert.equal(s._cnt[0], 2 ** 31 + 9);
+    }
+});

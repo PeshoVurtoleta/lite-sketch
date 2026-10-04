@@ -286,6 +286,140 @@ try {
     console.log('PARITY SS vs ' + ref + ': streams(cap 1/7/64/1000)+merge=' + (ssFail || 'identical') +
         ' | _mapOcc-positions-moved=' + occMoved + ' (hash-dependent, print-only) | ' + (ssOk ? 'ok' : 'FAIL'));
 
+    // ---- H2.5 F3/F4 identity: argument-free CMS helpers + SS inlined bump/_homeAt ----------
+    // The whole point of H2.5 is a ZERO behavior change: _base/_cnt, the inlined bump, _homeAt /
+    // _probeAt and _attach-reads-_count must leave every observable bit identical to the ref. This
+    // drives counts {1, 2^30, 2^31+j, 2^32-1} (the F3/F4 box domain) through CMS (1,1)/(4,1024)/
+    // (7,64) cons+plain and SS cap 1/7/64/1000, comparing the FULL pools. A TREE-SIDE per-op
+    // _mapOcc population watchdog (popcount === size, an array walk that cannot spin) FAILs before a
+    // broken SS hash could fill the table and spin a probe -- closing the H2.4 watchdog gap here.
+    let h25Fail = '';
+    let h25Checks = 0;
+    // Cheap ref-F12 probe: the pair (-(H*2^32+L), (H^1)*2^32+L) collides on the HI lane for a
+    // pre-F12 ref (sign folded into bit 0, a magnitude bit) and separates on an F12 ref. H2.5
+    // changes NO hash, so its state matches the ref bit-for-bit only where the ref hashes the key
+    // the same way: on an F12 ref over mixed-sign keys, on a pre-F12 ref over NON-NEGATIVE keys.
+    B.mix64(-(5 * 4294967296 + 7), 7); const h25RefNegHi = B.hashHi();
+    B.mix64(((5 ^ 1) * 4294967296 + 7), 7); const h25RefTwinHi = B.hashHi();
+    const h25RefHasF12 = h25RefNegHi !== h25RefTwinHi;
+    let hr = 0x5bd1e995 >>> 0;
+    const hrnd = () => { hr = (hr + 0x6d2b79f5) | 0; let t = hr; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const h25key = (i) => {
+        let base;
+        switch (i % 8) {
+            case 0: base = (hrnd() * 1000) | 0; break;                   // small
+            case 1: base = 2 ** 31 + ((hrnd() * 1e6) | 0); break;        // b31
+            case 2: base = 4294967295 - ((hrnd() * 65536) | 0); break;   // u32
+            case 3: base = 4294967296; break;                            // exactly 2^32
+            case 4: base = 2 ** 33 + ((hrnd() * 1e6) | 0); break;        // > 2^32
+            case 5: base = 9007199254740000 + ((hrnd() * 900) | 0); break; // near MAX_SAFE
+            case 6: base = 9007199254740991; break;                      // 2^53-1
+            default: base = (hrnd() * 5000) | 0;                         // small (drives bumps)
+        }
+        // Mixed sign only when the ref carries F12; otherwise non-negative (a pre-F12 ref hashes
+        // negatives differently, which is the F12 DOC-DIFF's job, not this identity section's).
+        return (h25RefHasF12 && (i & 1)) ? -base : base;
+    };
+    const h25count = (i) => [1, 2 ** 30, 2 ** 31 + (i & 7), 2 ** 32 - 1][i & 3];
+    const popOcc = (s) => { let n = 0; for (let i = 0; i < s._mapOcc.length; i++) n += s._mapOcc[i]; return n; };
+
+    // CMS: per-op total/saturated/estimate compare, then estimateHashed + a saturated-other merge.
+    for (const [d, w] of [[1, 1], [4, 1024], [7, 64]]) for (const conservative of [true, false]) {
+        const a = new A.CountMinSketch(d, w, { conservative, seed: 7 });
+        const b = new B.CountMinSketch(d, w, { conservative, seed: 7 });
+        for (let i = 0; i < 20000 && !h25Fail; i++) {
+            const k = h25key(i), c = h25count(i);
+            a.add(k, c); b.add(k, c);
+            if ((i & 7) === 0) { const hi = (i * 2654435761) >>> 0, lo = (i * 40503) >>> 0, c2 = h25count(i + 1); a.addHashed(hi, lo, c2); b.addHashed(hi, lo, c2); }
+            h25Checks += 3;
+            if (a.total !== b.total) h25Fail = 'cms ' + d + 'x' + w + ' total@' + i;
+            else if (a.saturated !== b.saturated) h25Fail = 'cms ' + d + 'x' + w + ' saturated@' + i;
+            else if (a.estimate(k) !== b.estimate(k)) h25Fail = 'cms ' + d + 'x' + w + ' estimate@' + i;
+            else if ((i & 7) === 0 && a.estimateHashed((i * 2654435761) >>> 0, (i * 40503) >>> 0) !== b.estimateHashed((i * 2654435761) >>> 0, (i * 40503) >>> 0)) h25Fail = 'cms ' + d + 'x' + w + ' estimateHashed@' + i;
+        }
+        const ca = a._counts, cb = b._counts;
+        for (let j = 0; j < ca.length && !h25Fail; j++) { h25Checks++; if (ca[j] !== cb[j]) h25Fail = 'cms ' + d + 'x' + w + ' counts[' + j + ']'; }
+    }
+    if (!h25Fail) {
+        const ta = new A.CountMinSketch(5, 256, { conservative: false, seed: 7 });
+        const tb = new B.CountMinSketch(5, 256, { conservative: false, seed: 7 });
+        const oa = new A.CountMinSketch(5, 256, { conservative: false, seed: 7 });
+        const ob = new B.CountMinSketch(5, 256, { conservative: false, seed: 7 });
+        for (let i = 0; i < 2000; i++) { const k = h25key(i), c = h25count(i); ta.add(k, c); tb.add(k, c); }
+        oa.add(777, 2 ** 32 - 1); ob.add(777, 2 ** 32 - 1); oa.add(777, 10); ob.add(777, 10);  // saturate the other
+        if (!oa.saturated) h25Fail = 'cms saturated-other setup bug';
+        ta.merge(oa); tb.merge(ob);
+        h25Checks += 2;
+        if (!h25Fail && ta.saturated !== tb.saturated) h25Fail = 'cms merge saturated';
+        if (!h25Fail && ta.total !== tb.total) h25Fail = 'cms merge total';
+        for (let j = 0; j < ta._counts.length && !h25Fail; j++) { h25Checks++; if (ta._counts[j] !== tb._counts[j]) h25Fail = 'cms merge counts[' + j + ']'; }
+    }
+
+    // SS: full-pool identity after an evicting stream, a merge and post-merge adds.
+    const ssFullEq = (a, b, label) => {
+        if (a.size !== b.size) return label + ' size';
+        if (a.total !== b.total) return label + ' total';
+        if (a._minBucket !== b._minBucket) return label + ' minBucket';
+        if (a._bFreeTop !== b._bFreeTop) return label + ' bFreeTop';
+        const cmp = (xa, xb, nm, n) => { for (let i = 0; i < n; i++) { h25Checks++; if (xa[i] !== xb[i]) return label + ' ' + nm + '[' + i + ']'; } return ''; };
+        let r = '';
+        r = r || cmp(a._key, b._key, 'key', a.size);
+        r = r || cmp(a._count, b._count, 'count', a.size);
+        r = r || cmp(a._error, b._error, 'error', a.size);
+        r = r || cmp(a._mapOcc, b._mapOcc, 'mapOcc', a._mapOcc.length);
+        r = r || cmp(a._mapKey, b._mapKey, 'mapKey', a._mapKey.length);
+        r = r || cmp(a._mapSlot, b._mapSlot, 'mapSlot', a._mapSlot.length);
+        r = r || cmp(a._bVal, b._bVal, 'bVal', a._capacity);
+        r = r || cmp(a._bNext, b._bNext, 'bNext', a._capacity);
+        r = r || cmp(a._bPrev, b._bPrev, 'bPrev', a._capacity);
+        r = r || cmp(a._bHead, b._bHead, 'bHead', a._capacity);
+        r = r || cmp(a._bFree, b._bFree, 'bFree', a._capacity);
+        r = r || cmp(a._cNext, b._cNext, 'cNext', a.size);
+        r = r || cmp(a._cPrev, b._cPrev, 'cPrev', a.size);
+        r = r || cmp(a._cBucket, b._cBucket, 'cBucket', a.size);
+        if (r) return r;
+        const ka = a.topK(), kb = b.topK();
+        if (ka.length !== kb.length) return label + ' topK len';
+        for (let i = 0; i < ka.length; i++) { h25Checks++; if (ka[i].key !== kb[i].key || ka[i].count !== kb[i].count || ka[i].error !== kb[i].error) return label + ' topK[' + i + ']'; }
+        for (let sl = 0; sl < a.size; sl++) { h25Checks += 2; const k = a._key[sl]; if (a.estimate(k) !== b.estimate(k)) return label + ' estimate'; if (a.errorOf(k) !== b.errorOf(k)) return label + ' errorOf'; }
+        return '';
+    };
+    const h25Pool = [];
+    for (let i = 0; i < 400; i++) h25Pool.push(h25key(i));
+    for (const cap of [1, 7, 64, 1000]) {
+        if (h25Fail) break;
+        const a = new A.SpaceSaving(cap, { seed: 5 }), b = new B.SpaceSaving(cap, { seed: 5 });
+        for (let i = 0; i < 20000 && !h25Fail; i++) {
+            const k = h25Pool[i % h25Pool.length], c = h25count(i);
+            a.add(k, c); b.add(k, c);
+            h25Checks += 3;
+            if (popOcc(a) !== a.size) h25Fail = 'ss cap ' + cap + ' WATCHDOG pop!=size@' + i;   // tree-side spin guard
+            else if (a.total !== b.total) h25Fail = 'ss cap ' + cap + ' total@' + i;
+            else if (a.estimate(k) !== b.estimate(k)) h25Fail = 'ss cap ' + cap + ' estimate@' + i;
+        }
+        if (!h25Fail) h25Fail = ssFullEq(a, b, 'ss cap ' + cap);
+    }
+    if (!h25Fail) {
+        const ma = new A.SpaceSaving(64, { seed: 5 }), mb = new B.SpaceSaving(64, { seed: 5 });
+        const oa = new A.SpaceSaving(64, { seed: 5 }), ob = new B.SpaceSaving(64, { seed: 5 });
+        for (let i = 0; i < 10000; i++) { const k = h25Pool[i % h25Pool.length], c = h25count(i); ma.add(k, c); mb.add(k, c); }
+        for (let i = 0; i < 10000; i++) { const k = h25Pool[(i * 3 + 1) % h25Pool.length], c = h25count(i + 2); oa.add(k, c); ob.add(k, c); }
+        ma.merge(oa); mb.merge(ob);
+        for (let i = 0; i < 5000 && !h25Fail; i++) {
+            const k = h25Pool[(i * 7) % h25Pool.length], c = h25count(i);
+            ma.add(k, c); mb.add(k, c);
+            h25Checks += 2;
+            if (popOcc(ma) !== ma.size) h25Fail = 'ss merge WATCHDOG pop!=size@' + i;
+            else if (ma.estimate(k) !== mb.estimate(k)) h25Fail = 'ss merge estimate@' + i;
+        }
+        if (!h25Fail) h25Fail = ssFullEq(ma, mb, 'ss merged');
+    }
+    const h25Ok = h25Fail === '';
+    console.log('PARITY H2.5 F3/F4 identity vs ' + ref + ': CMS(1,1)/(4,1024)/(7,64) cons+plain + SS cap 1/7/64/1000 ' +
+        '(counts {1,2^30,2^31+,2^32-1}; keys=' + (h25RefHasF12 ? 'mixed-sign (ref carries F12)' : 'non-negative (pre-F12 ref)') +
+        '; watchdog ' + (h25Fail.indexOf('WATCHDOG') >= 0 ? 'TRIPPED' : 'silent') + ') checks=' + h25Checks +
+        ' diffs=' + (h25Fail || 'identical') + ' | ' + (h25Ok ? 'ok' : 'FAIL'));
+
     // ---- primitive throw-message parity (except DD/SS _badCount, whose text changed) ----
     const msgOf = (fn) => { try { fn(); return null; } catch (e) { return e.message; } };
     const prims = [NaN, Infinity, -Infinity, 'str', true, undefined, null, Symbol('s'), 10n];
@@ -440,22 +574,40 @@ try {
     }
     hllOracleDiffs += hll2Diffs;
     cmsOracleDiffs += cms2Diffs;
-    const f12checks = {
+    // The ref side depends on WHICH ref: a pre-F12 ref (<= e805ac8) collides every pair, so the
+    // negative lanes must DIFFER (the DOC-DIFF); a ref that already carries F12 (de7ecaf+, incl.
+    // the default HEAD) separates every pair, so the negative lanes must be IDENTICAL. Anything
+    // in between (a partial collision) is neither build and FAILs.
+    const refPreF12 = f12RefDiff === 0, refHasF12 = f12RefDiff === N12;
+    const f12checks = refHasF12 ? {
         'pairs-differ-both-lanes(1e5)': f12NewDiff === N12,
-        'ref-all-collide': f12RefDiff === 0,
+        'ref-has-F12(all-separate)': true,
+        'neg-keys-identical-to-ref': negKeyDiff === 0,
+        'hll-pair-count-2(ref2)': hllPairNew === 2 && hllPairRef === 2,
+        'cms-estimate-0(ref0)': cmsEstNew === 0 && cmsEstRef === 0,
+        'hll-neg-state-identical': hllNegDiffs === 0,
+        'cms-neg-state-identical': cmsNegDiffs === 0,
+    } : {
+        'pairs-differ-both-lanes(1e5)': f12NewDiff === N12,
+        'ref-all-collide': refPreF12,
         'every-neg-key-differs': negKeyDiff === negKeyTotal,
         'hll-pair-count-2(ref1)': hllPairNew === 2 && hllPairRef === 1,
         'cms-estimate-0(ref100)': cmsEstNew === 0 && cmsEstRef === 100,
         'hll-neg-state-differs': hllNegDiffs > 0,
         'cms-neg-state-differs': cmsNegDiffs > 0,
+    };
+    Object.assign(f12checks, {
         'hll-neg-oracle(add==addHashed-mix64)': hllOracleDiffs === 0,
         'cms-neg-oracle(add==addHashed-mix64)': cmsOracleDiffs === 0,
         'cms-est-neg-oracle(estimate==estimateHashed-mix64)': est2Diffs === 0,
         'ss-neg-oracle(_hash==hashHi,add-homes-at-_hash)': ss2Diffs === 0,
-    };
+        // QA H2.5: the H2.5 identity section picks its key domain from a ONE-pair ref-F12 probe;
+        // it must agree with this block's 1e5-pair verdict, or that section ran on the wrong domain.
+        'h25-one-pair-probe==1e5-verdict': h25RefHasF12 ? refHasF12 : refPreF12,
+    });
     let f12Fail = '';
     for (const k of Object.keys(f12checks)) if (!f12checks[k] && !f12Fail) f12Fail = k;
-    console.log('PARITY DOC-DIFF F12 (new-side vs ' + ref + '; new/ref: pairs=' + f12NewDiff + '/' + N12 +
+    console.log('PARITY ' + (refHasF12 ? 'IDENTITY' : 'DOC-DIFF') + ' F12 (new-side vs ' + ref + '; new/ref: pairs=' + f12NewDiff + '/' + N12 +
         ' ref-separated=' + f12RefDiff + ' neg-key-diffs=' + negKeyDiff + '/' + negKeyTotal +
         ' hll-pair=' + hllPairNew + '/' + hllPairRef + ' cms-est=' + cmsEstNew + '/' + cmsEstRef +
         ' hll-neg-state-diffs=' + hllNegDiffs + ' cms-neg-state-diffs=' + cmsNegDiffs +
@@ -465,7 +617,7 @@ try {
         Object.keys(f12checks).map((k) => k + '=' + (f12checks[k] ? 'yes' : 'NO')).join(' ') +
         ' | ' + (f12Fail === '' ? 'ok' : 'FAIL ' + f12Fail));
 
-    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '';
+    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '' && h25Ok;
     if (!ok) process.exitCode = 1;
 } finally {
     rmSync(dir, { recursive: true, force: true });

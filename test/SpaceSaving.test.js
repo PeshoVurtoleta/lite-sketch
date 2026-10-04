@@ -886,3 +886,376 @@ test('QA H2.4 (SS site consistency, boundary matrix): the add() inline hash and 
     }
     assert.equal(bad, '', 'site drift: ' + bad);
 });
+
+// ===========================================================================================
+// H2.5 F3 -- argument-free SpaceSaving (inlined bump, _attach reads _count, _homeAt/_probeAt).
+// Parity-type: the first two pass on HEAD too (behavior is byte-identical); the FAIL-on-HEAD
+// teeth are test/lanes.mjs. The identity test is NEW-CODE ONLY (_homeAt/_probeAt do not exist
+// on HEAD). The boundary matrix mirrors the :867 site-consistency set.
+// ===========================================================================================
+const H25_KS = [0, 1, -1, -(2 ** 31 - 1), -(2 ** 31), -(2 ** 31) - 1, -(2 ** 32 - 1), -(2 ** 32),
+    -(2 ** 32 + 1), 2 ** 31, 2 ** 32 - 1, -(2 ** 40 + 104729), -(2 ** 52), -(2 ** 53 - 2),
+    -(2 ** 53 - 1), 2 ** 53 - 1, -((2 ** 21 - 1) * 4294967296)];
+
+// A mixed-sign, safe-integer key pool: the boundary matrix + a deterministic LCG spread, enough
+// distinct keys (> capacity) to force continuous eviction + backshift at both capacities.
+const H25_POOL = (() => {
+    const pool = [...H25_KS];
+    let x = 123456789;
+    for (let i = 0; i < 300; i++) {
+        x = (x * 1103515245 + 12345) & 0x7fffffff;
+        pool.push((i & 1) ? -(x + (i & 7)) : (x + (i & 7)));
+    }
+    return pool;
+})();
+
+test('H2.5 F3 (SS evict/backshift vs an exact Map): invariants hold after EVERY op over 20k ' +
+    'mixed-sign adds, counts {1, 2^30, 2^31+, 2^32-1}, capacity 7 and 64', () => {
+    for (const cap of [7, 64]) {
+        const s = new SpaceSaving(cap, { seed: 7 });
+        const truth = new Map();
+        let trueTotal = 0;
+        for (let op = 0; op < 20000; op++) {
+            const key = H25_POOL[(op * 7919) % H25_POOL.length];
+            const count = [1, 2 ** 30, 2 ** 31 + (op & 7), 2 ** 32 - 1][op & 3];
+            s.add(key, count);
+            truth.set(key, (truth.get(key) || 0) + count);
+            trueTotal += count;
+
+            // (a) _mapOcc population === size -- also the SPIN WATCHDOG: a broken hash corrupts
+            // the map so this diverges (and the array walk, unlike _probe, cannot spin).
+            let occ = 0;
+            for (let i = 0; i < s._mapOcc.length; i++) occ += s._mapOcc[i];
+            assert.equal(occ, s.size, 'cap ' + cap + ' op ' + op + ': _mapOcc pop != size');
+
+            // (b) every slot is found via _probe(key, _hash(key)); (c) bucket value == _count[sl].
+            for (let sl = 0; sl < s.size; sl++) {
+                const k = s._key[sl];
+                const idx = s._probe(k, s._hash(k));
+                assert.equal(s._mapOcc[idx], 1, 'cap ' + cap + ' op ' + op + ': slot ' + sl + ' not found');
+                assert.equal(s._mapSlot[idx], sl, 'cap ' + cap + ' op ' + op + ': wrong slot mapping');
+                assert.equal(s._bVal[s._cBucket[sl]], s._count[sl], 'cap ' + cap + ' op ' + op + ': bucket value drift');
+            }
+
+            // (c cont.) buckets ascend from _minBucket; siblings cover exactly `size` slots.
+            let b = s._minBucket, prev = -Infinity, seen = 0;
+            while (b >= 0) {
+                assert.ok(s._bVal[b] > prev, 'cap ' + cap + ' op ' + op + ': buckets not ascending');
+                prev = s._bVal[b];
+                for (let sl = s._bHead[b]; sl >= 0; sl = s._cNext[sl]) {
+                    assert.equal(s._cBucket[sl], b);
+                    assert.equal(s._count[sl], s._bVal[b]);
+                    seen++;
+                }
+                b = s._bNext[b];
+            }
+            assert.equal(seen, s.size, 'cap ' + cap + ' op ' + op + ': bucket forest lost a slot');
+
+            // (d) total is exact; (e) the SpaceSaving bracket est - err <= true <= est.
+            assert.equal(s.total, trueTotal, 'cap ' + cap + ' op ' + op + ': total drift');
+            for (let sl = 0; sl < s.size; sl++) {
+                const k = s._key[sl];
+                const est = s.estimate(k), err = s.errorOf(k), tru = truth.get(k);
+                assert.ok(est - err <= tru && tru <= est,
+                    'cap ' + cap + ' op ' + op + ': bracket broke for ' + k + ' (' + (est - err) + ' <= ' + tru + ' <= ' + est + ')');
+            }
+        }
+    }
+});
+
+test('H2.5 F3 (SS _attach ordering, pinned from HEAD): capacity 3, three equal 2^31 counts, ' +
+    'a 4th key (eviction) then a bump -- the evicted key and topK/error literals are HEAD-exact', () => {
+    const s = new SpaceSaving(3, { seed: 7 });
+    s.add(10, 2 ** 31);
+    s.add(20, 2 ** 31);
+    s.add(30, 2 ** 31);
+    s.add(40, 5);   // FULL -> evict the head of the min bucket (key 30, pinned from HEAD)
+    s.add(40, 7);   // bump the newcomer
+    // Literals cut from `git show HEAD:Sketch.js` BEFORE the edit (byte-identical behavior).
+    assert.equal(s.size, 3);
+    assert.equal(s.total, 6442450956);               // 3*2^31 + 5 + 7
+    assert.equal(s.estimate(30), 0, 'key 30 was the evicted head of the min bucket');
+    assert.equal(s.estimate(10), 2147483648);
+    assert.equal(s.estimate(20), 2147483648);
+    assert.equal(s.estimate(40), 2147483660);        // 5 + 7 bumped onto inherited min 2^31
+    assert.equal(s.errorOf(40), 2147483648);         // inherited the evicted min (2^31)
+    assert.equal(s.errorOf(10), 0);
+    assert.deepEqual(s.topK(), [
+        { key: 40, count: 2147483660, error: 2147483648 },
+        { key: 10, count: 2147483648, error: 0 },
+        { key: 20, count: 2147483648, error: 0 },
+    ]);
+});
+
+test('H2.5 F3 (SS _homeAt/_probeAt identity, NEW-CODE ONLY): for every slot ' +
+    '_homeAt(_key, sl) === (_hash(_key[sl]) & _mask) and _probeAt maps back to sl', () => {
+    const s = new SpaceSaving(64, { seed: 7 });
+    let n = 0;
+    for (const k of H25_KS) s.add(k, ++n);
+    s.add(-0, 100);
+    assert.equal(s.size, H25_KS.length);
+    let bad = '';
+    for (let sl = 0; sl < s.size; sl++) {
+        const k = s._key[sl];
+        const home = s._homeAt(s._key, sl);
+        if (home !== (s._hash(k) & s._mask)) bad += 'home:' + k + ' ';
+        const idx = s._probeAt(s._key, sl, home);
+        if (idx !== s._probe(k, s._hash(k))) bad += 'probeAt:' + k + ' ';
+        if (s._mapSlot[idx] !== sl) bad += 'slot:' + k + ' ';
+    }
+    assert.equal(bad, '', 'home/probe identity drift: ' + bad);
+});
+
+// ===========================================================================================
+// QA H2.5 -- boundary tests a mis-port of the inlined bump / _homeAt / _probeAt / _attach-reads-
+// _count would fail. All but the last pass on HEAD too (parity-type); the last is NEW-CODE ONLY.
+// ===========================================================================================
+// Per-op SPIN WATCHDOG: add, then require _mapOcc population === size. A corrupted home / backshift
+// leaks occupied map entries; this FAILs on the first leaked op, long before the load-0.5 table can
+// fill and spin a probe loop (a synchronous spin cannot be stopped by --test-timeout).
+function qa25Add(s, k, c) {
+    s.add(k, c);
+    let n = 0;
+    for (let j = 0; j < s._mapOcc.length; j++) n += s._mapOcc[j];
+    assert.equal(n, s.size, 'watchdog: _mapOcc population ' + n + ' != size ' + s.size + ' after add(' + k + ')');
+}
+// FULL observable + internal pool snapshot (map, bucket forest, free-list, scalars).
+function qa25Pool(s) {
+    return {
+        size: s.size, total: s.total, minBucket: s._minBucket, bFreeTop: s._bFreeTop,
+        key: Array.from(s._key), count: Array.from(s._count), error: Array.from(s._error),
+        cNext: Array.from(s._cNext), cPrev: Array.from(s._cPrev), cBucket: Array.from(s._cBucket),
+        bVal: Array.from(s._bVal), bNext: Array.from(s._bNext), bPrev: Array.from(s._bPrev),
+        bHead: Array.from(s._bHead), bFree: Array.from(s._bFree),
+        mapOcc: Array.from(s._mapOcc), mapKey: Array.from(s._mapKey), mapSlot: Array.from(s._mapSlot),
+    };
+}
+// LIVE state only (what a fresh twin fed the same ops must reproduce exactly; clear() leaves the
+// dead pool bytes behind by design, so they are excluded).
+function qa25Live(s) {
+    const slots = [];
+    for (let sl = 0; sl < s.size; sl++) slots.push([s._key[sl], s._count[sl], s._error[sl], s._cBucket[sl]]);
+    const map = [];
+    for (let j = 0; j < s._mapOcc.length; j++) if (s._mapOcc[j] === 1) map.push([j, s._mapKey[j], s._mapSlot[j]]);
+    const chain = [];
+    for (let b = s._minBucket; b >= 0; b = s._bNext[b]) {
+        const sib = [];
+        for (let sl = s._bHead[b]; sl >= 0; sl = s._cNext[sl]) sib.push(sl);
+        chain.push([b, s._bVal[b], sib]);
+    }
+    return { size: s.size, total: s.total, slots, map, chain, topK: s.topK() };
+}
+// Model-free structural invariants: map <-> slots bijection, Knuth probe-run invariant (no hole
+// between an entry's home and its index), bucket chain ascending with consistent bPrev, every
+// slot in exactly the bucket of its count. Returns '' or the first violation.
+function qa25Check(s) {
+    const M = s._mapOcc.length, mask = s._mask;
+    let occ = 0;
+    for (let j = 0; j < M; j++) {
+        if (s._mapOcc[j] !== 1) continue;
+        occ++;
+        const sl = s._mapSlot[j], k = s._mapKey[j];
+        if (sl < 0 || sl >= s.size || s._key[sl] !== k) return 'map[' + j + '] -> bad slot ' + sl;
+        const home = s._hash(k) & mask;
+        for (let t = home; t !== j; t = (t + 1) & mask) if (s._mapOcc[t] !== 1) return 'probe-run hole at ' + t + ' for map[' + j + ']';
+    }
+    if (occ !== s.size) return 'occ ' + occ + ' != size ' + s.size;
+    for (let sl = 0; sl < s.size; sl++) {
+        const idx = s._probe(s._key[sl], s._hash(s._key[sl]));
+        if (s._mapOcc[idx] !== 1 || s._mapSlot[idx] !== sl) return 'slot ' + sl + ' not found';
+    }
+    let prevB = -1, prevV = -Infinity, seen = 0;
+    for (let b = s._minBucket; b >= 0; b = s._bNext[b]) {
+        if (s._bPrev[b] !== prevB) return 'bPrev[' + b + '] ' + s._bPrev[b] + ' != ' + prevB;
+        if (!(s._bVal[b] > prevV)) return 'buckets not ascending at ' + b;
+        if (s._bHead[b] < 0) return 'empty live bucket ' + b;
+        let p = -1;
+        for (let sl = s._bHead[b]; sl >= 0; sl = s._cNext[sl]) {
+            if (s._cPrev[sl] !== p) return 'cPrev[' + sl + ']';
+            if (s._cBucket[sl] !== b || s._count[sl] !== s._bVal[b]) return 'slot ' + sl + ' in wrong bucket';
+            p = sl; seen++;
+        }
+        prevB = b; prevV = s._bVal[b];
+    }
+    if (seen !== s.size) return 'forest covers ' + seen + ' != size ' + s.size;
+    if (s.size > 0 && s._bFreeTop + (function () { let n = 0; for (let b = s._minBucket; b >= 0; b = s._bNext[b]) n++; return n; })() !== s._capacity) {
+        return 'bucket free-list leak: free ' + s._bFreeTop + ' + live != capacity';
+    }
+    return '';
+}
+// Group candidate keys by home for a given (capacity, seed); returns keys sharing `home`.
+function qa25SameHome(s, home, n, start) {
+    const out = [];
+    for (let k = start; out.length < n; k++) {
+        if ((s._hash(k) & s._mask) === home) out.push(k);
+        const nk = -k;
+        if (out.length < n && nk !== 0 && (s._hash(nk) & s._mask) === home) out.push(nk);
+    }
+    return out;
+}
+
+test('QA H2.5 (SS capacity 1 and 2, counts 2^32-1, total at the 2^53-1 ceiling): insert / bump / ' +
+    'evict rejects are FULL-POOL byte-identical through the inlined bump; the exact-ceiling add lands', () => {
+    for (const cap of [1, 2]) {
+        const s = new SpaceSaving(cap, { seed: 3 });
+        // reach 2^53-1 - 1000 with 2^32-1 steps on key 2^31 (a non-Smi key, non-Smi counts)
+        fillTotal(s, 2 ** 31, SS_MAX_SAFE - 1000 - (cap === 2 ? 1 : 0));
+        if (cap === 2) qa25Add(s, -(2 ** 32), 1);                 // second slot: count 1 (the min)
+        assert.equal(qa25Check(s), '', 'cap ' + cap + ' pre');
+        const room = SS_MAX_SAFE - s.total;                  // exactly 1000 left
+        assert.equal(room, 1000);
+        const cases = [
+            [() => s.add(2 ** 31, room + 1), 'bump past ceiling by 1'],
+            [() => s.add(2 ** 31, 4294967295), 'bump 2^32-1'],
+            [() => s.add(7, room + 1), 'insert/evict past ceiling by 1'],
+            [() => s.add(-(2 ** 53 - 1), 4294967295), 'evict 2^32-1, key -(2^53-1)'],
+        ];
+        if (cap === 2) cases.push([() => s.add(-(2 ** 32), 4294967295), 'bump the min slot 2^32-1']);
+        for (const [fn, label] of cases) {
+            const before = qa25Pool(s);
+            assert.throws(fn, (e) => liteSketch(e) && /9007199254740991/.test(e.message) &&
+                e.message.includes('current total ' + before.total + ' + '), 'cap ' + cap + ' ' + label);
+            assert.deepEqual(qa25Pool(s), before, 'cap ' + cap + ' ' + label + ': pool changed on reject');
+        }
+        // the exact-ceiling add is ACCEPTED: an eviction on cap 1, a bump of the min on cap 2.
+        const victim = cap === 1 ? 99 : -(2 ** 32);
+        const prevEst = s.estimate(victim);
+        const minC = s._bVal[s._minBucket];
+        qa25Add(s, victim, room);
+        assert.equal(s.total, SS_MAX_SAFE, 'cap ' + cap + ' total lands exactly on 2^53-1');
+        assert.equal(s.estimate(victim), (cap === 1 ? minC : prevEst) + room, 'cap ' + cap + ' landed count');
+        assert.equal(qa25Check(s), '', 'cap ' + cap + ' post');
+        // and now EVERY add rejects, byte-identically (count 1 is the smallest legal count)
+        for (const k of [victim, 2 ** 31, 12345]) {
+            const before = qa25Pool(s);
+            assert.throws(() => s.add(k, 1), liteSketch, 'cap ' + cap + ' at ceiling add(' + k + ', 1)');
+            assert.deepEqual(qa25Pool(s), before, 'cap ' + cap + ' at ceiling: pool changed');
+        }
+    }
+});
+
+test('QA H2.5 (SS evict when the evicted key and the newcomer share a home / probe run, incl. ' +
+    'the wrap at index M-1): backshift then re-probe keeps every key findable', () => {
+    for (const cap of [2, 3, 4]) {
+        for (const seed of [0, 7, -1]) {
+            const probe = new SpaceSaving(cap, { seed });
+            const M = probe._mapOcc.length, mask = probe._mask;
+            for (const home of [0, mask]) {                    // mask = the wrap-around home
+                const run = qa25SameHome(probe, home, cap + 2, 2 ** 31 - 3);
+                // every permutation-ish order: fill with the first cap keys at varied counts so the
+                // min (the evictee) sits at the head, the middle and the tail of the probe run.
+                for (let minPos = 0; minPos < cap; minPos++) {
+                    const s = new SpaceSaving(cap, { seed });
+                    for (let i = 0; i < cap; i++) qa25Add(s, run[i], i === minPos ? 1 : 2 ** 31 + i);
+                    assert.equal(qa25Check(s), '', 'fill cap ' + cap + ' seed ' + seed + ' home ' + home);
+                    const evictee = run[minPos];
+                    const newcomer = run[cap];
+                    qa25Add(s, newcomer, 2 ** 32 - 1);              // evicts `evictee` (count 1, the unique min)
+                    const tag = 'cap ' + cap + ' seed ' + seed + ' home ' + home + ' minPos ' + minPos;
+                    assert.equal(qa25Check(s), '', tag + ' after evict');
+                    assert.equal(s.estimate(evictee), 0, tag + ' evictee gone');
+                    assert.equal(s.estimate(newcomer), 1 + 2 ** 32 - 1, tag + ' newcomer = min + count');
+                    assert.equal(s.errorOf(newcomer), 1, tag + ' newcomer error = evicted min');
+                    for (let i = 0; i < cap; i++) if (i !== minPos) assert.equal(s.estimate(run[i]), 2 ** 31 + i, tag + ' survivor ' + i);
+                    // second eviction in the same run (the evictee re-enters), then a bump of it
+                    qa25Add(s, evictee, 3);
+                    assert.equal(qa25Check(s), '', tag + ' re-enter');
+                    qa25Add(s, evictee, 2 ** 31);
+                    assert.equal(qa25Check(s), '', tag + ' bump re-entered');
+                    assert.ok(s.estimate(evictee) > 2 ** 31, tag + ' re-entered key monitored');
+                }
+            }
+            assert.ok(M >= 4);
+        }
+    }
+});
+
+test('QA H2.5 (SS clear() then reuse): the live state equals a fresh twin fed the same ops, stale ' +
+    'pool bytes never alias a pre-clear key, and a duplicate clear() changes nothing', () => {
+    for (const cap of [1, 2, 7]) {
+        const s = new SpaceSaving(cap, { seed: 9 });
+        const pre = [2 ** 31, -(2 ** 31), 2 ** 53 - 1, -(2 ** 53 - 1), 0, 4294967296, 5, 6, 7, 8];
+        for (let i = 0; i < 40; i++) qa25Add(s, pre[i % pre.length], [1, 2 ** 30, 2 ** 31 + 1, 2 ** 32 - 1][i & 3]);
+        s.clear();
+        const c1 = qa25Pool(s);
+        s.clear();
+        assert.deepEqual(qa25Pool(s), c1, 'cap ' + cap + ': duplicate clear changed the pool');
+        for (const k of pre) assert.equal(s.estimate(k), 0, 'cap ' + cap + ': stale key ' + k + ' still estimates');
+        const twin = new SpaceSaving(cap, { seed: 9 });
+        const post = [7, 2 ** 31, -3, 2 ** 31 + 1, 4294967296, -(2 ** 53 - 1), 11, 2 ** 31];
+        for (let i = 0; i < 64; i++) {
+            const k = post[(i * 5) % post.length], c = [2 ** 32 - 1, 1, 2 ** 31 + (i & 7), 2 ** 30][i & 3];
+            qa25Add(s, k, c); qa25Add(twin, k, c);
+            assert.equal(qa25Check(s), '', 'cap ' + cap + ' op ' + i);
+            assert.deepEqual(qa25Live(s), qa25Live(twin), 'cap ' + cap + ' op ' + i + ': reused != fresh twin');
+        }
+    }
+});
+
+test('QA H2.5 (SS merge then bump / evict): the merge-rebuilt forest (bPrev hints) feeds the inlined ' +
+    'bump correctly -- exact counts, invariants after every op, counts >= 2^31', () => {
+    for (const cap of [1, 3, 16]) {
+        const a = new SpaceSaving(cap, { seed: 4 }), b = new SpaceSaving(cap, { seed: 4 });
+        for (let i = 0; i < 3 * cap + 5; i++) {
+            qa25Add(a, i, 2 ** 31 + i);
+            qa25Add(b, -(i + 1) * 4294967296 - i, [1, 2 ** 32 - 1][i & 1]);
+            qa25Add(b, i, 2 ** 30);
+        }
+        a.merge(b);
+        assert.equal(qa25Check(a), '', 'cap ' + cap + ' after merge');
+        const keys = a.topK().map((e) => e.key);
+        for (let r = 0; r < 4; r++) {
+            for (const k of keys) {
+                const est = a.estimate(k), err = a.errorOf(k);
+                const minC = a._bVal[a._minBucket];
+                const c = [1, 2 ** 31 + 3, 2 ** 32 - 1, 2 ** 30][(r + Math.abs(k)) & 3];
+                const tot = a.total;
+                qa25Add(a, k, c);
+                const tag = 'cap ' + cap + ' r ' + r + ' add ' + k;
+                assert.equal(qa25Check(a), '', tag);
+                if (est !== 0) {                                // monitored -> inlined bump: exact
+                    assert.equal(a.estimate(k), est + c, tag + ' exact bump');
+                    assert.equal(a.errorOf(k), err, tag + ' bump keeps error');
+                } else {                                        // evicted earlier -> evict path
+                    assert.equal(a.estimate(k), minC + c, tag + ' evict = min + c');
+                    assert.equal(a.errorOf(k), minC, tag + ' evict error = min');
+                }
+                assert.equal(a.total, tot + c, tag + ' total');
+            }
+            qa25Add(a, 1e9 + r, 2 ** 32 - 1);                       // evict on a merge-built forest
+            assert.equal(qa25Check(a), '', 'cap ' + cap + ' r ' + r + ' evict');
+            assert.ok(a.estimate(1e9 + r) >= 2 ** 32 - 1, 'cap ' + cap + ' newcomer monitored');
+        }
+    }
+});
+
+test('QA H2.5 (SS _homeAt/_probeAt over the MAP pool, NEW-CODE ONLY): for every occupied map index ' +
+    'j (incl. j = M-1 and j = 0) _homeAt(_mapKey, j) === _hash & _mask and _probeAt(_mapKey, j, home) ' +
+    '=== j; an absent key probes to an EMPTY index', () => {
+    for (const cap of [1, 2, 64]) {
+        const s = new SpaceSaving(cap, { seed: -7 });
+        const mask = s._mask;
+        // force the wrap: keys whose home is M-1, then fill
+        const wrap = qa25SameHome(s, mask, Math.min(cap, 2), 2 ** 32 - 3);
+        for (const k of wrap) qa25Add(s, k, 2 ** 31);
+        for (let i = 0; s.size < cap && i < 4 * cap; i++) qa25Add(s, -(2 ** 31) - i * 65537, i + 1);
+        let checked = 0, bad = '';
+        for (let j = 0; j <= mask; j++) {
+            if (s._mapOcc[j] !== 1) continue;
+            checked++;
+            const home = s._homeAt(s._mapKey, j);
+            if (home !== (s._hash(s._mapKey[j]) & mask)) bad += 'home@' + j + ' ';
+            if (s._probeAt(s._mapKey, j, home) !== j) bad += 'probeAt@' + j + ' ';
+        }
+        assert.equal(checked, cap, 'cap ' + cap + ': occupied entries');
+        assert.equal(bad, '', 'cap ' + cap + ': ' + bad);
+        // an absent key (stored in a scratch Float64Array) probes to an empty index
+        const scratch = new Float64Array([2 ** 53 - 1, -0, 0]);
+        for (let i = 0; i < scratch.length; i++) {
+            const present = s.estimate(scratch[i]) !== 0;
+            const idx = s._probeAt(scratch, i, s._homeAt(scratch, i));
+            assert.equal(s._mapOcc[idx] === 1, present, 'cap ' + cap + ' scratch[' + i + ']');
+            assert.equal(idx, s._probe(scratch[i], s._hash(scratch[i])), 'cap ' + cap + ' scratch[' + i + '] index');
+        }
+    }
+});

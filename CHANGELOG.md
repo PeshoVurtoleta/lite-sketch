@@ -8,6 +8,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`SpaceSaving.add` no longer boxes the key or the count inside the library (F3).** `add`
+  routed the per-op work through `_bump(slot, delta)`, `_mapDeleteKey(key)` and
+  `_attach(slot, val, hint)` -- each taking a `number` argument, so a key `>= 2^31` or a count
+  `>= 2^31` (lite-hud's cumulative microseconds) boxed a `HeapNumber` crossing every bump,
+  eviction and backshift. The bump is now inlined into `add`, `_attach(slot, hint)` reads the
+  target value from `_count[slot]` itself, and eviction / backshift recompute the home arg-free
+  through a new `_homeAt(arr, i)` / `_probeAt(arr, i, home)` (the key read from the buffer, never
+  passed across a call). With no inlining, keys `>= 2^31` drop from **98-99 scavenges at 1.6M
+  ops** to **24** (the caller's own argument box; 1.1.2 read 195); the never-optimized caller lane
+  drops **49 -> 25**. Small keys with a constant count `2^30` go **24 -> 0** (default and
+  no-inline). A variable count `>= 2^31` on the bump path goes **49 -> 25** (the caller's count
+  box). Default-tier non-Smi keys stay at the caller's box until `addFrom` lands (1.2.0). State is
+  **bit-identical** (proven over 636,951 parity checks against the pre-H2.5 build (de7ecaf, which
+  already carries F12)).
+- **`CountMinSketch.add` / `addHashed` no longer box a variable count inside the update (F4).**
+  `_applyCons` / `_applyPlain` took `(base, count)`, so a non-constant `count >= 2^31` boxed a
+  `HeapNumber` crossing the call in the default tier. The base now lives in a per-instance
+  `Int32Array(1)` slot and the count in a `Float64Array(1)` slot, the helpers are argument-free,
+  and the per-row fmix is hand-inlined (bit-identical math). Default-tier add / addHashed with a
+  variable `count >= 2^31` drops from **24-25 scavenges at 1.6M ops** to **0-1** (conservative and
+  plain). `estimate` is unchanged (its per-row fmix inline is deferred to 1.2.0). State is
+  **bit-identical**.
 - **Negative keys no longer collide with their `2^32`-shifted twins (F12).** The key's sign was
   folded into **bit 0** of the high word (`hiw ^ neg`), a magnitude bit, so `-k` aliased a real
   positive key: `add(-1); add(2**32+1)` counted **1** distinct (now **2**); 20000 distinct

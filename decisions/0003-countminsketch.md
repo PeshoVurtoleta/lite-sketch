@@ -102,6 +102,24 @@ guard lines; no restructure.
    shared `_describe(x)` (typeof-first); a null-proto object / throwing / re-entrant `toString` can
    no longer escape the tag or mutate the receiver during a byte-identical rejection.
 
+## H2.5 amendment (2026-10-04) -- argument-free update helpers (F4)
+
+Zero behavior change (bit-identical to the pre-H2.5 build (de7ecaf, which already carries F12) over
+636,951 parity checks). `_applyCons`
+/ `_applyPlain` took `(base, count)`, so a non-constant `count >= 2^31` boxed a `HeapNumber`
+crossing the call in the default tier (the remaining Node F4 box after H2.4's int32 hash words).
+
+1. **Per-instance scratch, allocated once in the ctor:** `_base = new Int32Array(1)` and
+   `_cnt = new Float64Array(1)`. `add` / `addHashed` write `_base[0] = h ^ g` (resp. `hi ^ lo`) and
+   `_cnt[0] = count`, then call `_applyCons()` / `_applyPlain()` with **no arguments**; the helpers
+   read `base` / `count` back from the slots. The double stays in the typed-array slot end to end.
+2. **The per-row fmix is hand-inlined** (`x ^= x >>> 16; x = Math.imul(x, FMIX_C1); ...`), bit-
+   identical to `_m3final((base ^ i*ODD_CONST) | 0)`, so the helpers stay monomorphic and under the
+   460-byte inline cap (`add` 362 -> 378, `_applyCons` 222 -> 307, `_applyPlain` 150 -> 224).
+3. **`estimate` / `estimateHashed` are byte-identical** (364 / 168 bytes unchanged); their per-row
+   fmix inline is deferred to 1.2.0 through the F5 scratch (422 bytes would crowd the cap with H2.6's
+   own bytes). An interleave parity test confirms `_base` / `_cnt` are PER-INSTANCE, not shared.
+
 ## Non-goals
 
 No range / heavy-hitter queries (that is SpaceSaving, M4, and DDSketch, M3); no serialization

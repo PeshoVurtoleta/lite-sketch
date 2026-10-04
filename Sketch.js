@@ -566,6 +566,8 @@ export class CountMinSketch {
         this._conservative = conservative;
         this._counts = new Uint32Array(d * cw);
         this._idx = new Int32Array(d);  // pre-allocated per-row flat-index scratch (0-alloc conservative update)
+        this._base = new Int32Array(1); // F4: per-instance base lane (int32 slot; argument-free _apply*)
+        this._cnt = new Float64Array(1);// F4: per-instance count (f64 slot; a count >= 2^31 never crosses as an arg)
         this._total = 0;
         this._saturated = false;        // sticky: set on any CMS_MAX_COUNT clamp; while false, estimate is one-sided
     }
@@ -673,9 +675,10 @@ export class CountMinSketch {
         g = _m3round(g, lo);
         g = _m3round(g, hiw ^ (neg << 31));
         g = _m3final(g ^ 8);                        // LO lane (int32 local)
-        const base = (h ^ g) | 0;
-        if (this._conservative) return this._applyCons(base, count);
-        return this._applyPlain(base, count);
+        this._base[0] = h ^ g;
+        this._cnt[0] = count;
+        if (this._conservative) return this._applyCons();
+        return this._applyPlain();
     }
 
     /**
@@ -694,9 +697,10 @@ export class CountMinSketch {
             return this._badCount(count);
         }
         if (this._total + count > 9007199254740991) return this._badTotal(count);
-        const base = (hi ^ lo) | 0;
-        if (this._conservative) return this._applyCons(base, count);
-        return this._applyPlain(base, count);
+        this._base[0] = hi ^ lo;
+        this._cnt[0] = count;
+        if (this._conservative) return this._applyCons();
+        return this._applyPlain();
     }
 
     /**
@@ -704,12 +708,20 @@ export class CountMinSketch {
      * row's flat index in `_idx`, find the current min across the d cells, then raise
      * only the cells below `min + count` up to it (saturating at CMS_MAX_COUNT). Two
      * passes over d rows, no allocation.
+     *
+     * ARGUMENT-FREE (F4): `base` and `count` are read from the `_base` / `_cnt` slots
+     * the caller wrote, not passed in. A `count` >= 2^31 (lite-hud's cumulative
+     * microseconds) passed as an argument boxes a HeapNumber crossing this call in the
+     * default tier; reading it from the Float64Array slot keeps the double in-place. The
+     * per-row fmix is hand-inlined (identical math to `_m3final`) so this stays monomorphic.
      */
-    _applyCons(base, count) {
+    _applyCons() {
         const d = this._d, w = this._w, mask = this._mask, counts = this._counts, idx = this._idx;
+        const base = this._base[0], count = this._cnt[0];
         let mn = 0xffffffff;
         for (let i = 0; i < d; i++) {
-            const x = _m3final((base ^ Math.imul(i, ODD_CONST)) | 0);
+            let x = base ^ Math.imul(i, ODD_CONST);
+            x = x ^ (x >>> 16); x = Math.imul(x, FMIX_C1); x = x ^ (x >>> 13); x = Math.imul(x, FMIX_C2); x = x ^ (x >>> 16);
             const col = x & mask;
             const id = i * w + col;
             idx[i] = id;
@@ -729,11 +741,17 @@ export class CountMinSketch {
     /**
      * @private Plain update (classic Count-Min), 0 B/op. Add `count` to one cell per
      * row (saturating at CMS_MAX_COUNT). Linearly mergeable.
+     *
+     * ARGUMENT-FREE (F4): `base` and `count` are read from the `_base` / `_cnt` slots the
+     * caller wrote (see `_applyCons`). The per-row fmix is hand-inlined (identical math to
+     * `_m3final`).
      */
-    _applyPlain(base, count) {
+    _applyPlain() {
         const d = this._d, w = this._w, mask = this._mask, counts = this._counts;
+        const base = this._base[0], count = this._cnt[0];
         for (let i = 0; i < d; i++) {
-            const x = _m3final((base ^ Math.imul(i, ODD_CONST)) | 0);
+            let x = base ^ Math.imul(i, ODD_CONST);
+            x = x ^ (x >>> 16); x = Math.imul(x, FMIX_C1); x = x ^ (x >>> 13); x = Math.imul(x, FMIX_C2); x = x ^ (x >>> 16);
             const id = i * w + (x & mask);
             let v = counts[id] + count;
             if (v > CMS_MAX_COUNT) { v = CMS_MAX_COUNT; this._saturated = true; }
@@ -1566,9 +1584,12 @@ const SS_DEFAULT_SEED = HLL_DEFAULT_SEED;
  *     (Float64Array), `_mapOcc` (Uint8Array so key 0 is a legal, distinguishable key --
  *     "null is not zero"), `_mapSlot` (Int32Array), `_mask = M - 1`. Linear probe with
  *     Knuth BACKSHIFT deletion (no tombstones), so an eviction's map-delete keeps the probe
- *     invariants exact. The map's canonical home is `_hash(storedKey) & _mask` for EVERY
- *     entry, so the backshift can recompute a home from a stored key with one consistent
- *     function.
+ *     invariants exact. The map's canonical home is `_hash(storedKey) & _mask` for EVERY entry,
+ *     computed in THREE BIT-IDENTICAL, site-tested copies: `_hash` (the reference, used by
+ *     estimate / errorOf / merge placement and the tests), `add`'s inline HI-lane mix (the hot
+ *     insert / bump / evict path), and `_homeAt(arr, i)` (the evicted-key delete probe and the
+ *     backshift, reading the key from a buffer so it never boxes a HeapNumber crossing a call). An
+ *     identity test pins `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
  *
  * Hot path (`add`, 0 B/op amortized): the HI-lane murmur is INLINED into int32 LOCALS exactly
  * like `HyperLogLog.add` -- it never writes the module HASH_HI / HASH_LO slots, so a uint32
@@ -1738,9 +1759,14 @@ export class SpaceSaving {
         h = _m3round(h, lo);
         h = _m3round(h, hiw ^ (neg << 31));
         h = _m3final(h ^ 8);                        // HI lane (int32 local); == _hash(key)
-        const i = this._probe(key, h);
-        if (this._mapOcc[i] === 1) {                // monitored -> bump
-            this._bump(this._mapSlot[i], count);
+        const home = h & this._mask;                // canonical home (a Smi; never crosses _probe as a double)
+        const i = this._probe(key, home);
+        if (this._mapOcc[i] === 1) {                // monitored -> bump (inlined: no count crosses a call)
+            const sl = this._mapSlot[i];
+            const prevB = this._bPrev[this._cBucket[sl]];   // read BEFORE _detach moves the slot's bucket
+            this._count[sl] += count;
+            this._detach(sl);
+            this._attach(sl, prevB);
             this._total += count;
             return this;
         }
@@ -1752,7 +1778,7 @@ export class SpaceSaving {
             this._mapOcc[i] = 1;
             this._mapKey[i] = key;
             this._mapSlot[i] = sl;
-            this._attach(sl, count, -1);
+            this._attach(sl, -1);
             this._total += count;
             return this;
         }
@@ -1760,15 +1786,16 @@ export class SpaceSaving {
         const minB = this._minBucket;
         const sl = this._bHead[minB];
         const m = this._bVal[minB];
-        this._mapDeleteKey(this._key[sl]);          // remove the evicted key from the map
+        // remove the evicted key from the map; its home + probe is recomputed arg-free (no double crosses).
+        this._mapDelete(this._probeAt(this._key, sl, this._homeAt(this._key, sl)));
         this._key[sl] = key;
         this._error[sl] = m;
         const nv = m + count;
         this._count[sl] = nv;
         const prevB = this._bPrev[minB];            // value < m < nv (a valid lower hint)
         this._detach(sl);
-        this._attach(sl, nv, prevB);
-        const j = this._probe(key, h);              // re-probe: the map shifted during delete
+        this._attach(sl, prevB);
+        const j = this._probe(key, home);           // re-probe: the map shifted during delete
         this._mapOcc[j] = 1;
         this._mapKey[j] = key;
         this._mapSlot[j] = sl;
@@ -1784,8 +1811,7 @@ export class SpaceSaving {
      */
     estimate(key) {
         if (typeof key !== 'number' || key !== key) return 0;
-        const h = this._hash(key);
-        const i = this._probe(key, h);
+        const i = this._probe(key, this._hash(key) & this._mask);
         return this._mapOcc[i] === 1 ? this._count[this._mapSlot[i]] : 0;
     }
 
@@ -1797,8 +1823,7 @@ export class SpaceSaving {
      */
     errorOf(key) {
         if (typeof key !== 'number' || key !== key) return 0;
-        const h = this._hash(key);
-        const i = this._probe(key, h);
+        const i = this._probe(key, this._hash(key) & this._mask);
         return this._mapOcc[i] === 1 ? this._error[this._mapSlot[i]] : 0;
     }
 
@@ -1921,12 +1946,11 @@ export class SpaceSaving {
             this._key[sl] = it.key;
             this._count[sl] = it.count;
             this._error[sl] = it.error;
-            const h = this._hash(it.key);
-            const idx = this._probe(it.key, h);
+            const idx = this._probe(it.key, this._hash(it.key) & this._mask);
             this._mapOcc[idx] = 1;
             this._mapKey[idx] = it.key;
             this._mapSlot[idx] = sl;
-            this._attach(sl, it.count, -1);
+            this._attach(sl, -1);
         }
         this._total = oldTotal + otherTotal;
         return this;
@@ -1949,8 +1973,9 @@ export class SpaceSaving {
     /**
      * @private HI-lane murmur of a numeric key (identical math to `add`'s inline mix and to
      * mix64's HI lane). Returns a SIGNED int32 (SMI) -- callers take `& _mask`, so the sign
-     * never matters. 0-alloc, monomorphic (keys are always numbers). This is the map's ONE
-     * canonical home function (used by placement, probing, and backshift alike).
+     * never matters. 0-alloc, monomorphic (keys are always numbers). This is the REFERENCE copy
+     * of the map home: estimate / errorOf / merge placement and the tests call it; `add`'s inline
+     * mix and `_homeAt` are bit-identical, site-tested copies of the same home.
      * @param {number} key
      * @returns {number} int32 HI lane
      */
@@ -1968,10 +1993,13 @@ export class SpaceSaving {
     }
 
     /**
-     * @private Linear-probe the map for `key` (h = its `_hash`). Returns the matching index
-     * (if present) or the first empty index (if absent). 0-alloc.
+     * @private Linear-probe the map for `key` from `h`. Returns the matching index (if present)
+     * or the first empty index (if absent). 0-alloc. `h` may be a pre-masked home (`_hash & _mask`)
+     * OR a raw `_hash` (int32): `h & mask` is idempotent on a home, so EVERY production caller --
+     * `add` (hot) and estimate / errorOf / merge (cold) -- passes the home `_hash(key) & _mask`;
+     * only the tests pass a raw `_hash`, which this `& mask` still handles.
      * @param {number} key
-     * @param {number} h the key's `_hash` (int32)
+     * @param {number} h the key's `_hash` (int32) or its home (`_hash & _mask`)
      * @returns {number} map index
      */
     _probe(key, h) {
@@ -1985,19 +2013,59 @@ export class SpaceSaving {
     }
 
     /**
-     * @private Remove `key` from the map by probing to its index then Knuth backshift-deleting
-     * (no tombstones -- the probe invariants stay exact). 0-alloc. `key` must be present.
-     * @param {number} key
+     * @private The canonical map home of the numeric key stored at `arr[i]` (a Float64Array
+     * slot, e.g. `_key` or `_mapKey`), i.e. `_hash(arr[i]) & _mask`, with the HI-lane murmur
+     * HAND-INLINED (the same neg / `Math.abs` / low-word / high-word split as `_hash`, the same
+     * `_m3round` rotl-15/13 + 0xe6546b64 steps and `_m3final` fmix) so the key never crosses a
+     * call boundary as an argument -- a key >= 2^31 read from `arr` would box a HeapNumber
+     * passed to `_hash`. Returns a Smi (`h & _mask`). This is the second bit-identical, site-
+     * tested copy of the canonical home (the first is `add`'s inline mix). 0-alloc.
+     * @param {Float64Array} arr the key pool (`_key` on eviction, `_mapKey` on backshift)
+     * @param {number} i the slot index to read
+     * @returns {number} the key's home, `_hash(arr[i]) & _mask`
      */
-    _mapDeleteKey(key) {
-        this._mapDelete(this._probe(key, this._hash(key)));
+    _homeAt(arr, i) {
+        const key = arr[i];
+        const neg = key < 0 ? 1 : 0;
+        const a = Math.abs(key);
+        let k = a | 0;
+        let h = this._seed;
+        k = Math.imul(k, HASH_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HASH_C2);
+        h = h ^ k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+        k = (a < 4294967296 ? 0 : ((a / 4294967296) | 0)) ^ (neg << 31);
+        k = Math.imul(k, HASH_C1); k = (k << 15) | (k >>> 17); k = Math.imul(k, HASH_C2);
+        h = h ^ k; h = (h << 13) | (h >>> 19); h = (Math.imul(h, 5) + 0xe6546b64) | 0;
+        h = h ^ 8;
+        h = h ^ (h >>> 16); h = Math.imul(h, FMIX_C1); h = h ^ (h >>> 13); h = Math.imul(h, FMIX_C2); h = h ^ (h >>> 16);
+        return h & this._mask;
+    }
+
+    /**
+     * @private Linear-probe the map for the key stored at `arr[i]`, starting from its pre-masked
+     * `home`. Returns the matching index (if present) or the first empty index. 0-alloc. The key
+     * is read from the buffer here, so it never crosses `_probe` as a (possibly boxed) argument.
+     * @param {Float64Array} arr the key pool
+     * @param {number} i the slot index to read
+     * @param {number} home the key's home (`_homeAt(arr, i)`)
+     * @returns {number} map index
+     */
+    _probeAt(arr, i, home) {
+        const occ = this._mapOcc, mkey = this._mapKey, mask = this._mask;
+        const key = arr[i];
+        let j = home;
+        while (occ[j] === 1) {
+            if (mkey[j] === key) return j;
+            j = (j + 1) & mask;
+        }
+        return j;
     }
 
     /**
      * @private Knuth backshift deletion at map index `i` (open addressing, no tombstones).
      * Walk forward from the hole; an entry `j` moves into the hole iff its home lies cyclically
-     * outside `(i, j]`. Recomputes each home via the canonical `_hash` of the stored key
-     * (numbers -- cheap, 0-alloc). Runs on every eviction, so it must be correct + 0-alloc.
+     * outside `(i, j]`. Recomputes each home via `_homeAt(_mapKey, j)` -- the canonical home of
+     * the stored key, with the key read from the buffer (no double crosses a call per step).
+     * Runs on every eviction, so it must be correct + 0-alloc.
      * @param {number} i the (occupied) index to delete
      */
     _mapDelete(i) {
@@ -2005,7 +2073,7 @@ export class SpaceSaving {
         occ[i] = 0;
         let j = (i + 1) & mask;
         while (occ[j] === 1) {
-            const home = this._hash(mkey[j]) & mask;
+            const home = this._homeAt(mkey, j);
             const a = (home - i) & mask;             // steps from the hole i to the entry's home
             const d = (j - i) & mask;                // steps from the hole i to the entry j
             if (a === 0 || a > d) {                   // home NOT in (i, j] -> j can fill the hole
@@ -2028,33 +2096,19 @@ export class SpaceSaving {
     }
 
     /**
-     * @private Bump slot `slot`'s count by `delta`: detach it from its bucket and re-attach at
-     * the new value. `prevB` (the bucket below the current one, value < old count < new value)
-     * is a valid lower hint for the forward-walking attach; for a unit add the target is the
-     * immediate next bucket (O(1)). 0-alloc.
+     * @private Attach `slot` to the bucket of its CURRENT count `_count[slot]`, birthing that
+     * bucket (from the free-list) and splicing it into the ascending bucket list if none exists.
+     * Reads the target value from `_count[slot]` itself -- every caller (insert, the inlined
+     * bump, evict, merge rebuild) writes `_count[slot]` FIRST -- so a count >= 2^31 never crosses
+     * this call as a (boxed) argument (F3). `hint` is a bucket with value <= the count to begin
+     * the forward walk (or -1 to start at `_minBucket`). Pushes `slot` at the HEAD of the target
+     * bucket's sibling list. Keeps `_minBucket` correct. 0-alloc.
      * @param {number} slot
-     * @param {number} delta positive
+     * @param {number} hint a bucket id with value <= `_count[slot]`, or -1
      */
-    _bump(slot, delta) {
-        const b = this._cBucket[slot];
-        const nv = this._count[slot] + delta;
-        this._count[slot] = nv;
-        const prevB = this._bPrev[b];
-        this._detach(slot);
-        this._attach(slot, nv, prevB);
-    }
-
-    /**
-     * @private Attach `slot` to the bucket of value `val`, birthing it (from the free-list) and
-     * splicing it into the ascending bucket list if none exists. `hint` is a bucket with value
-     * <= val to begin the forward walk (or -1 to start at `_minBucket`). Pushes `slot` at the
-     * HEAD of the target bucket's sibling list. Keeps `_minBucket` correct. 0-alloc.
-     * @param {number} slot
-     * @param {number} val the target count-value
-     * @param {number} hint a bucket id with value <= val, or -1
-     */
-    _attach(slot, val, hint) {
+    _attach(slot, hint) {
         const bVal = this._bVal, bNext = this._bNext, bPrev = this._bPrev, bHead = this._bHead;
+        const val = this._count[slot];
         let prev = -1;
         let b = hint >= 0 ? hint : this._minBucket;
         while (b >= 0 && bVal[b] < val) { prev = b; b = bNext[b]; }

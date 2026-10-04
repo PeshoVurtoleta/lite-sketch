@@ -94,11 +94,14 @@ for (const noInline of [false, true]) {
     gate('CTRL[b31/ni]', v, v >= 12);
 }
 
-// ---- N3 (H2.4): the F2-Node + F12 hash-word box lanes ------------------------
-// 144 fresh children ((36 gated + 8 Noop) x REPS=3, + 12 SS once): {hll,cms,cmsest} x {b31,u32,n31,safe} x {df,ni,nc}, Noop x 4kc x
-// {ni,nc} (the subtraction baseline + the never-optimize teeth), ss x 4kc x 3 modes
-// (print-only; F3 is gated in H2.5). Run through an execFile pool of N3_JOBS (default 4;
-// 1 = serial). Scavenges over 8N with a 4 MB semi-space; one HeapNumber box/op reads ~24.
+// ---- N3 (H2.4 hash-word boxes) + N3c (H2.5 count boxes, F3/F4) ---------------
+// 192 fresh children, all REPS=3. H2.4: {hll,cms,cmsest} x {b31,u32,n31,safe} x {df,ni,nc}
+// (36) + Noop x 4kc x {ni,nc} (8, the subtraction baseline + never-optimize teeth). SS add
+// count-1 x 4kc x {df,ni,nc} (12) -- print-only in H2.4, now GATED (G1 ni/nc, G2 df; F3).
+// N3c count lanes (F3/F4): SS add count-2^30 small {ni,df} (G3); SS bump (--hit) count-2^31
+// small+b31 ni with a Noop.hitv31 baseline (G4, + CV-CTRL); CMS cons + plain count-2^31 small
+// df (G5). Run through an execFile pool of N3_JOBS (default 4; 1 = serial). Scavenges over 8N
+// with a 4 MB semi-space; one HeapNumber box/op reads ~24.
 const N3_JOBS = Math.max(1, parseInt(process.env.N3_JOBS || '4', 10) || 4);
 const N3_KINDS = ['hll', 'cms', 'cmsest'];
 const N3_MODES = ['df', 'ni', 'nc'];
@@ -109,47 +112,67 @@ function n3Flags(mode) {
     if (mode === 'nc') return [...BASE, '--allow-natives-syntax'];   // for natives.mjs's %NeverOptimizeFunction
     return [...BASE];
 }
-function scavJob(kind, kc, mode) {
-    const args = [...n3Flags(mode), LANE, 'scav', kind, kc, 'fresh',
-        ...(mode === 'nc' ? ['--nc'] : []), ...LIBFLAGS];
+function scavJob(job) {
+    const { kind, kc, mode, count, countv, hit } = job;
+    const extra = [];
+    if (mode === 'nc') extra.push('--nc');
+    if (count != null) extra.push('--count', String(count));
+    if (countv != null) extra.push('--countv', String(countv));
+    if (hit) extra.push('--hit');
+    const args = [...n3Flags(mode), LANE, 'scav', kind, kc, 'fresh', ...extra, ...LIBFLAGS];
     return new Promise((resolve, reject) => {
         execFile(process.execPath, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
-            if (err) return reject(new Error('scav ' + kind + '/' + kc + '/' + mode + ': ' + err.message));
+            if (err) return reject(new Error('scav ' + job.key + ': ' + err.message));
             const v = JSON.parse(stdout.trim().split('\n').pop()).scav;
-            if (!Number.isInteger(v) || v < 0) return reject(new Error('scav ' + kind + '/' + kc + '/' + mode + ' returned ' + v));
+            if (!Number.isInteger(v) || v < 0) return reject(new Error('scav ' + job.key + ' returned ' + v));
             resolve(v);
         });
     });
 }
 
-// Every GATED lane (the 3 kinds x 4 kc x {df,ni,nc}) and its Noop baseline is run REPS times
-// as separate children; the gate is on the MIN. Scheduler jitter / caller tier-up under CPU
-// load only ADDS scavenges, never removes a real library box, so the MIN is the honest library
-// estimate for all three modes. SS lanes are print-only (F3) and run once.
+// Every lane -- gated or baseline -- is run REPS times as separate children; the gate is on the
+// MIN. Scheduler jitter / caller tier-up under CPU load only ADDS scavenges, never removes a real
+// library box, so the MIN is the honest library estimate for all three modes.
 const REPS = 3;
 const jobs = [];
+const addLane = (job) => { for (let r = 0; r < REPS; r++) jobs.push(job); };
+
+// H2.4: the gated hash-word lanes + their Noop baselines.
 for (const kind of N3_KINDS) for (const kc of N3_KCS) for (const mode of N3_MODES) {
-    for (let r = 0; r < REPS; r++) jobs.push([kind, kc, mode]);
+    addLane({ kind, kc, mode, key: kind + '/' + kc + '/' + mode });
 }
 for (const kc of N3_KCS) for (const mode of ['ni', 'nc']) {
-    for (let r = 0; r < REPS; r++) jobs.push(['noop', kc, mode]);
+    addLane({ kind: 'noop', kc, mode, key: 'noop/' + kc + '/' + mode });
 }
-for (const kc of N3_KCS) for (const mode of N3_MODES) jobs.push(['ss', kc, mode]);
+// SS add count-1 x 4kc x 3 modes: print-only in H2.4, GATED here (G1 ni/nc, G2 df; F3).
+for (const kc of N3_KCS) for (const mode of N3_MODES) {
+    addLane({ kind: 'ss', kc, mode, key: 'ss/' + kc + '/' + mode });
+}
+// N3c H2.5 count lanes.
+// G3: SS add, small key, CONSTANT count 2^30 (every arg a Smi -> 0), ni + df.
+addLane({ kind: 'ss', kc: 'small', mode: 'ni', count: 2 ** 30, key: 'ss.c30/small/ni' });
+addLane({ kind: 'ss', kc: 'small', mode: 'df', count: 2 ** 30, key: 'ss.c30/small/df' });
+// G4: SS bump (--hit), VARIABLE count 2^31, small + b31, ni; vs a Noop.hitv31 baseline (also CV-CTRL).
+for (const kc of ['small', 'b31']) {
+    addLane({ kind: 'ss', kc, mode: 'ni', countv: 2 ** 31, hit: true, key: 'ss.hitv31/' + kc + '/ni' });
+    addLane({ kind: 'noop', kc, mode: 'ni', countv: 2 ** 31, hit: true, key: 'noop.hitv31/' + kc + '/ni' });
+}
+// G5: CMS cons + plain, small key, VARIABLE count 2^31, df (the count crosses _applyCons/_applyPlain).
+addLane({ kind: 'cms', kc: 'small', mode: 'df', countv: 2 ** 31, key: 'cms.v31/small/df' });
+addLane({ kind: 'cmsp', kc: 'small', mode: 'df', countv: 2 ** 31, key: 'cmsp.v31/small/df' });
 
-const R = {};   // key -> array of scav values (REPS entries for every gated lane and its Noop; one for SS)
+const R = {};   // key -> array of REPS scav values
 let nextJob = 0;
 async function n3Worker() {
     while (nextJob < jobs.length) {
-        const idx = nextJob++;
-        const [kind, kc, mode] = jobs[idx];
-        const k = kind + '/' + kc + '/' + mode;
-        const v = await scavJob(kind, kc, mode);
-        (R[k] || (R[k] = [])).push(v);
+        const job = jobs[nextJob++];
+        const v = await scavJob(job);
+        (R[job.key] || (R[job.key] = [])).push(v);
     }
 }
 await Promise.all(Array.from({ length: Math.min(N3_JOBS, jobs.length) }, n3Worker));
-const one = (k) => R[k][0];
 const vmin = (k) => Math.min(...R[k]);
+const reps = (k) => R[k].join(',');
 
 // Gates, fixed order. (1) ni/nc: min(lane) - min(noop, same mode, kc) <= 2 (24 lanes). Both
 // sides are the MIN over REPS children (tier / jitter noise only adds scavenges).
@@ -189,9 +212,50 @@ for (const kc of N3_KCS) {
     const v = vmin('noop/' + kc + '/nc');
     gate('NC-CTRL[noop/' + kc + ']', v, v >= 12);
 }
-// Print-only: the ni Noop baseline (min), and the SS lanes (F3, gated in H2.5).
+// Print-only: the ni Noop baseline (min).
 for (const kc of N3_KCS) results.push('noop-ni[' + kc + ']=' + vmin('noop/' + kc + '/ni'));
-for (const mode of N3_MODES) for (const kc of N3_KCS) results.push('SS[' + mode + '/' + kc + ']=' + one('ss/' + kc + '/' + mode) + ' (print-only: F3, gated in H2.5)');
+
+// ---- N3c (H2.5, F3/F4): the count-box gates. Every rep is printed; the gate is on the MIN. ----
+// G1 (teeth): SS add count-1, ni/nc. lane - noop(same mode, kc) <= 2. HEAD boxes the caller's key
+// INSIDE the library (ni 74-75 / nc 25-26) so it FAILs; the tree reads the Noop floor.
+for (const mode of ['ni', 'nc']) {
+    for (const kc of N3_KCS) {
+        const lk = 'ss/' + kc + '/' + mode, nk = 'noop/' + kc + '/' + mode;
+        const delta = vmin(lk) - vmin(nk);
+        gate('N3[' + mode + '/ss/' + kc + ']', delta + '[ss=' + reps(lk) + ',noop=' + reps(nk) + ']', delta <= 2);
+    }
+}
+// G2 (regression guard): SS add count-1, df. min <= the LIVE vmin(noop, ni, kc) + 2 -- SS add is
+// > 460 bytes (never inlined) so the df floor IS the caller's own box; the limit is never raised.
+for (const kc of N3_KCS) {
+    const lk = 'ss/' + kc + '/df';
+    const mn = vmin(lk), lim = vmin('noop/' + kc + '/ni') + 2;
+    gate('N3[df/ss/' + kc + ']', 'min=' + mn + '[' + reps(lk) + '](<=' + lim + ')', mn <= lim);
+}
+// G3 (teeth): SS add, small key, constant count 2^30 (every arg a Smi). min <= 2. HEAD reads ~24.
+for (const mode of ['ni', 'df']) {
+    const lk = 'ss.c30/small/' + mode, mn = vmin(lk);
+    gate('N3c[' + mode + '/ss.c30/small]', 'min=' + mn + '[' + reps(lk) + ']', mn <= 2);
+}
+// G4 (teeth): SS bump, variable count 2^31, ni. lane - noop.hitv31(ni, kc) <= 2. HEAD boxes the
+// count INSIDE the bump (delta ~25) so it FAILs; the tree reads the Noop floor (the caller's box).
+for (const kc of ['small', 'b31']) {
+    const lk = 'ss.hitv31/' + kc + '/ni', nk = 'noop.hitv31/' + kc + '/ni';
+    const delta = vmin(lk) - vmin(nk);
+    gate('N3c[ni/ss.hitv31/' + kc + ']', delta + '[ss=' + reps(lk) + ',noop=' + reps(nk) + ']', delta <= 2);
+}
+// CV-CTRL (teeth, non-vacuity): the variable count 2^31 really crosses as a non-Smi -> the Noop
+// baseline must box it, reading >= 12. A Smi count or an elided arg would read ~0 and pass vacuously.
+{
+    const v = vmin('noop.hitv31/small/ni');
+    gate('CV-CTRL[noop.hitv31/small]', v + '[' + reps('noop.hitv31/small/ni') + ']', v >= 12);
+}
+// G5 (teeth): CMS cons + plain, small key, variable count 2^31, df. min <= 2. HEAD boxes the count
+// crossing _applyCons / _applyPlain (24-25) so it FAILs; the tree reads it from the _cnt slot.
+for (const tag of ['cms', 'cmsp']) {
+    const lk = tag + '.v31/small/df', mn = vmin(lk);
+    gate('N3c[df/' + tag + '.v31/small]', 'min=' + mn + '[' + reps(lk) + ']', mn <= 2);
+}
 
 const ok = fails === 0;
 console.log('GATE lanes' + (libArg ? ' (lib=' + libArg + ')' : '') + ': ' + results.join(' ') +

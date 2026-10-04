@@ -108,6 +108,31 @@ Validation only; `add` gains guard lines, the rest of the hot path is byte-ident
    shared `_describe(x)` (typeof-first), so a null-proto object or a throwing / re-entrant
    `toString` can no longer escape the `[lite-sketch]` tag or mutate the summary during a rejection.
 
+## H2.5 amendment (2026-10-04) -- argument-free hot path (F3; S1 home site)
+
+Zero behavior change (bit-identical to the pre-H2.5 build (de7ecaf, which already carries F12) over
+636,951 parity checks); the hot body stops boxing the key / count inside the library. The ":39-41 one
+function" claim above is refined: the map home `hash(storedKey) & mask` is now realised as **one home
+in THREE bit-identical, site-tested copies** -- `_hash` (the reference, used by estimate / errorOf /
+merge placement and the tests), `add`'s inline mix, and `_homeAt` -- because routing a key / count
+through a `number`-typed helper boxed a `HeapNumber` for values `>= 2^31`.
+
+1. **The bump is inlined into `add`** (no `_bump(slot, delta)`): `add` reads
+   `prevB = _bPrev[_cBucket[sl]]` BEFORE `_count[sl] += count` and `_detach`, then `_attach`. No
+   count crosses a call.
+2. **`_attach(slot, hint)` reads `_count[slot]` itself** (was `_attach(slot, val, hint)`). Every
+   caller -- insert, the inlined bump, evict, merge rebuild -- writes `_count[slot]` first, so the
+   value is never passed (and never boxed) as an argument.
+3. **Eviction + backshift are argument-free.** `_mapDeleteKey(key)` is gone; eviction does
+   `_mapDelete(_probeAt(_key, sl, _homeAt(_key, sl)))` and the backshift home is `_homeAt(_mapKey, j)`.
+   `_homeAt(arr, i)` hand-inlines the HI-lane murmur (same neg / `Math.abs` / low-word / high-word
+   split and the same `_m3round` / `_m3final` constants as `_hash`) and reads the key from the buffer,
+   so it never boxes crossing a call. `_homeAt` serves the evicted-key delete probe and the backshift;
+   the evict RE-PROBE reuses `add`'s own `home`. This IS the F2 "SS home" hand-inline site. `_probe` is
+   unchanged (its `h & mask` is idempotent): EVERY production caller -- `add` (hot) and estimate /
+   errorOf / merge (cold) -- passes the home `_hash(key) & _mask`; only the tests pass a raw `_hash`.
+   A qa identity test pins `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
+
 ## Non-goals
 
 No sliding-window / decay variant (a future member); no serialization format in the
