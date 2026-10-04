@@ -78,6 +78,30 @@ one draw). It also gates one-sidedness (0 undercounts) and conservative <= plain
 the space co-headline: `d * w * 4` bytes vs the exact `Map` whose memory grows O(distinct).
 MEASURED vs THEORETICAL side by side (the lite-filter table shape).
 
+## H2.3 amendment (2026-10-04) -- counting honesty (F13, F14, F15, F16, F20; S4, S5, S6, S7)
+
+The hot bodies of `add` / `addHashed` / `estimate` / `_applyCons` / `_applyPlain` change only by
+guard lines; no restructure.
+
+1. **`estimate` guard widened to `add`'s (F13).** A key `add` would reject (non-integer /
+   non-finite / `|key| > 2^53-1`) now estimates 0 instead of truncating under `>>> 0` and aliasing
+   a real key (`estimate(Infinity)` / `(1.5)` / `(2**64)` no longer read a neighbour's count).
+2. **One-sidedness is scoped to `!saturated` (F14, S4).** A sticky `saturated` getter is set on
+   every `CMS_MAX_COUNT` clamp (cons, plain, merge), carried by `merge` from either side, and reset
+   by `clear()`. While it is false the estimate never undercounts; once true a saturated key may
+   read low. "NEVER undercounts" becomes "one-sided while `!saturated`".
+3. **Running-total ceiling (F15, S5).** `count` stays `[1, 2^32-1]`; an `add` / `addHashed` /
+   `merge` that would push `total` past `2^53-1` throws tagged (a new cold `_badTotal`) as a
+   byte-identical no-op, so the exact aggregate never silently goes inexact.
+4. **`withAccuracy` throws when unattainable (F16, S6).** The silent clamp of `w` to `2^25` and `d`
+   to `32` is deleted; a request needing `w > 2^25` or `d > 32` now throws tagged. The clamp UP of
+   `d` to `>= 1` stays (it only strengthens the guarantee).
+5. **Cross-`conservative` merge is allowed and documented (S7).** `this` keeps its own flag; the
+   result stays one-sided (exact only when both sides are plain).
+6. **Throwers run no caller code (F20).** Every cold message now formats its rejected arg through a
+   shared `_describe(x)` (typeof-first); a null-proto object / throwing / re-entrant `toString` can
+   no longer escape the tag or mutate the receiver during a byte-identical rejection.
+
 ## Non-goals
 
 No range / heavy-hitter queries (that is SpaceSaving, M4, and DDSketch, M3); no serialization

@@ -392,8 +392,8 @@ grows until H2.8, which owns the 1.2.0 trinity. The order follows the dependenci
 | --- | --- | --- |
 | H2.1 (done) | F1 + the reusable child-process lane harness (N2-HLL, N5, a one-box control) + the HLL torture lane at 0 | 2 lines of HLL |
 | H2.2 (done) | F10, F11, F17 (S2, S3): the DDSketch ctor and merge fail-closed fixes | DDSketch ctor / merge |
-| **H2.3** | F13, F14, F15, F16 (S4, S5, S6) + F20: counting honesty (estimate guard, `saturated`, count cap, withX throws) and the `String(x)` thrower fix | validation only, no restructure |
-| H2.4 | F2 + F12 (S1): the hand-inlined murmur + sign bit at all five sites, and the N9 parity harness | hash sites |
+| H2.3 (done) | F13, F14, F15, F16 (S4, S5, S6) + F20: counting honesty (estimate guard, `saturated`, count cap, withX throws) and the `String(x)` thrower fix | validation only, no restructure |
+| **H2.4** | F2 + F12 (S1): the hand-inlined murmur + sign bit at all five sites, and the N9 parity harness | hash sites |
 | H2.5 | F3 + F4: argument-free SpaceSaving and CMS helpers (N3) | SS / CMS internals |
 | H2.6 | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7 | public API (additive) |
 | H2.7 | F7, F8, F18, F21: `topKInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
@@ -475,7 +475,7 @@ Reviewer focus:
 - whether CTRL really runs no-inline;
 - whether the lanes read keys from the Float64Array rather than from a closure int.
 
-### 7.3 H2.2 spec -- DDSketch fail-closed: F10 + F11 + F17 (S2, S3)  [DONE 2026-10-04, awaiting maintainer commit]
+### 7.3 H2.2 spec -- DDSketch fail-closed: F10 + F11 + F17 (S2, S3)  [DONE, committed 26b6eb3]
 
 Result: the coder hit its turn limit once. The reviewer REJECTED once, for doc truth only: the stale
 jsdoc domain and the inverted F17 direction in the CHANGELOG. It then APPROVED. qa found b1-b7 PASS:
@@ -609,5 +609,235 @@ Reviewer focus:
 - Can the strict-collapsed check ever let a partial write through (ordering vs the pre-scan)?
 - Do the caps throw rather than silently clamp?
 - Can G1 flake on a slow machine? (5 ms vs 0.0001 ms; the 2 s child timeout.)
+
+### 7.4 H2.3 spec -- counting honesty: F13 + F14 + F15 + F16 (S4, S5, S6) + F20  [DONE 2026-10-04, awaiting maintainer commit]
+
+Result: the reviewer REJECTED twice, then APPROVED; qa found c1-c8 PASS.
+- **Rejection 1 (HIGH, an orchestrator miss):** the new guards pushed DD `add` from 445 to 483
+  bytecode bytes and `addFrom` from 435 to 465. Both crossed V8's 460-byte inline cap, so a fractional
+  `dd.add(x)` boxed its argument: N7 `add(value)` went 0 -> 15. Torture still printed `ok` because
+  that lane was print-only. The spec's "no torture change needed" was wrong; the prototype had already
+  shown the 15.
+  - Fix: `!Number.isFinite(value)`, plus the count cap and total guard folded into one branch with a
+    cold `_badCount` dispatch. Now add is 448 bytes and addFrom 449; messages and rejections unchanged.
+  - New gate: torture gates N7 `add(value)` <= 2 (SCAV_ADD_INLINE). It FAILs at 15 on the 483-byte
+    shape and under `--max-inlined-bytecode-size=440`.
+  - The bytecode of every changed hot method was measured; none crossed 460. SS.add was already over
+    460 on HEAD (680 -> 721).
+  - The same round fixed a stale d.ts "always" line, asserted the F16 rounding preconditions, and
+    added a checked parity DOC-DIFF line.
+- **Rejection 2 (LOW, gate teeth):** `/33554432/` and `/16777216/` also matched the constructor's own
+  messages, so the withX off-by-one mutants survived. They now match `/width cap/` / `/capacity
+  cap/`. A new DD G-F20b pins the non-finite `_badValue` path.
+- **qa added 4 cases:** the CMS merge total guard runs before the saturated carry (a mutant otherwise
+  survived), a self-merge at the 2^53-1 ceiling for all three members, the `_badTotal` text, and the
+  read-only `saturated`.
+- **Numbers:** 217 tests (0 todo). On HEAD, 24 of the planner tests fail. Torture is `ok` x5 with N7
+  add(value) = 0. Perf 9/9, lanes ok, witness byte-identical to HEAD. Parity: HLL / DD / CMS / SS /
+  messages identical, DOC-DIFF 7/7. The hot-set diff is exactly the 8 methods; HLL hot bytecode is
+  identical (338/171).
+- **Watch:** DD add / addFrom sit at 448 / 449 vs 460. N7 guards `add`; `addFrom` losing inlining
+  costs only call overhead, not boxing. Re-measure if H2.5 / H2.6 grow either body.
+
+Why now: every finding here is validation or disclosure, with no restructure. It has to land before
+H2.5/H2.6 restructure the add paths that will carry it. F14 and F15 break the headline claims
+("NEVER undercounts", "exact running aggregates"). F20 breaks the tag law in all four members. The
+hash sites do not move (F2/F12 are H2.4).
+
+Pre-measured (HEAD 26b6eb3, Node 26.8.2):
+- **F13:** on CMS(4,1024), after `add(0,50); add(1,70)`: `estimate(Infinity)` = 50, `(1.5)` = 70,
+  `(2**64)` = 50 (Infinity and 2^64 alias key 0; 1.5 aliases key 1).
+- **F14:** `add(5,2**32-1); add(5,10)` gives estimate 4294967295 and total 4294967305, on both the
+  cons and plain paths.
+- **F15:** SS `add(1,1e308)` x2 gives total Infinity and `heavyHitters(0)` returns []. DD
+  `add(1,2**60)` x2 is accepted. CMS 2^21+2 adds of (1, 2^32-1) give total 9007207842578432.
+- **F16:** `withAccuracy(1e-12,0.01)` gives epsilon 8.1e-8, `(0.01,1e-20)` gives d=32, and
+  `withError(1e-9)` gives k=2^24.
+- **F20:** `Object.create(null)` gives an untagged TypeError, a throwing toString replaces the tag,
+  and a re-entrant toString mutates reg[0]. 35 `String(` call sites on 34 lines (H2.2 added two).
+- **Prototype** (the T2-T4 hot guards on a copy of HEAD): torture `ok` with 0 B/op on all 9 lanes and
+  SCAV 0 on every clean lane, perf 9/9, lanes ok. Tests 197 pass / 1 fail: DDSketch.test.js:625,
+  which pins the old behavior that S5 changes.
+- **Boundary doubles (verified by the orchestrator):** `ceil(e/(e/2^25))` = 2^25 and
+  `ceil(e/nextDown(e/2^25))` = 2^25+1; `ceil(ln(1/exp(-31.5)))` = 32, `exp(-32.5)` gives 33;
+  `ceil(1/2^-24)` = 2^24 and `ceil(1/nextDown(2^-24))` = 2^24+1; `e/5e-324` = Infinity.
+- **Exactness:** `total + count > 2^53-1` is exact for total <= 2^53-1 and count <= 2^53-1, because
+  rounding is monotonic and 2^53 is representable. This also covers the merge guards.
+
+Hot body vs cold path. Exactly 8 hot methods change bytes:
+- CMS `add` / `addHashed` (+1 total-guard line each), `estimate` (guard widened to add's),
+  `_applyCons` / `_applyPlain` (the clamp branch gains `this._saturated = true`);
+- DD `add` (count cap + total guard), `addFrom` (total guard);
+- SS `add` (count cap + total guard).
+
+Every other hot method stays byte-identical (HLL add / addHashed, CMS estimateHashed, DD _addKey /
+quantile, SS estimate / _hash / _probe / _bump / _attach / _detach / _mapDelete). Each new hot value
+(`this._total + count`, `this._count + count`) is a register temp compared in place; the only new call
+is the cold `_badTotal` on the reject path; `_saturated` stores a boolean constant. No torture change
+is needed.
+
+Out of scope (do not touch):
+- the murmur and sign bit (H2.4); helper arguments (H2.5); addFrom / addHashedFrom (H2.6);
+- option bags, forEach, -0 and the merge brand check (F18/F21, H2.7), including `Array.isArray` on a
+  revoked Proxy (CMS / DD / SS option checks) and `instanceof` running a Proxy trap in DD addFrom;
+- thresholds (F9, H2.8) and the README:137 collapse wording (F19);
+- SS `estimate` (it compares keys exactly, so it has no F13 alias). SS "never undercounts a monitored
+  key" (llms ~:302, ADR 0005:93) stays true and is not edited.
+
+**Tasks**
+- **T1 (coder, Sketch.js, F20):** one module-scope cold `function _describe(x)` after `saltRow`.
+  - `typeof` first. A string returns itself. `object` returns `x === null ? 'null' : '[object]'`.
+    `function` returns `'[function]'`. Anything else returns `String(x)` (number / boolean /
+    undefined / bigint / symbol run no user code).
+  - It never reads a property, never calls `Array.isArray`, never touches x beyond `typeof` / `===`.
+  - Replace all 35 `String(` call sites with it (HLL 4, CMS 11, DD 13 incl. both in `_badBuf`, SS 7).
+    Fix the comments that cite String (:404, :790, :1535, :2013). Exactly one `String(` call survives,
+    inside `_describe` (`hashString(` matches a naive grep).
+  - For every primitive argument the message text stays byte-identical to HEAD.
+- **T2 (coder, Sketch.js, F13):** CMS `estimate`'s guard becomes add's own: `typeof key !== 'number'
+  || key !== key || !Number.isInteger(key) || Math.abs(key) > 9007199254740991` returns 0. Jsdoc: a
+  key `add` would reject estimates 0.
+- **T3 (coder, Sketch.js, F14 + S4):**
+  - Ctor: `this._saturated = false;` is the LAST field, after `_total`.
+  - `_applyCons`: `if (target > CMS_MAX_COUNT) { target = CMS_MAX_COUNT; this._saturated = true; }`.
+    `_applyPlain` gets the same on `v`. An exact 2^32-1 does not set it.
+  - `merge`: `let sat = other._saturated;`, each clamp sets `sat = true`, and after the loop
+    `if (sat) this._saturated = true;`. `clear()` resets it.
+  - `get saturated()` (O(1)) after `total`, jsdoc: sticky; while false, estimate is one-sided.
+  - Class jsdoc: "NEVER undercounts" becomes "one-sided while `!saturated`".
+- **T4 (coder, Sketch.js, F15 + S5):** literals stay in the hot bodies, as with `9007199254740991`.
+  - CMS `add` / `addHashed`: `if (this._total + count > 9007199254740991) return this._badTotal(count);`
+    right after the count check, before the hash.
+  - DD `add`: the count check gains `|| count > 4294967295`, then
+    `if (this._count + count > 9007199254740991) return this._badTotal(count);` BEFORE the
+    `value < 0` line, so before the zero-branch write.
+  - DD `addFrom`: `if (this._count + 1 > 9007199254740991) return this._badTotal(1);` after the
+    NaN/Infinity check.
+  - SS `add`: count cap + total guard after the count check, before the hash.
+  - Merges, all before the first write: CMS after the brand/shape check (`this._total +
+    other._total`); DD after the strict pre-scan, before the "Past every throw" line (`this._count +
+    other._count`); SS right after the brand check, before `minThis` and the Map build.
+  - A new cold `_badTotal(n)` per class: a tagged RangeError naming 2^53-1, printing the current total
+    (DD: count) and `_describe(n)`.
+  - DD / SS `_badCount` messages become "count must be an integer in [1, 4294967295]", like CMS.
+  - Update the add / merge jsdocs of all three classes.
+- **T5 (coder, Sketch.js, F16 + S6):**
+  - `withAccuracy`, after the domain checks: `w = Math.ceil(Math.E / epsilon)`; if `w > CMS_W_MAX`
+    throw a tagged RangeError naming epsilon and 33554432 (2^25). Then `d = Math.ceil(Math.log(1 /
+    delta))`; if `d > CMS_D_MAX` throw a tagged RangeError naming delta and 32. Both throws come BEFORE
+    the round-up loop; Infinity from a denormal also throws.
+  - Delete the w clamp, its comment and the d > 32 clamp. Keep `if (d < 1) d = 1`.
+  - `withError`: `k = Math.ceil(1 / epsilon)`; if `k > SS_CAP_MAX` throw tagged, naming epsilon and
+    16777216. Fix both jsdocs.
+- **T6 (coder, tests, existing per-member files and style; each new gate FAILs on HEAD):**
+  - **G-F13 (CMS):** the pre-measured sequence on cons + plain. `estimate` of Infinity, -Infinity,
+    1.5, 2**64, 2**53 and -(2**53) is 0; keys 0 / 1 still read 50 / 70.
+  - **G-F14 (CMS):** fresh false; after `add(5,2**32-1)` false; after `add(5,10)` true (cons and
+    plain). A merge clamp sets it; a saturated other carries it into an empty `this`. Sticky after more
+    adds; `clear()` gives false.
+  - **G-F15:**
+    - DD and SS count cap: `add(k,2**32-1)` accepted; `2**32`, `1e308` and MAX_SAFE throw tagged with
+      a byte-identical snapshot, and the message contains `[1, 4294967295]`.
+    - Total N/N+1, one fill per member: 2^21 adds of (k, 2^32-1) then `add(k, 2**21-1)` give total
+      === 2^53-1 (accepted). Then each entry point throws tagged with a byte-identical snapshot: CMS add
+      + addHashed; DD add(v), add(0), addFrom; SS insert / bump / evict.
+    - Merge (CMS / DD / SS): `this` at total 2^53-6 rejects an other of total 6 byte-identically and
+      accepts an other of total 5 (result 2^53-1).
+  - **G-F16:** each boundary first asserts its own double-rounding precondition.
+    - CMS rejects: `withAccuracy(1e-12,.01)` and `(1e-9,.01)` (< 2000 ms); `(5e-324,.01)`;
+      `(nextDown(Math.E/2**25),.5)`; `(.01,1e-20)`, `(.01,1e-300)`, `(.01,Math.exp(-32.5))`,
+      `(.01,5e-324)`.
+    - CMS accepts: `(Math.E/2**25,.5)` gives w === 2**25; `(.01,Math.exp(-31.5))` gives d === 32;
+      `(.01,0.999999999999999)` gives d === 1.
+    - SS rejects `withError(1e-9)`, `(5e-324)`, `(nextDown(2**-24))`; accepts `withError(2**-24)`
+      with capacity 2**24.
+  - **G-F20 (all 4 files):** hostile args, each with a `calls` counter: (a) `Object.create(null)`;
+    (b) toString / valueOf that throw `boom`; (c) toPrimitive / toString / valueOf that mutate the
+    receiver AND a second instance; (d) a function with a mutating toString. Slots:
+    - HLL: ctor p, seed; add; addHashed hi, lo.
+    - CMS: ctor d, w, `{seed}`, `{conservative}`; withAccuracy eps, delta; add key, count; addHashed
+      hi, lo, count.
+    - DD: ctor alpha, `{maxBins}`, `{range: H}`, `{range:[H,5]}`, `{range:[1,H]}`; add value, count;
+      addFrom buf, i.
+    - SS: ctor capacity, `{seed}`; withError; add key, count.
+    - Each throw is tagged, both snapshots byte-identical, `calls === 0`, and one null-proto message
+      per class ends in `got [object]`.
+  - **G-S7 (CMS, a pin, not a behavior change):** merges cons<-plain and plain<-cons (d=4, w=64, 5000
+    adds over 500 keys) are accepted, `this.conservative` is unchanged, 0 undercounts vs an exact Map,
+    and `saturated` is false. It passes on HEAD by design; its teeth are a mutant that rejects the
+    merge or flips the flag.
+  - **Existing tests that change (rewrite, never delete):**
+    - DDSketch.test.js:625 (accepted `add(5, MAX_SAFE)`): 2^32-1 accepted; 2^32 and MAX_SAFE throw
+      byte-identically.
+    - CountMinSketch.test.js:286 (asserted the clamp to 2^25): throws tagged in < 2000 ms, keeping the
+      no-hang regression.
+    - CountMinSketch.test.js:294: `dTiny.d === 1` stays; 1e-300 now throws.
+    - SpaceSaving.test.js:535: 1e-9 throws; 2**-24 gives 2^24.
+    - HyperLogLog.test.js:580-593: drop `todo`, fix the comment, make it the HLL G-F20.
+    - CountMinSketch.test.js:386: add the missing `assert.equal(d.estimate(1.5), 0)`.
+    - CountMinSketch.test.js:255/262/269: add `saturated` false-before / true-after.
+    - SpaceSaving.test.js:433 and the DD bad-count matrix gain `2**32`, `1e308` and MAX_SAFE.
+    - Header comments: CMS items 6/8, and SS. No existing test asserts on array or object message
+      text, so `'[object]'` touches no other test.
+- **T7 (coder, test/parity.mjs, H2.3 section, against the same ref):**
+  - CMS: cons + plain at (4,1024) and (5,4096); seeded integer-key streams (small / negative /
+    > 2^32 / near-MAX_SAFE classes), counts in [1, 2^32-1] with total < 2^53, plus addHashed lanes.
+    Identical: `_counts`, `total`, `estimate` on every added key + 10k random integers, and merges
+    plain<-plain, cons<-plain, plain<-cons.
+  - DD: non-strict / maxBins 64 / strict, counts <= 2^32-1, through `ddSnap`: identical.
+  - SS: capacity 1/7/64/1000 with evictions + merge: `_key` / `_count` / `_error` [0, size), total
+    and `topK()` identical.
+  - Messages: for primitive bad args (numbers, strings, booleans, undefined, null, Symbol, BigInt) at
+    every thrower, new message === ref message, except DD/SS `_badCount`.
+  - Documented diffs (printed; each checked new-side only): estimate of non-integer / non-finite /
+    > MAX_SAFE keys is now 0; counts > 2^32-1 and totals > 2^53-1 rejected (tagged + byte-identical);
+    `saturated` is new; withX unattainable inputs throw; non-primitive messages print `[object]`;
+    a doubly-invalid DD add (negative value + over-cap count) now names the count.
+- **T8 (coder, docs, never VERSION):**
+  - Sketch.d.ts: "one-sided while `!saturated`" + the S7 note; withAccuracy throws when w > 2^25 or
+    d > 32; CMS count domain, total guard, `saturated` carried by merge, cross-flag merge allowed; new
+    `readonly saturated: boolean`; clear resets it; DD count [1, 2^32-1] + total guard; withError
+    throws; SS add domain and merge doc. test/types gets `const sat: boolean = cms.saturated` plus a
+    `@ts-expect-error` write.
+  - llms.txt: every CMS "never undercounts" line, a `saturated` line, the withX lines, the DD count
+    domain (:211 `[1, 2^53)` becomes `[1, 2^32-1]`), the SS count domain, the total guard.
+  - README: :92 / :120 ("can never undercount"), the S7 note, withX, rejected-key estimates 0,
+    `cms.saturated`, the DD / SS count domain; grep long lines for `undercount|clamp|one-sided`.
+  - ADRs: 0003 a dated H2.3 note (item 3 "while `!saturated`" + S7; item 4's clamp replaced by the
+    S6 throw; item 5 gains `saturated` + the total guard); 0004 and 0005: the S5 cap and the S6 throw.
+  - CHANGELOG `[Unreleased]`: **Fixed** F13, F14, F15, F16, F20 (each with its HEAD example);
+    **Added** `CountMinSketch.saturated`; **Changed** DD/SS count > 2^32-1 throws, totals past 2^53-1
+    throw on add / addFrom / merge of all three counted members, withAccuracy / withError throw
+    instead of clamping, non-primitive args print `[object]` / `[function]`, the DD/SS count message
+    text, and the doubly-invalid precedence.
+
+**Assertions (qa proves each; c1-c5 also run against `git show HEAD:Sketch.js` with the tests copied
+to the scratchpad and the import repointed, and must FAIL there)**
+- c1: G-F13 passes. On HEAD it reads 50 / 70 / 50 and FAILs.
+- c2: G-F14 passes. On HEAD `saturated` is undefined and it FAILs.
+- c3: G-F15 passes, with total === 9007199254740991 accepted and +1 rejected at every entry point and
+  every merge. On HEAD all are accepted and it FAILs.
+- c4: G-F16 passes, each reject in < 2000 ms. On HEAD the clamped instances return and it FAILs.
+- c5: G-F20 passes with `calls === 0` in all four members and every slot. On HEAD the throws are
+  untagged / `boom`, calls > 0, and it FAILs. `grep -nE '(^|[^A-Za-z_])String\(' Sketch.js` prints
+  exactly 1 line.
+- c6: `node test/parity.mjs` shows HLL ok, DD ok, and H2.3 at 0 diffs on accepted streams, with
+  primitive-message parity. Only the documented diffs are printed.
+- c7: torture `ok`, unchanged, over 3 runs: 9 measureAllocs lanes at 0 B/op; SCAV_CLEAN lanes and
+  the N7 addFrom lane = 0; phase 2b maxMajor 0; trackers return to 0; abGrowth <= 0. Perf 9/9 and
+  `npm run lanes` ok.
+- c8: the hot-set byte diff vs HEAD is exactly the 8 methods above (HLL byte-identical except its 4
+  throwers). ASCII-only, no deps, pack 7 files, VERSION '1.1.2'. `npm run verify` green with 199 +
+  new tests and 0 todo; witness unchanged.
+
+Reviewer focus:
+- Does every guard precede EVERY write (the DD zero branch, all three SS paths, each merge)?
+- Is `_saturated` initialized last and set only on a real clamp?
+- Does `_describe` touch x beyond `typeof` / `===`? Does any implicit `'' + x` of a caller value
+  remain in a throw path?
+- Is each boundary precondition asserted rather than assumed?
+
+RISK: a forged `other` (F21) can still run caller code through `this._total + other._total` in the
+new merge guards. That class is pre-existing and owned by H2.7.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

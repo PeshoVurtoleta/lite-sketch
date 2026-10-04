@@ -122,6 +122,22 @@ the ctor constants/math, `merge`, and one new cold thrower moved.
    before the strict pre-scan, as a byte-identical no-op -- its low-end mass has already folded,
    so the strict range guarantee cannot hold.
 
+## H2.3 amendment (2026-10-04) -- counting honesty (F15, F20; S5)
+
+Validation only; `add` / `addFrom` gain guard lines, the rest of the hot path is byte-identical.
+
+1. **Count cap + running-count ceiling (F15, S5).** `count` is now `[1, 2^32-1]` (matching CMS); an
+   `add` / `addFrom` / `merge` that would push the exact running `count` past `2^53-1` throws tagged
+   (a new cold `_badTotal`) as a byte-identical no-op. The `_badCount` message becomes "count must
+   be an integer in [1, 4294967295]". The count check precedes the negative-value check, so a
+   doubly-invalid `add(-5, 2**40)` names the count; a non-finite value is still caught first (one
+   `Number.isFinite` call now folds the old typeof/NaN/+-Infinity chain), so `add(NaN, 2**32)` names
+   the value. `add` and `addFrom` fold the count-domain + total-ceiling guards into one cold branch
+   so their hot bodies stay under the V8 inline-bytecode cap (`add` 448, `addFrom` 449 bytes).
+2. **Throwers run no caller code (F20).** Every cold message (incl. both arms of `_badBuf`) formats
+   its rejected arg through the shared `_describe(x)` (typeof-first), so a null-proto object or a
+   throwing / re-entrant `toString` can no longer escape the `[lite-sketch]` tag or mutate state.
+
 ## Non-goals
 
 No negative values (deferred); no rank-error mode (relative-error is the point); no top-k /

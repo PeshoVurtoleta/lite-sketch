@@ -56,7 +56,7 @@ A sketch is a promise: "I use `X` bytes and my answer is within `E` of the truth
 ## What you get
 
 - **HyperLogLog** -- distinct-count (cardinality) in fixed space, `~1.04/sqrt(m)` standard error, mergeable. (The reference member.)
-- **CountMinSketch** -- point-query frequency ("how many times have I seen `x`?") in a fixed `d x w` matrix, a one-sided over-estimate bounded by `epsilon * N`, with conservative update on by default and merge for map/reduce.
+- **CountMinSketch** -- point-query frequency ("how many times have I seen `x`?") in a fixed `d x w` matrix, a one-sided over-estimate (while `!saturated`) bounded by `epsilon * N`, with conservative update on by default and merge for map/reduce.
 - **DDSketch** -- relative-error quantiles (p50/p90/p99/...) in fixed space, with a *hard* per-query guarantee `|v - v_true| <= alpha * v_true` -- the family's sharpest bound. Collapsing-lowest keeps the tail accurate; strict fixed-range is an opt-in.
 - **SpaceSaving** -- heavy hitters / top-k in `k` fixed counters: every element above `N/k` frequency is reported (no false negatives), with a bracketed `[count - error, count]` on each. Completes the roster -- the four-member API is stable as of 1.0.0.
 - **A shipped, avalanche-tested hash** -- a two-lane 64-bit-quality non-crypto mix, zero-alloc, with a pre-hashed fast path for callers who bring their own. (HyperLogLog and CountMinSketch use it; DDSketch bins raw values.)
@@ -89,7 +89,7 @@ The estimator (`count()`) is O(m) and runs only when you ask; `add()` touches ex
 
 ## CountMinSketch
 
-Count *how many times* you have seen a key, in a fixed `d x w` matrix of counters -- no matter how many distinct keys the stream carries. Each key hashes to one column per row; `add` bumps those `d` cells; `estimate` returns their **minimum**. Since collisions only ever add, the min is a one-sided over-estimate: `estimate(key) >= true count`, and it exceeds the truth by more than `epsilon * N` (N = total added) with probability at most `delta`.
+Count *how many times* you have seen a key, in a fixed `d x w` matrix of counters -- no matter how many distinct keys the stream carries. Each key hashes to one column per row; `add` bumps those `d` cells; `estimate` returns their **minimum**. Since collisions only ever add, the min is a one-sided over-estimate (while `!saturated`): `estimate(key) >= true count`, and it exceeds the truth by more than `epsilon * N` (N = total added) with probability at most `delta`.
 
 ```js
 import { CountMinSketch } from '@zakkster/lite-sketch';
@@ -117,7 +117,7 @@ total.estimate(k);                                       // same answer as one s
 <details>
 <summary><b>Why the min is the right answer, and the accuracy/space trade (deep dive)</b></summary>
 
-Every counter a key touches is `true count + (collisions from other keys)`. Collisions are non-negative, so *every* cell is an over-estimate and the smallest one is the tightest -- that is why `estimate` takes the min, and why it can never undercount. The Cormode-Muthukrishnan bound sets the geometry: `w = ceil(e / epsilon)` columns cap the expected collision mass at `epsilon * N` per row, and `d = ceil(ln(1/delta))` independent rows drive the probability that *all* rows are unlucky down to `delta`. `withAccuracy(epsilon, delta)` inverts that; the raw `new CountMinSketch(d, w)` gives you the dial directly (`w` rounds up to a power of two so a column is a single `& (w-1)` mask). Memory is a flat `d * w * 4` bytes regardless of how many distinct keys arrive -- against an exact `Map` whose footprint grows with the distinct count. Counters saturate at `2^32 - 1` rather than wrapping (a wrap would break the min's monotonicity). The accuracy witness gates the measured over-estimate against `epsilon * N` on a Zipfian stream, and confirms conservative <= plain, on every release.
+Every counter a key touches is `true count + (collisions from other keys)`. Collisions are non-negative, so *every* cell is an over-estimate and the smallest one is the tightest -- that is why `estimate` takes the min, and why it can never undercount **while `!saturated`**. Once a counter clamps at `2^32 - 1` (the saturation ceiling) the sticky `cms.saturated` getter flips to `true` and a query over a saturated key may read low -- so the one-sided guarantee is explicitly scoped to `!saturated`. A cross-`conservative` merge is allowed (`this` keeps its own flag, the result stays one-sided; S7), and `saturated` is carried from either side. The Cormode-Muthukrishnan bound sets the geometry: `w = ceil(e / epsilon)` columns cap the expected collision mass at `epsilon * N` per row, and `d = ceil(ln(1/delta))` independent rows drive the probability that *all* rows are unlucky down to `delta`. `withAccuracy(epsilon, delta)` inverts that; the raw `new CountMinSketch(d, w)` gives you the dial directly (`w` rounds up to a power of two so a column is a single `& (w-1)` mask). Memory is a flat `d * w * 4` bytes regardless of how many distinct keys arrive -- against an exact `Map` whose footprint grows with the distinct count. Counters saturate at `2^32 - 1` rather than wrapping (a wrap would break the min's monotonicity). The accuracy witness gates the measured over-estimate against `epsilon * N` on a Zipfian stream, and confirms conservative <= plain, on every release.
 </details>
 
 ## DDSketch
@@ -207,18 +207,19 @@ Error roughly halves each time `p` rises by 2 (`m` quadruples) -- the space/accu
 
 ```js
 new CountMinSketch(d, w, options?)                     // d in [1,32]; w rounds up to a power of two, <= 2^25; d*w <= 2^31.
-CountMinSketch.withAccuracy(epsilon, delta, options?)  // w = ceil(e/epsilon) (pow2), d = ceil(ln 1/delta). epsilon, delta in (0,1).
+CountMinSketch.withAccuracy(epsilon, delta, options?)  // w = ceil(e/epsilon) (pow2), d = ceil(ln 1/delta). epsilon, delta in (0,1). THROWS when unattainable (w > 2^25 or d > 32) -- no silent clamp.
 // options: { seed?, conservative = true }             // an unknown option key throws [lite-sketch] with a did-you-mean hint.
 
-cms.add(key, count = 1) -> this          // HOT, O(d), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + increment the d cells. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key or bad count.
+cms.add(key, count = 1) -> this          // HOT, O(d), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + increment the d cells. count in [1, 2^32-1]. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key, a bad count, or a running total past 2^53-1.
 cms.addHashed(hi, lo, count = 1) -> this // HOT, O(d), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
-cms.estimate(key) -> number              // HOT, O(d), 0 B/op. The min of the d cells (one-sided over-estimate). NEVER throws (bad key -> 0).
+cms.estimate(key) -> number              // HOT, O(d), 0 B/op. The min of the d cells (one-sided over-estimate). NEVER throws -- a key add would reject estimates 0 (never aliases a real key).
 cms.estimateHashed(hi, lo) -> number     // HOT, O(d), 0 B/op. Query form of the pre-hashed path (bad lane -> 0).
-cms.merge(other) -> this                 // Element-wise saturating add. Throws [lite-sketch] on a non-CMS or mismatched d/w/seed.
-cms.clear() -> this                      // Zero the counters + running total; reuse the allocation.
+cms.merge(other) -> this                 // Element-wise saturating add. Throws [lite-sketch] on a non-CMS, mismatched d/w/seed, or a running total past 2^53-1. A cross-conservative merge is allowed (this keeps its flag); saturated is carried.
+cms.clear() -> this                      // Zero the counters + running total + saturated; reuse the allocation.
 cms.d / cms.w / cms.seed                 // the frozen shape + hash seed (getters)
 cms.conservative -> boolean              // whether conservative update is on (getter)
 cms.total -> number                      // the exact running sum N of all added counts (getter)
+cms.saturated -> boolean                 // sticky: true once a counter clamped at 2^32-1 (one-sided only while false); carried by merge, reset by clear (getter)
 cms.epsilon -> number                    // e / w -- the theoretical additive-error fraction (getter)
 cms.delta -> number                      // e^-d -- the theoretical failure probability (getter)
 ```
@@ -236,13 +237,13 @@ More columns `w` shrink the error `epsilon`; more rows `d` shrink the failure pr
 new DDSketch(alpha, options?)            // alpha in [1e-6, 1) = relative accuracy (floor is the exported DD_ALPHA_MIN). options: { maxBins = 2048, range?: [min, max] }.
                                          //   Throws [lite-sketch] on a bad alpha (incl. < DD_ALPHA_MIN) / maxBins / range BEFORE allocating. range present = strict fixed-range.
 
-dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite value (x=0 -> zero counter). Throws on x<0, non-finite,
-                                         //   out-of-indexable-range, or a bad count -- a byte-identical no-op.
+dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite value (x=0 -> zero counter). count in [1, 2^32-1]. Throws on x<0, non-finite,
+                                         //   out-of-indexable-range, a bad count, or a running count past 2^53-1 -- a byte-identical no-op.
 dd.addFrom(buf, i) -> this               // HOT, O(1), 0 B/op. Add buf[i] (count=1) read UNBOXED from a Float64Array -- the zero-box entry
                                          //   point for a FRACTIONAL value (add(fractionalDouble) boxes its argument ~16 B/call when not inlined).
                                          //   Same validation as add; throws on a bad buf / index or a value add would reject.
 dd.quantile(q) -> number                 // COLD, O(bins). The q-quantile (q in [0,1]) within alpha relative error. NEVER throws (empty/bad q -> NaN).
-dd.merge(other) -> this                  // Fold other in (collapsing as needed), carrying other.collapsed forward. Throws [lite-sketch] on a non-DDSketch, unequal alpha, a strict out-of-range key, or a collapsed other merged into a strict sketch.
+dd.merge(other) -> this                  // Fold other in (collapsing as needed), carrying other.collapsed forward. Throws [lite-sketch] on a non-DDSketch, unequal alpha, a running count past 2^53-1, a strict out-of-range key, or a collapsed other merged into a strict sketch.
 dd.clear() -> this                       // Zero the bins + all scalars; reuse the allocation.
 dd.alpha -> number                       // the relative-accuracy knob (getter)
 dd.count -> number                       // exact element count N (getter)
@@ -267,15 +268,15 @@ Smaller `alpha` -> finer buckets -> more bins used for a given value range (rais
 
 ```js
 new SpaceSaving(capacity, options?)      // capacity = k monitored counters, integer in [1, 2^24]. options: { seed? }.
-SpaceSaving.withError(epsilon, options?) // k = ceil(1/epsilon); a monitored key's over-count is then <= epsilon*N. epsilon in (0,1).
+SpaceSaving.withError(epsilon, options?) // k = ceil(1/epsilon); a monitored key's over-count is then <= epsilon*N. epsilon in (0,1). THROWS when unattainable (k > 2^24) -- no silent clamp.
 
-ss.add(key, count = 1) -> this           // HOT, O(1) amortized, 0 B/op. Increment / insert / evict-min. Throws on a non-safe-integer key or bad count.
+ss.add(key, count = 1) -> this           // HOT, O(1) amortized, 0 B/op. Increment / insert / evict-min. count in [1, 2^32-1]. Throws on a non-safe-integer key, a bad count, or a running total past 2^53-1.
 ss.estimate(key) -> number               // HOT, O(1). Monitored count (an upper bound), or 0. NEVER throws.
 ss.errorOf(key) -> number                // HOT, O(1). Over-count bound (true is in [estimate - errorOf, estimate]), or 0. NEVER throws.
 ss.forEach(fn) -> void                   // Alloc-free walk (storage order): fn(key, count, error, ss).
 ss.topK(n = size) -> Array<{key,count,error}>   // Top n by count DESC. COLD, allocates. NEVER throws.
 ss.heavyHitters(threshold) -> Array<{key,count,error}>  // count > threshold*total -- a SUPERSET, no false negatives. COLD, allocates.
-ss.merge(other) -> this                  // Union + keep top-k. Throws [lite-sketch] on a non-SpaceSaving or unequal capacity/seed.
+ss.merge(other) -> this                  // Union + keep top-k. Throws [lite-sketch] on a non-SpaceSaving, unequal capacity/seed, or a running total past 2^53-1.
 ss.clear() -> this                       // Drop all monitored keys; reuse the pools.
 ss.capacity / ss.size / ss.total         // k; monitored count (<= k); exact running sum N (getters)
 ss.epsilon -> number                     // 1 / capacity -- the theoretical error fraction (getter)
@@ -341,7 +342,7 @@ SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the e
 
 ## Design decisions worth knowing
 
-- **Accuracy is a co-headline, stated honestly.** Every member states space AND error AND whether the error is one-sided or two-sided, statistical or hard. HLL's is a *statistical* two-sided `~1.04/sqrt(m)`; CountMinSketch's is a *one-sided* over-estimate bounded by `epsilon * N` with probability `1 - delta`; DDSketch's is a *hard per-query* relative bound `|v - v_true| <= alpha * v_true` -- three different guarantee shapes, each named for what it actually is.
+- **Accuracy is a co-headline, stated honestly.** Every member states space AND error AND whether the error is one-sided or two-sided, statistical or hard. HLL's is a *statistical* two-sided `~1.04/sqrt(m)`; CountMinSketch's is a *one-sided* over-estimate (while `!saturated`) bounded by `epsilon * N` with probability `1 - delta`; DDSketch's is a *hard per-query* relative bound `|v - v_true| <= alpha * v_true` -- three different guarantee shapes, each named for what it actually is.
 - **Collapsing-lowest protects the tail (DDSketch).** When memory is tight the smallest-value buckets collapse, never the largest -- because p99, not p1, is what you page on. The degradation is disclosed (the smallest values may exceed `alpha`); strict fixed-range mode trades the unbounded range for a hard fail-closed door instead.
 - **Eviction is the algorithm, not a failure (SpaceSaving).** Unlike the fixed-capacity structures in `@zakkster/lite-o1`, SpaceSaving never throws at capacity -- it evicts the minimum, and that eviction is exactly what yields the no-false-negatives guarantee. It reports a *superset* (every true hitter, maybe a few extra) because that is the honest shape of the guarantee; the exact-subset filter is one subtraction away.
 - **Conservative update by default (CountMinSketch).** It cannot change the min-query answer, only tighten it, so it is a free accuracy win on skewed streams -- the default. The one cost is that it is not linearly mergeable, so plain mode stays available for exact map/reduce (an explicit `{ conservative: false }`).

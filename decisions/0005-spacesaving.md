@@ -93,6 +93,21 @@ the bracket `count - error <= true <= count` holds for every monitored key; and
 O(distinct). The over-estimate is one-sided (a monitored key is never undercounted);
 uniformity is statistical (the hash), not cryptographic.
 
+## H2.3 amendment (2026-10-04) -- counting honesty (F15, F16, F20; S5, S6)
+
+Validation only; `add` gains guard lines, the rest of the hot path is byte-identical.
+
+1. **Count cap + running-total ceiling (F15, S5).** `count` is now `[1, 2^32-1]` (matching CMS); an
+   `add` / `merge` that would push the exact running `total` past `2^53-1` throws tagged (a new cold
+   `_badTotal`) as a byte-identical no-op across insert / bump / evict and merge. The `_badCount`
+   message becomes "count must be an integer in [1, 4294967295]". SpaceSaving still "never
+   undercounts a monitored key" -- that guarantee is unchanged.
+2. **`withError` throws when unattainable (F16, S6).** The silent clamp of `k` to `2^24` is deleted;
+   a request needing `k > 2^24` now throws tagged rather than quietly returning a weaker summary.
+3. **Throwers run no caller code (F20).** Every cold message formats its rejected arg through the
+   shared `_describe(x)` (typeof-first), so a null-proto object or a throwing / re-entrant
+   `toString` can no longer escape the `[lite-sketch]` tag or mutate the summary during a rejection.
+
 ## Non-goals
 
 No sliding-window / decay variant (a future member); no serialization format in the

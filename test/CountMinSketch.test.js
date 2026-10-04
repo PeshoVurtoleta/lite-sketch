@@ -27,6 +27,14 @@ import { CountMinSketch, VERSION } from '../Sketch.js';
 
 const liteSketch = (e) => e instanceof Error && /^\[lite-sketch]/.test(e.message);
 
+// Cold test helpers: the adjacent double below x, via a bit view (probe the exact edges).
+function nextDown(x) {
+    const f = new Float64Array([x]);
+    const u = new BigUint64Array(f.buffer);
+    u[0] -= 1n;
+    return f[0];
+}
+
 // Deterministic PRNG (mulberry32-style) so no test ever flakes.
 function makeRng(seed) {
     let s = seed >>> 0;
@@ -254,16 +262,22 @@ test('conservative merge documents a VALID but LOOSER one-sided upper bound', ()
 
 test('saturation: add(key, 0xffffffff) then add(key, 5) caps at 0xffffffff, no wraparound (conservative)', () => {
     const c = new CountMinSketch(3, 16, { conservative: true });
+    assert.equal(c.saturated, false);              // F14: fresh sketch is not saturated
     c.add(42, 0xffffffff);
+    assert.equal(c.saturated, false);              // an exact 2^32-1 counter has NOT clamped
     c.add(42, 5);
     assert.equal(c.estimate(42), 0xffffffff);
+    assert.equal(c.saturated, true);               // the clamp set the sticky flag
 });
 
 test('saturation via _applyPlain path caps at 0xffffffff, no wraparound (conservative:false)', () => {
     const c = new CountMinSketch(3, 16, { conservative: false });
+    assert.equal(c.saturated, false);
     c.add(42, 0xffffffff);
+    assert.equal(c.saturated, false);
     c.add(42, 5);
     assert.equal(c.estimate(42), 0xffffffff);
+    assert.equal(c.saturated, true);
 });
 
 test('saturation: merge of two near-max plain sketches caps at 0xffffffff', () => {
@@ -271,8 +285,10 @@ test('saturation: merge of two near-max plain sketches caps at 0xffffffff', () =
     const b = new CountMinSketch(3, 16, { conservative: false, seed: 1 });
     a.add(7, 0xfffffffe);
     b.add(7, 10);
+    assert.equal(a.saturated, false);
     a.merge(b);
     assert.equal(a.estimate(7), 0xffffffff);
+    assert.equal(a.saturated, true);               // the merge clamp set it
 });
 
 // --- withAccuracy derivation -------------------------------------------------
@@ -283,19 +299,19 @@ test('withAccuracy(0.001, 0.01) derives d=5, w=4096 exactly', () => {
     assert.equal(c.w, 4096);
 });
 
-test('withAccuracy REGRESSION: a tiny epsilon clamps w to 2^25 and does not hang', () => {
+test('withAccuracy REGRESSION: an unattainable epsilon throws tagged (F16/S6) without hanging', () => {
+    // F16/S6: a w > 2^25 request is now rejected, not clamped. The no-hang regression still
+    // holds -- the throw is immediate (the int32 round-up loop is never reached).
     const start = Date.now();
-    const c = CountMinSketch.withAccuracy(1e-9, 0.01);
+    assert.throws(() => CountMinSketch.withAccuracy(1e-9, 0.01), liteSketch);
     const elapsed = Date.now() - start;
-    assert.equal(c.w, 1 << 25);
     assert.ok(elapsed < 2000, 'withAccuracy(1e-9, ...) took ' + elapsed + 'ms (regression: must not hang)');
 });
 
-test('withAccuracy clamps d to [1, 32]', () => {
+test('withAccuracy clamps d UP to >= 1 but throws when d > 32 (F16/S6)', () => {
     const dTiny = CountMinSketch.withAccuracy(0.01, 0.999999999999999);
-    assert.ok(dTiny.d >= 1, 'd must clamp to >= 1, got ' + dTiny.d);
-    const dHuge = CountMinSketch.withAccuracy(0.01, 1e-300);
-    assert.equal(dHuge.d, 32, 'd must clamp to <= 32, got ' + dHuge.d);
+    assert.equal(dTiny.d, 1, 'd clamps UP to >= 1 (only strengthens), got ' + dTiny.d);
+    assert.throws(() => CountMinSketch.withAccuracy(0.01, 1e-300), liteSketch);  // needs d > 32
 });
 
 // --- FAIL-CLOSED matrix: ctor --------------------------------------------------
@@ -387,6 +403,7 @@ test('F2: add rejects a non-integer / out-of-safe-range key [lite-sketch] (was t
     const d = new CountMinSketch(5, 1 << 12);
     d.add(1, 50);
     assert.throws(() => d.add(1.5), liteSketch);
+    assert.equal(d.estimate(1.5), 0);              // F13: a key add would reject estimates 0, never aliases
 });
 
 test('add accepts count at the boundaries 1 and 0xffffffff', () => {
@@ -552,4 +569,223 @@ test('ADVERSARIAL: safe-integer keys beyond 2^32 hash via the high-word path and
     // aliasing candidates) -- collisions may over-count but must never under-count.
     assert.ok(c.estimate(1) >= truth.get(1));
     assert.ok(c.estimate(2 ** 32 + 1) >= truth.get(2 ** 32 + 1));
+});
+
+// ===========================================================================
+// H2.3 gates (F13, F14, F15, F16, F20, S7)
+// ===========================================================================
+
+const MAX_SAFE = 9007199254740991;   // 2^53 - 1
+function cmsSnap(c) {
+    return { counts: Array.from(c._counts), total: c.total, saturated: c.saturated };
+}
+function cmsUnchanged(before, c, label) {
+    const a = cmsSnap(c);
+    assert.deepEqual(a.counts, before.counts, label + ': _counts changed');
+    assert.equal(a.total, before.total, label + ': total changed');
+    assert.equal(a.saturated, before.saturated, label + ': saturated changed');
+}
+
+// G-F13: an un-addable key estimates 0, never aliases a real key (cons + plain).
+for (const conservative of [true, false]) {
+    test('G-F13 (' + (conservative ? 'cons' : 'plain') + '): a key add would reject estimates 0, never aliases', () => {
+        const c = new CountMinSketch(4, 1024, { conservative });
+        c.add(0, 50);
+        c.add(1, 70);
+        for (const bad of [Infinity, -Infinity, 1.5, 2 ** 64, 2 ** 53, -(2 ** 53), NaN]) {
+            assert.equal(c.estimate(bad), 0, 'estimate(' + bad + ')');
+        }
+        assert.equal(c.estimate(0), 50);
+        assert.equal(c.estimate(1), 70);
+    });
+}
+
+// G-F14: the sticky `saturated` getter (F14/S4).
+test('G-F14: saturated is sticky, set on a clamp, carried by merge, reset by clear', () => {
+    for (const conservative of [true, false]) {
+        const c = new CountMinSketch(3, 16, { conservative });
+        assert.equal(c.saturated, false, 'fresh');
+        c.add(5, 0xffffffff);
+        assert.equal(c.saturated, false, 'exact 2^32-1 does not clamp');
+        c.add(5, 10);
+        assert.equal(c.saturated, true, 'clamp sets it (' + (conservative ? 'cons' : 'plain') + ')');
+        c.add(6, 1);
+        assert.equal(c.saturated, true, 'sticky after more adds');
+        c.clear();
+        assert.equal(c.saturated, false, 'clear resets it');
+    }
+    // a saturated other carries it into a fresh (empty) this
+    const src = new CountMinSketch(3, 16, { conservative: false, seed: 9 });
+    src.add(7, 0xffffffff);
+    src.add(7, 1);
+    assert.equal(src.saturated, true);
+    const dst = new CountMinSketch(3, 16, { conservative: false, seed: 9 });
+    assert.equal(dst.saturated, false);
+    dst.merge(src);
+    assert.equal(dst.saturated, true, 'merge carries other.saturated into an empty this');
+});
+
+// G-F15 (CMS): the total guard at 2^53-1 (F15/S5).
+test('G-F15 (CMS): count cap + running-total ceiling 2^53-1, byte-identical reject', () => {
+    const c = new CountMinSketch(4, 64);
+    assert.doesNotThrow(() => c.add(1, 0xffffffff));        // 2^32-1 count accepted
+    for (const bad of [2 ** 32, 1e308, MAX_SAFE]) {
+        const before = cmsSnap(c);
+        assert.throws(() => c.add(1, bad), (e) => liteSketch(e) && /\[1, 4294967295]/.test(e.message), 'count=' + bad);
+        cmsUnchanged(before, c, 'count=' + bad);
+    }
+    // Fill to total === 2^53-1 exactly via 2^21 adds of (k, 2^32-1), then add(k, 2^21-1).
+    const f = new CountMinSketch(4, 64, { conservative: false });
+    for (let i = 0; i < (1 << 21); i++) f.add(1, 0xffffffff);
+    f.add(1, (1 << 21) - 1);
+    assert.equal(f.total, MAX_SAFE, 'total reaches exactly 2^53-1');
+    // Every entry point now rejects +1 byte-identically.
+    for (const fn of [() => f.add(2, 1), () => f.addHashed(1, 2, 1)]) {
+        const before = cmsSnap(f);
+        assert.throws(fn, (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+        cmsUnchanged(before, f, 'total+1 reject');
+    }
+    // merge: this at total 2^53-6 rejects an other of total 6, accepts an other of total 5.
+    // (a single count caps at 2^32-1, so build the big total via the same 2^21 fill.)
+    const base = new CountMinSketch(4, 64, { conservative: false });
+    for (let i = 0; i < (1 << 21); i++) base.add(1, 0xffffffff);
+    base.add(1, (1 << 21) - 6);                    // total === 2^53 - 6 === MAX_SAFE - 5
+    assert.equal(base.total, MAX_SAFE - 5);
+    const other6 = new CountMinSketch(4, 64, { conservative: false });
+    other6.add(2, 6);
+    const b6 = cmsSnap(base);
+    assert.throws(() => base.merge(other6), (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+    cmsUnchanged(b6, base, 'merge total+1 reject');
+    const other5 = new CountMinSketch(4, 64, { conservative: false });
+    other5.add(2, 5);
+    assert.doesNotThrow(() => base.merge(other5));
+    assert.equal(base.total, MAX_SAFE, 'merge to exactly 2^53-1 accepted');
+});
+
+// G-F16 (CMS): unattainable withAccuracy throws, attainable boundaries accept (F16/S6).
+test('G-F16 (CMS): withAccuracy rejects unattainable requests, accepts the exact boundary', () => {
+    // double-rounding preconditions (orchestrator-verified).
+    assert.equal(Math.ceil(Math.E / (Math.E / 2 ** 25)), 2 ** 25);
+    assert.equal(Math.ceil(Math.E / nextDown(Math.E / 2 ** 25)), 2 ** 25 + 1);
+    assert.equal(Math.ceil(Math.log(1 / Math.exp(-31.5))), 32);
+    assert.equal(Math.ceil(Math.log(1 / Math.exp(-32.5))), 33);
+    // width rejects match the FACTORY's "width cap 33554432" wording (NOT the bare number, which the
+    // ctor message "w must be an integer in [1, 33554432]" also contains), so a `w > CMS_W_MAX + 1`
+    // mutant that merely falls through to the ctor dies -- the N+1 boundary `nextDown(E/2^25)` needs w === 2^25+1.
+    const widthMsg = (e) => liteSketch(e) && /width cap 33554432/.test(e.message);
+    for (const [eps, delta] of [[1e-12, 0.01], [1e-9, 0.01], [5e-324, 0.01],
+        [nextDown(Math.E / 2 ** 25), 0.5]]) {
+        const start = Date.now();
+        assert.throws(() => CountMinSketch.withAccuracy(eps, delta), widthMsg, 'eps=' + eps);
+        assert.ok(Date.now() - start < 2000);
+    }
+    // depth rejects match the DEPTH-cap message (/depth cap 32/) so a `d > CMS_D_MAX + 1`
+    // mutant dies -- the N+1 boundary exp(-32.5) needs d === 33.
+    const depthMsg = (e) => liteSketch(e) && /depth cap 32/.test(e.message);
+    for (const delta of [1e-20, 1e-300, Math.exp(-32.5), 5e-324]) {
+        assert.throws(() => CountMinSketch.withAccuracy(0.01, delta), depthMsg, 'delta=' + delta);
+    }
+    // accepts the exact boundary
+    assert.equal(CountMinSketch.withAccuracy(Math.E / 2 ** 25, 0.5).w, 2 ** 25);
+    assert.equal(CountMinSketch.withAccuracy(0.01, Math.exp(-31.5)).d, 32);
+    assert.equal(CountMinSketch.withAccuracy(0.01, 0.999999999999999).d, 1);
+});
+
+// G-S7: a cross-flag merge is allowed, keeps this's flag, stays one-sided (pin, not a change).
+test('G-S7 (CMS): cross-conservative merge is accepted, keeps this.conservative, 0 undercounts', () => {
+    const rng = makeRng(7);
+    for (const [thisCons, otherCons] of [[true, false], [false, true]]) {
+        const a = new CountMinSketch(4, 64, { conservative: thisCons, seed: 3 });
+        const b = new CountMinSketch(4, 64, { conservative: otherCons, seed: 3 });
+        const truth = new Map();
+        for (let i = 0; i < 5000; i++) {
+            const key = (rng() * 500) | 0;
+            const dst = (i & 1) ? b : a;
+            dst.add(key);
+            truth.set(key, (truth.get(key) || 0) + 1);
+        }
+        assert.doesNotThrow(() => a.merge(b));
+        assert.equal(a.conservative, thisCons, 'this keeps its own flag');
+        assert.equal(a.saturated, false);
+        for (const [k, t] of truth) assert.ok(a.estimate(k) >= t, 'undercount key=' + k);
+    }
+});
+
+// G-F20 (CMS): hostile args run NO user code; throws are tagged + byte-identical.
+test('G-F20 (CMS): a rejected arg never runs caller code (tagged, calls===0, byte-identical)', () => {
+    let calls = 0;
+    const hostile = () => [
+        Object.create(null),
+        { toString() { calls++; throw new Error('boom'); } },
+        { [Symbol.toPrimitive]() { calls++; cRef.add(0, 0); return 1; },
+          toString() { calls++; cRef.add(0, 0); return 'x'; },
+          valueOf() { calls++; cRef.add(0, 0); return 1; } },
+        Object.assign(function () {}, { toString() { calls++; cRef.add(0, 0); return 'f'; } }),
+    ];
+    let cRef;
+    // ctor slots
+    for (const h of hostile()) { assert.throws(() => new CountMinSketch(h, 16), liteSketch); }
+    for (const h of hostile()) { assert.throws(() => new CountMinSketch(4, h), liteSketch); }
+    for (const h of hostile()) { assert.throws(() => new CountMinSketch(4, 16, { seed: h }), liteSketch); }
+    for (const h of hostile()) { assert.throws(() => new CountMinSketch(4, 16, { conservative: h }), liteSketch); }
+    for (const h of hostile()) { assert.throws(() => CountMinSketch.withAccuracy(h, 0.01), liteSketch); }
+    for (const h of hostile()) { assert.throws(() => CountMinSketch.withAccuracy(0.01, h), liteSketch); }
+    cRef = new CountMinSketch(4, 16, { seed: 1 });
+    for (const h of hostile()) { const b = cmsSnap(cRef); assert.throws(() => cRef.add(h, 1), liteSketch); cmsUnchanged(b, cRef, 'add key'); }
+    for (const h of hostile()) { const b = cmsSnap(cRef); assert.throws(() => cRef.add(5, h), liteSketch); cmsUnchanged(b, cRef, 'add count'); }
+    for (const h of hostile()) { const b = cmsSnap(cRef); assert.throws(() => cRef.addHashed(h, 0, 1), liteSketch); cmsUnchanged(b, cRef, 'addHashed hi'); }
+    for (const h of hostile()) { const b = cmsSnap(cRef); assert.throws(() => cRef.addHashed(0, h, 1), liteSketch); cmsUnchanged(b, cRef, 'addHashed lo'); }
+    for (const h of hostile()) { const b = cmsSnap(cRef); assert.throws(() => cRef.addHashed(0, 0, h), liteSketch); cmsUnchanged(b, cRef, 'addHashed count'); }
+    assert.equal(calls, 0, 'no hostile toString/valueOf/toPrimitive ran');
+    // a null-proto object message ends in `got [object]`
+    let msg = '';
+    try { new CountMinSketch(Object.create(null), 16); } catch (e) { msg = e.message; }
+    assert.ok(/got \[object]$/.test(msg), 'null-proto message: ' + msg);
+});
+
+// ---------------------------------------------------------------------------
+// QA H2.3 boundary gaps (not in the planner's G-list):
+//  (a) the merge total guard precedes the `saturated` carry: a saturated other that would
+//      overflow the total leaves this.saturated false (a carry-before-guard mutant dies);
+//  (b) self-merge (this === other) at the ceiling: 2^52-1 doubles to 2^53-2, then rejects;
+//  (c) the _badTotal message is a RangeError printing the current total and the rejected n;
+//  (d) `saturated` is getter-only at runtime; the estimate guard accepts -(2^53-1) (N).
+// ---------------------------------------------------------------------------
+test('QA H2.3 (CMS): merge total guard precedes the saturated carry; self-merge at the ceiling', () => {
+    const o = new CountMinSketch(4, 64, { conservative: false });
+    for (let i = 0; i < (1 << 21); i++) o.add(1, 0xffffffff);
+    o.add(1, (1 << 21) - 6);
+    assert.equal(o.total, MAX_SAFE - 5);
+    assert.equal(o.saturated, true, 'precondition: other is saturated');
+    const t = new CountMinSketch(4, 64, { conservative: false });
+    t.add(2, 6);
+    const bt = cmsSnap(t);
+    assert.equal(bt.saturated, false);
+    let msg = '';
+    assert.throws(() => t.merge(o), (e) => { msg = e.message; return e instanceof RangeError && liteSketch(e); });
+    cmsUnchanged(bt, t, 'saturated other, total+1 reject');
+    assert.ok(msg.includes('current total 6 + ' + (MAX_SAFE - 5)), '_badTotal prints current total + n: ' + msg);
+    // self-merge: 2^52-1 -> 2^53-2 accepted, then 2^53-2 doubled rejects with no write.
+    const s = new CountMinSketch(4, 64, { conservative: false });
+    for (let i = 0; i < (1 << 20); i++) s.add(1, 0xffffffff);
+    s.add(1, (1 << 20) - 1);
+    assert.equal(s.total, 2 ** 52 - 1);
+    assert.equal(s.merge(s).total, 2 ** 53 - 2);
+    const bs = cmsSnap(s);
+    assert.throws(() => s.merge(s), (e) => e instanceof RangeError && liteSketch(e) && /9007199254740991/.test(e.message));
+    cmsUnchanged(bs, s, 'self-merge total+1 reject');
+    // add-path message prints the current total and the rejected count.
+    assert.throws(() => s.add(3, 2), (e) => e instanceof RangeError &&
+        e.message.includes('current total ' + (2 ** 53 - 2) + ' + 2'));
+});
+
+test('QA H2.3 (CMS): saturated is getter-only; estimate accepts the -(2^53-1) boundary key', () => {
+    const c = new CountMinSketch(4, 1024);
+    assert.throws(() => { c.saturated = true; }, TypeError);
+    assert.equal(c.saturated, false);
+    c.add(-MAX_SAFE, 4);
+    c.add(MAX_SAFE, 3);
+    assert.ok(c.estimate(-MAX_SAFE) >= 4, 'N: -(2^53-1) is addable so it estimates');
+    assert.ok(c.estimate(MAX_SAFE) >= 3);
+    assert.equal(c.estimate(-(MAX_SAFE + 2)), 0, 'N+1 (2^53 rounded) estimates 0');
 });

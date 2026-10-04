@@ -82,10 +82,13 @@ const cw: number = cms.w;
 const cseed: number = cms.seed;
 const ccons: boolean = cms.conservative;
 const ctotal: number = cms.total;
+const csat: boolean = cms.saturated;
 const ceps: number = cms.epsilon;
 const cdelta: number = cms.delta;
-void cd; void cw; void cseed; void ccons; void ctotal; void ceps; void cdelta;
+void cd; void cw; void cseed; void ccons; void ctotal; void csat; void ceps; void cdelta;
 
+// @ts-expect-error -- saturated is readonly.
+cms.saturated = true;
 // @ts-expect-error -- d is readonly.
 cms.d = 4;
 // @ts-expect-error -- w is readonly.

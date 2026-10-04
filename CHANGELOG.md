@@ -45,11 +45,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ctor now bisects add's own key expression over adjacent doubles: `minIndexable` is the
   EXCLUSIVE floor (last rejected double), `maxIndexable` the INCLUSIVE ceiling (last accepted
   double, always below `Number.MAX_VALUE`).
+- **`CountMinSketch.estimate` no longer aliases an un-addable key (F13).** Its guard was only
+  `typeof` + `NaN`, so a key `add` would reject was truncated under `>>> 0` and read a real key's
+  cell: after `add(0, 50); add(1, 70)`, `estimate(Infinity)` and `estimate(2**64)` returned 50 and
+  `estimate(1.5)` returned 70. `estimate` now applies `add`'s own guard and returns 0 for any
+  non-integer / non-finite / out-of-safe-range key.
+- **`CountMinSketch` saturation is now surfaced, not silent (F14).** `add(5, 2**32-1); add(5, 10)`
+  returned estimate `4294967295` while `total` was `4294967305` -- a silent UNDERCOUNT that broke
+  the "never undercounts" headline. A new sticky `saturated` getter is set on every clamp (cons,
+  plain, merge) and carried by `merge`; the guarantee is now stated as "one-sided while
+  `!saturated`".
+- **Exact running aggregates no longer go silently inexact past `2^53-1` (F15).** All three counted
+  members' running totals were effectively unbounded: `SpaceSaving.add(1, 1e308)` twice gave
+  `total === Infinity` and `heavyHitters(0) === []`; `DDSketch.add(1, 2**60)` twice was accepted; and
+  CountMinSketch's `total` passed `2^53` by repeated `add(k, 2**32-1)` (e.g. `9007207842578432` after
+  `2^21 + 2` such adds), drifting into rounding then `Infinity`. Every `add` / `addHashed` (CMS) /
+  `addFrom` (DD) / `merge` of CountMinSketch, DDSketch and SpaceSaving now rejects a running total
+  past `2^53-1` tagged and byte-identically; a total of exactly `2^53-1` is still accepted.
+- **`withAccuracy` / `withError` no longer silently clamp to a weaker guarantee (F16).**
+  `CountMinSketch.withAccuracy(1e-12, 0.01)` returned `epsilon` `8.1e-8` and
+  `SpaceSaving.withError(1e-9)` returned `k = 2^24`, quietly giving back a sketch weaker than
+  requested. An unattainable request (`w > 2^25`, `d > 32`, or `k > 2^24`) now throws `[lite-sketch]`.
+- **Cold throwers no longer run caller code (F20).** All 35 `String(x)` call sites in throw paths
+  were replaced by a shared, typeof-first `_describe(x)`: a null-proto object gave an UNTAGGED
+  `TypeError`, a throwing `toString` replaced the tag, and a re-entrant `toString` mutated the
+  receiver during a "byte-identical" rejection (`reg[0]` `0 -> 53`). A rejection is now tagged and
+  byte-identical in all four members and every constructor, running no user code.
 
 ### Added
 
 - **`DD_ALPHA_MIN`** -- a named export (`1e-6`), the smallest `alpha` the `DDSketch`
   constructor accepts (`DD_ALPHA_MIN <= alpha < 1`).
+- **`CountMinSketch.saturated`** -- a sticky `boolean` getter (F14/S4), `true` once any counter
+  clamped at `2^32-1`. While `false` the estimate is strictly one-sided; `merge` carries it from
+  either side, and `clear()` resets it.
 - **`npm run lanes`** -- a child-process scavenge/deopt lane harness
   (`test/lanes.mjs` + `test/lanes/lane.mjs`), now part of `npm run verify`. One child
   per lane under `--max-semi-space-size=4` (default and no-inline) gates HyperLogLog
@@ -64,6 +93,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A STRICT `DDSketch` now throws `[lite-sketch]` when merging a COLLAPSED `other`.** Its
   low-end mass has already folded, so a fixed-range sketch cannot absorb it without breaking
   its range guarantee. The rejection is a byte-identical no-op.
+- **DDSketch and SpaceSaving `count` > `2^32-1` now throws** (S5), matching CountMinSketch. A
+  finite count above `2^32-1` was accepted before; the `_badCount` message of both is now
+  "count must be an integer in [1, 4294967295]".
+- **A running total past `2^53-1` now throws on `add` / `addFrom` / `merge` of all three counted
+  members** (CountMinSketch, DDSketch, SpaceSaving) -- the exact aggregate was silently going
+  inexact before (S5).
+- **`CountMinSketch.withAccuracy` and `SpaceSaving.withError` now throw instead of clamping** when
+  the request is unattainable (`w > 2^25`, `d > 32`, or `k > 2^24`) (S6). The clamp UP of `d` to
+  `>= 1` stays, since it only strengthens the guarantee.
+- **Non-primitive throw arguments now print `[object]` / `[function]`** (F20). A rejected arg that
+  is an object or function is described structurally instead of coerced with `String(x)`, so no
+  user `toString` / `valueOf` runs during a rejection; primitive messages are byte-identical.
+- **A doubly-invalid `DDSketch.add` (negative value + over-cap count) now names the count** -- the
+  count check runs before the negative-value check (but a non-finite value is still caught first, so
+  `add(NaN, 2**32)` names the value).
 
 ## [1.1.2] - 2026-09-23
 

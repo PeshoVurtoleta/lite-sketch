@@ -94,10 +94,13 @@ export interface CountMinSketchOptions {
  * `Uint32Array(d * w)` counter matrix, `d` hash rows x `w` columns (`w` a power of
  * two). `add(key, count?)` increments one cell per row (conservative or plain per the
  * ctor flag), 0 B/op; `estimate(key)` returns the minimum of its `d` cells -- a
- * ONE-SIDED over-estimate: `f_hat >= f_true` always, with `f_hat - f_true <=
- * epsilon * total` w.p. `>= 1 - delta` (`epsilon = e/w`, `delta = e^-d`). Plain
- * sketches merge EXACTLY (elementwise saturating add); conservative merge is a valid
- * but looser upper bound. Dense-only; no crypto hashing.
+ * ONE-SIDED over-estimate while `!saturated`: `f_hat >= f_true`, with `f_hat - f_true <=
+ * epsilon * total` w.p. `>= 1 - delta` (`epsilon = e/w`, `delta = e^-d`) -- one-sided
+ * while `!saturated` (once a counter saturates at 2^32-1 the `saturated` getter is set
+ * and a query over a saturated key may read low). Plain sketches merge EXACTLY
+ * (elementwise saturating add); conservative merge is a valid but looser upper bound; a
+ * cross-`conservative` merge is allowed (S7, `this` keeps its own flag). Dense-only; no
+ * crypto hashing.
  */
 export class CountMinSketch {
     /**
@@ -110,8 +113,10 @@ export class CountMinSketch {
 
     /**
      * Build a sketch sized to a target accuracy: `w = ceil(e/epsilon)` (rounded up to
-     * a power of two, clamped to the width cap), `d = ceil(ln(1/delta))` (clamped to
-     * [1, 32]). Delegates remaining validation to the constructor.
+     * a power of two), `d = ceil(ln(1/delta))` (clamped UP to >= 1). Throws [lite-sketch]
+     * when the request is UNATTAINABLE -- `w > 2^25` or `d > 32` (F16/S6) -- rather than
+     * silently clamping down to a weaker guarantee. Delegates remaining validation to the
+     * constructor.
      * @param epsilon relative error, in (0, 1).
      * @param delta failure probability, in (0, 1).
      */
@@ -132,28 +137,31 @@ export class CountMinSketch {
     /** Total count added (sum of all `count`s). O(1). */
     readonly total: number;
 
+    /** Whether any counter has saturated at 2^32-1 (F14/S4). Sticky: set on any clamp, carried by `merge` from either side, reset only by `clear()`. While false the estimate is strictly one-sided (never undercounts); once true a saturated key may read low. O(1). */
+    readonly saturated: boolean;
+
     /** The theoretical relative error, e / w. O(1). */
     readonly epsilon: number;
 
     /** The theoretical failure probability, e^-d. O(1). */
     readonly delta: number;
 
-    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and increment its row cells by `count` (default 1). HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key or an out-of-range count (a byte-identical no-op). */
+    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and increment its row cells by `count` (default 1, domain [1, 2^32-1]). HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key, an out-of-range count, or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
     add(key: number, count?: number): this;
 
-    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-uint32 lane or an out-of-range count. */
+    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-uint32 lane, an out-of-range count, or a running `total` past 2^53-1. */
     addHashed(hi: number, lo: number, count?: number): this;
 
-    /** The minimum over the key's d cells -- the tightest one-sided over-estimate. HOT, O(d), 0 B/op. Never throws (a bad key estimates 0). */
+    /** The minimum over the key's d cells -- the tightest one-sided over-estimate. HOT, O(d), 0 B/op. Never throws: a key `add` would reject (non-integer / non-finite / out-of-safe-range) estimates 0 and never aliases a real key (F13). */
     estimate(key: number): number;
 
     /** Estimate from a pre-hashed key (two uint32 lanes). HOT, O(d), 0 B/op. Never throws (a bad lane estimates 0). */
     estimateHashed(hi: number, lo: number): number;
 
-    /** Element-wise saturating add of `other` into this. Exact for plain sketches; a valid but looser upper bound for conservative ones. Throws [lite-sketch] on a non-CountMinSketch or a d / w / seed mismatch. */
+    /** Element-wise saturating add of `other` into this. Exact for plain sketches; a valid but looser upper bound for conservative ones; a cross-`conservative` merge is allowed (S7, `this` keeps its flag). Carries `other.saturated` and any merge-time clamp into `this.saturated`. Throws [lite-sketch] on a non-CountMinSketch, a d / w / seed mismatch, or a running `total` past 2^53-1 (byte-identical). */
     merge(other: CountMinSketch): this;
 
-    /** Zero every counter and the running total; reuse the same allocation. */
+    /** Zero every counter, the running total, and the sticky `saturated` flag; reuse the same allocation. */
     clear(): this;
 }
 
@@ -235,7 +243,7 @@ export class DDSketch {
     /** STRICT mode: the configured range maximum passed at construction (NaN if not strict). O(1). */
     readonly rangeMax: number;
 
-    /** Add a value with a positive integer `count` (default 1). HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-finite / negative value, a non-positive-integer count, or (strict mode) a value outside the fixed range. */
+    /** Add a value with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-finite / negative value, a count outside [1, 2^32-1], an add that would push the running `count` past 2^53-1 (F15/S5), or (strict mode) a value outside the fixed range -- each a byte-identical no-op. A doubly-invalid add (negative value + over-cap count) names the count (the count check precedes the negative-value check; a non-finite value is still caught first). */
     add(value: number, count?: number): this;
 
     /** Add the value at `buf[i]` (count = 1) -- the ZERO-BOX entry point for a FRACTIONAL hot-path value: `add(fractionalDouble)` boxes its argument (~16 B/call) when not inlined, whereas `addFrom` reads `buf[i]` unboxed. Same validation / throws / binning as `add`. HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-Float64Array `buf`, an out-of-bounds / non-integer `i`, or a value `add` would reject. */
@@ -244,7 +252,7 @@ export class DDSketch {
     /** Estimate the value at quantile q in [0, 1] -- the alpha-approximate member. COLD, O(bins). NEVER throws; returns NaN for a bad q or an empty sketch. */
     quantile(q: number): number;
 
-    /** Merge `other` into this: fold the running aggregates and every populated bin through the same collapse logic as `add`, and carry `other.collapsed` forward (merging collapsed mass makes this collapsed). O(other bins). Throws [lite-sketch] on a non-DDSketch, an unequal alpha/gamma, (strict mode) an incoming key outside the fixed range, or (strict mode) a COLLAPSED `other`. */
+    /** Merge `other` into this: fold the running aggregates and every populated bin through the same collapse logic as `add`, and carry `other.collapsed` forward (merging collapsed mass makes this collapsed). O(other bins). Throws [lite-sketch] on a non-DDSketch, an unequal alpha/gamma, a running `count` past 2^53-1 (F15/S5), (strict mode) an incoming key outside the fixed range, or (strict mode) a COLLAPSED `other`. */
     merge(other: DDSketch): this;
 
     /** Reset the sketch to empty. O(maxBins). */
@@ -289,8 +297,9 @@ export class SpaceSaving {
     constructor(capacity: number, options?: SpaceSavingOptions);
 
     /**
-     * Build a summary sized to a target error: `k = ceil(1 / epsilon)` (clamped to
-     * 2^24). A monitored key's over-estimate is then bounded by `epsilon * N`.
+     * Build a summary sized to a target error: `k = ceil(1 / epsilon)`. A monitored key's
+     * over-estimate is then bounded by `epsilon * N`. Throws [lite-sketch] when the request
+     * is UNATTAINABLE -- `k > 2^24` (F16/S6) -- rather than silently clamping down.
      * @param epsilon the target error fraction, a number in (0, 1).
      */
     static withError(epsilon: number, options?: SpaceSavingOptions): SpaceSaving;
@@ -310,7 +319,7 @@ export class SpaceSaving {
     /** The uint32 hash seed. O(1). */
     readonly seed: number;
 
-    /** Add a safe-integer `key` with a positive integer `count` (default 1). HOT, O(1) amortized, 0 B/op. Increments, inserts, or evicts the min. Throws [lite-sketch] on a non-safe-integer key or a non-positive-integer count (a byte-identical no-op). */
+    /** Add a safe-integer `key` with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 B/op. Increments, inserts, or evicts the min. Throws [lite-sketch] on a non-safe-integer key, a count outside [1, 2^32-1], or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
     add(key: number, count?: number): this;
 
     /** The estimated frequency of `key` (an upper bound), or 0 if not monitored. HOT, O(1). NEVER throws. */
@@ -328,7 +337,7 @@ export class SpaceSaving {
     /** Every monitored key with `count > threshold * total` -- a SUPERSET with NO false negatives (every true heavy hitter is included; a few false positives may be too). Filter the result by `(count - error) > threshold * total` for the guaranteed-frequent subset. COLD; ALLOCATES. NEVER throws. */
     heavyHitters(threshold: number): SpaceSavingEntry[];
 
-    /** Merge `other` into this (min-imputation for absent keys, keep the top-k). O(k). Throws [lite-sketch] on a non-SpaceSaving or an unequal capacity/seed. */
+    /** Merge `other` into this (min-imputation for absent keys, keep the top-k). O(k). Throws [lite-sketch] on a non-SpaceSaving, an unequal capacity/seed, or a running `total` past 2^53-1 (F15/S5, byte-identical). */
     merge(other: SpaceSaving): this;
 
     /** Reset the summary to empty. O(capacity). */

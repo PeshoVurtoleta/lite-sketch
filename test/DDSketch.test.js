@@ -461,6 +461,18 @@ test('STRICT merge: an out-of-range incoming key throws [lite-sketch] as a byte-
 function snapshot(s) {
     return { count: s.count, sum: s.sum, min: s.min, max: s.max, zeroCount: s.zeroCount, collapsed: s.collapsed };
 }
+// Byte-identical snapshot incl. a bins copy (for the F15 total-guard no-op proof).
+function ddSnap(s) {
+    return { bins: Array.from(s._bins), count: s.count, sum: s.sum, min: s.min, max: s.max,
+             zeroCount: s.zeroCount, collapsed: s.collapsed };
+}
+function ddUnchanged(before, s, label) {
+    const a = ddSnap(s);
+    assert.deepEqual(a.bins, before.bins, label + ': _bins changed');
+    for (const k of ['count', 'sum', 'zeroCount', 'collapsed']) {
+        assert.equal(a[k], before[k], label + ': ' + k + ' changed');
+    }
+}
 function assertUnchanged(before, s, label) {
     const after = snapshot(s);
     for (const k of Object.keys(before)) {
@@ -484,6 +496,7 @@ test('add() fail-closed no-op matrix: every bad value/count throws [lite-sketch]
     }
     const badCounts = [
         [5, 0], [5, 1.5], [5, -1], [5, NaN], [5, Infinity], [5, '1'], [5, null],
+        [5, 2 ** 32], [5, 1e308], [5, Number.MAX_SAFE_INTEGER],   // F15: count > 2^32-1 throws
     ];
     for (const [value, count] of badCounts) {
         const before = snapshot(s);
@@ -622,10 +635,15 @@ test('boundary: N=0 (empty), N=1, and a two-value sketch quantile correctly', ()
     assertWithinAlpha(two.quantile(1), 1000000, 0.01, 'N=2 q=1');
 });
 
-test('boundary: add(count) at N-1/N/N+1 of the safe-integer domain via a huge but finite count', () => {
+test('boundary: add count caps at 2^32-1; a larger finite count throws byte-identically (F15/S5)', () => {
     const s = new DDSketch(0.01);
-    assert.doesNotThrow(() => s.add(5, Number.MAX_SAFE_INTEGER));
-    assert.equal(s.count, Number.MAX_SAFE_INTEGER);
+    assert.doesNotThrow(() => s.add(5, 4294967295));      // 2^32-1 accepted
+    assert.equal(s.count, 4294967295);
+    for (const bad of [2 ** 32, Number.MAX_SAFE_INTEGER]) {
+        const before = ddSnap(s);
+        assert.throws(() => s.add(5, bad), (e) => liteSketch(e) && /\[1, 4294967295]/.test(e.message), 'count=' + bad);
+        ddUnchanged(before, s, 'count=' + bad);
+    }
 });
 
 test('duplicate clear() is idempotent and a byte-identical no-op the second time', () => {
@@ -1058,4 +1076,108 @@ test('H2.2 ADVERSARIAL: a rejected merge never carries collapsed (gamma mismatch
     // null / undefined others are the existing non-instance reject (still tagged).
     for (const o of [null, undefined]) assert.throws(() => strict.merge(o), liteSketch, 'merge(' + o + ') throws tagged');
     assertDeepUnchanged(sBefore, strict, 'null / undefined merge');
+});
+
+// ===========================================================================
+// H2.3 gates (F15 count cap + total ceiling, F20 no-user-code throwers)
+// ===========================================================================
+
+const DD_MAX_SAFE = 9007199254740991;   // 2^53 - 1
+
+test('G-F15 (DD): count cap 2^32-1 + running-count ceiling 2^53-1, byte-identical reject', () => {
+    // count cap: 2^32-1 accepted; 2^32, 1e308, MAX_SAFE throw with the [1, 4294967295] message.
+    const s = new DDSketch(0.01);
+    assert.doesNotThrow(() => s.add(5, 4294967295));
+    for (const bad of [2 ** 32, 1e308, DD_MAX_SAFE]) {
+        const before = ddSnap(s);
+        assert.throws(() => s.add(7, bad), (e) => liteSketch(e) && /\[1, 4294967295]/.test(e.message), 'count=' + bad);
+        ddUnchanged(before, s, 'count=' + bad);
+    }
+    // Fill count to exactly 2^53-1, then reject +1 at every entry point byte-identically.
+    const f = new DDSketch(0.01);
+    for (let i = 0; i < (1 << 21); i++) f.add(5, 4294967295);
+    f.add(5, (1 << 21) - 1);
+    assert.equal(f.count, DD_MAX_SAFE, 'count reaches exactly 2^53-1');
+    const scratch = new Float64Array([3.5]);
+    for (const fn of [() => f.add(5), () => f.add(0), () => f.addFrom(scratch, 0)]) {
+        const before = ddSnap(f);
+        assert.throws(fn, (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+        ddUnchanged(before, f, 'count+1 reject');
+    }
+    // A doubly-invalid add (negative value + over-cap count): the count check fires FIRST,
+    // so the message names the count (precedence pinned).
+    const d = new DDSketch(0.01);
+    assert.throws(() => d.add(-5, 2 ** 40), (e) => liteSketch(e) && /\[1, 4294967295]/.test(e.message));
+});
+
+test('G-F15 (DD): merge at total 2^53-6 rejects an other of 6, accepts an other of 5', () => {
+    const base = new DDSketch(0.01);
+    for (let i = 0; i < (1 << 21); i++) base.add(5, 4294967295);
+    base.add(5, (1 << 21) - 6);                   // count === 2^53 - 6
+    assert.equal(base.count, DD_MAX_SAFE - 5);
+    const other6 = new DDSketch(0.01); other6.add(5, 6);
+    const b6 = ddSnap(base);
+    assert.throws(() => base.merge(other6), (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+    ddUnchanged(b6, base, 'merge count+1 reject');
+    const other5 = new DDSketch(0.01); other5.add(5, 5);
+    assert.doesNotThrow(() => base.merge(other5));
+    assert.equal(base.count, DD_MAX_SAFE);
+});
+
+test('G-F20 (DD): a rejected arg never runs caller code (tagged, calls===0, byte-identical)', () => {
+    let calls = 0;
+    let dRef;
+    const H = () => ({ [Symbol.toPrimitive]() { calls++; if (dRef) dRef.add(1); return 1; },
+                       toString() { calls++; if (dRef) dRef.add(1); return 'x'; },
+                       valueOf() { calls++; if (dRef) dRef.add(1); return 1; } });
+    const hostile = () => [Object.create(null), { toString() { calls++; throw new Error('boom'); } }, H(),
+        Object.assign(function () {}, { toString() { calls++; return 'f'; } })];
+    // ctor slots: alpha, {maxBins}, {range:H}, {range:[H,5]}, {range:[1,H]}
+    for (const h of hostile()) assert.throws(() => new DDSketch(h), liteSketch);
+    for (const h of hostile()) assert.throws(() => new DDSketch(0.01, { maxBins: h }), liteSketch);
+    for (const h of hostile()) assert.throws(() => new DDSketch(0.01, { range: h }), liteSketch);
+    for (const h of hostile()) assert.throws(() => new DDSketch(0.01, { range: [h, 5] }), liteSketch);
+    for (const h of hostile()) assert.throws(() => new DDSketch(0.01, { range: [1, h] }), liteSketch);
+    dRef = new DDSketch(0.01); dRef.add(2);
+    for (const h of hostile()) { const b = ddSnap(dRef); assert.throws(() => dRef.add(h), liteSketch); ddUnchanged(b, dRef, 'add value'); }
+    for (const h of hostile()) { const b = ddSnap(dRef); assert.throws(() => dRef.add(2, h), liteSketch); ddUnchanged(b, dRef, 'add count'); }
+    for (const h of hostile()) { const b = ddSnap(dRef); assert.throws(() => dRef.addFrom(h, 0), liteSketch); ddUnchanged(b, dRef, 'addFrom buf'); }
+    for (const h of hostile()) { const b = ddSnap(dRef); assert.throws(() => dRef.addFrom(new Float64Array([1]), h), liteSketch); ddUnchanged(b, dRef, 'addFrom i'); }
+    assert.equal(calls, 0, 'no hostile toString/valueOf/toPrimitive ran');
+    let msg = '';
+    try { new DDSketch(Object.create(null)); } catch (e) { msg = e.message; }
+    assert.ok(/got \[object]$/.test(msg), 'null-proto message: ' + msg);
+});
+
+// Pin: a non-finite value is rejected by _badValue (TypeError, "value must be finite..."), NOT by
+// _badIndexable (RangeError) -- so a mutant weakening `!Number.isFinite(value)` to a NaN-only check
+// (which would let Infinity flow into Math.log and hit the indexable guard) dies on type AND message.
+// The message prefix is byte-identical to HEAD.
+test('G-F20b (DD): non-finite add / addFrom hit _badValue (TypeError), not _badIndexable', () => {
+    const s = new DDSketch(0.01);
+    const valMsg = (e) => e instanceof TypeError && liteSketch(e) &&
+        /DDSketch value must be finite, non-negative/.test(e.message);
+    for (const v of [Infinity, -Infinity, NaN, '1']) {
+        assert.throws(() => s.add(v), valMsg, 'add(' + String(v) + ')');
+    }
+    for (const v of [Infinity, -Infinity, NaN]) {
+        assert.throws(() => s.addFrom(new Float64Array([v]), 0), valMsg, 'addFrom([' + v + '])');
+    }
+});
+
+// QA H2.3 boundary gap: self-merge (this === other) at the count ceiling, and the _badTotal
+// message is a RangeError printing the current count and the rejected n.
+test('QA H2.3 (DD): self-merge at the count ceiling; _badTotal prints current count + n', () => {
+    const s = new DDSketch(0.01);
+    for (let i = 0; i < (1 << 20); i++) s.add(5, 4294967295);
+    s.add(5, (1 << 20) - 1);
+    assert.equal(s.count, 2 ** 52 - 1);
+    assert.equal(s.merge(s).count, 2 ** 53 - 2);
+    const b = ddSnap(s);
+    assert.throws(() => s.merge(s), (e) => e instanceof RangeError && liteSketch(e) &&
+        e.message.includes('current count ' + (2 ** 53 - 2) + ' + ' + (2 ** 53 - 2)));
+    ddUnchanged(b, s, 'self-merge count+1 reject');
+    assert.throws(() => s.add(5, 2), (e) => e instanceof RangeError &&
+        e.message.includes('current count ' + (2 ** 53 - 2) + ' + 2'));
+    ddUnchanged(b, s, 'add count+1 reject');
 });

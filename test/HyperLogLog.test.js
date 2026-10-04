@@ -577,17 +577,29 @@ test('F1: duplicate sign-bit writes and a double clear() are idempotent', () => 
     assert.equal(h._reg[exp.j], exp.rho, 'writes after a double clear land normally');
 });
 
-// ADVERSARIAL (pre-existing in 1.1.2, found by H2.1 qa, NOT an F1 regression): the cold
-// thrower formats the rejected lane with String(x), which runs caller code. A null-proto
-// object makes String() throw an UNTAGGED TypeError, a throwing toString replaces the
-// tagged error, and a toString that re-enters addHashed mutates the receiver during a
-// "byte-identical" rejection. Pinned as todo so verify stays green until a fix session.
-test('ADVERSARIAL: a rejected lane never runs caller code (tagged throw, receiver untouched)', { todo: 'thrower calls String(x): null-proto / throwing / re-entrant toString escape the tag' }, () => {
-    const h = new HyperLogLog(4);
-    assert.throws(() => h.addHashed(Object.create(null), 0), liteSketch, 'null-proto lane');
-    assert.throws(() => h.add(Object.create(null)), liteSketch, 'null-proto key');
-    assert.throws(() => h.addHashed({ toString() { throw new Error('boom'); } }, 0), liteSketch, 'throwing toString');
-    const snap = Array.from(h._reg);
-    assert.throws(() => h.addHashed({ toString() { h.addHashed(0, 0); return 'x'; } }, 0), liteSketch);
-    assert.deepEqual(Array.from(h._reg), snap, 're-entrant toString mutated the receiver');
+// G-F20 (F20, fixed in H2.3): the cold throwers now format rejected args through `_describe`,
+// which runs NO user code. A null-proto object gives a TAGGED error ending in `got [object]`,
+// a throwing toString no longer replaces the tag, and a toString that re-enters the receiver
+// never runs, so a rejection stays byte-identical.
+test('G-F20 (HLL): a rejected arg never runs caller code (tagged, calls===0, receiver untouched)', () => {
+    let calls = 0;
+    let hRef;
+    const H = () => ({ [Symbol.toPrimitive]() { calls++; if (hRef) hRef.addHashed(0, 0); return 1; },
+                       toString() { calls++; if (hRef) hRef.addHashed(0, 0); return 'x'; },
+                       valueOf() { calls++; if (hRef) hRef.addHashed(0, 0); return 1; } });
+    const hostile = () => [Object.create(null), { toString() { calls++; throw new Error('boom'); } }, H(),
+        Object.assign(function () {}, { toString() { calls++; return 'f'; } })];
+    // ctor slots p, seed
+    for (const h of hostile()) assert.throws(() => new HyperLogLog(h), liteSketch);
+    for (const h of hostile()) assert.throws(() => new HyperLogLog(14, h), liteSketch);
+    hRef = new HyperLogLog(4);
+    hRef.addHashed(123, 456);
+    const snap = () => Array.from(hRef._reg);
+    for (const h of hostile()) { const b = snap(); assert.throws(() => hRef.add(h), liteSketch); assert.deepEqual(snap(), b, 'add key'); }
+    for (const h of hostile()) { const b = snap(); assert.throws(() => hRef.addHashed(h, 0), liteSketch); assert.deepEqual(snap(), b, 'addHashed hi'); }
+    for (const h of hostile()) { const b = snap(); assert.throws(() => hRef.addHashed(0, h), liteSketch); assert.deepEqual(snap(), b, 'addHashed lo'); }
+    assert.equal(calls, 0, 'no hostile toString/valueOf/toPrimitive ran');
+    let msg = '';
+    try { new HyperLogLog(Object.create(null)); } catch (e) { msg = e.message; }
+    assert.ok(/got \[object]$/.test(msg), 'null-proto message: ' + msg);
 });

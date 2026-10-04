@@ -162,6 +162,24 @@ export function saltRow(h, i) {
     return _m3final((h ^ Math.imul(i, ODD_CONST)) | 0) >>> 0;
 }
 
+/**
+ * @private Cold describe of ANY value for a throw message, running NO user code (F20):
+ * `typeof` first, so a null-prototype object or a `toString` / `valueOf` / `Symbol.toPrimitive`
+ * that throws or mutates the receiver can NEVER run during a rejection that must be a
+ * byte-identical no-op. A string returns itself; a number / boolean / undefined / bigint /
+ * symbol (and null) is `String`-safe and formats directly; any object is `'[object]'` and any
+ * function `'[function]'`. It touches `x` only through `typeof` / `===`, never a property read.
+ * @param {*} x the rejected value
+ * @returns {string} a message fragment that is byte-identical to HEAD for every primitive
+ */
+function _describe(x) {
+    const t = typeof x;
+    if (t === 'string') return x;
+    if (t === 'object') return x === null ? 'null' : '[object]';
+    if (t === 'function') return '[function]';
+    return String(x);
+}
+
 // ===========================================================================
 // HyperLogLog (ADR 0002) -- the reference member (cardinality / distinct-count)
 // ===========================================================================
@@ -254,11 +272,11 @@ export class HyperLogLog {
         // non-integer number; typeof rejects Symbol / BigInt before | coerces them.
         if (typeof p !== 'number' || (p | 0) !== p || p < HLL_P_MIN || p > HLL_P_MAX) {
             throw new RangeError(
-                '[lite-sketch] HyperLogLog p must be an integer in [4, 18], got ' + String(p));
+                '[lite-sketch] HyperLogLog p must be an integer in [4, 18], got ' + _describe(p));
         }
         if (typeof seed !== 'number' || !Number.isInteger(seed)) {
             throw new RangeError(
-                '[lite-sketch] HyperLogLog seed must be an integer, got ' + String(seed));
+                '[lite-sketch] HyperLogLog seed must be an integer, got ' + _describe(seed));
         }
         const m = 1 << p;
         this._p = p;
@@ -401,14 +419,14 @@ export class HyperLogLog {
         return this;
     }
 
-    /** @private Cold thrower for a bad key (String is Symbol / BigInt-safe). */
+    /** @private Cold thrower for a bad key (_describe runs no user code -- F20). */
     _badKey(key) {
-        throw new TypeError('[lite-sketch] HyperLogLog.add key must be a number, got ' + String(key));
+        throw new TypeError('[lite-sketch] HyperLogLog.add key must be a number, got ' + _describe(key));
     }
 
     /** @private Cold thrower for a bad pre-hashed lane. */
     _badLane(x) {
-        throw new TypeError('[lite-sketch] HyperLogLog.addHashed lanes must be uint32, got ' + String(x));
+        throw new TypeError('[lite-sketch] HyperLogLog.addHashed lanes must be uint32, got ' + _describe(x));
     }
 
     /** @private Cold thrower for an incompatible merge (non-instance vs m/seed mismatch). */
@@ -455,8 +473,9 @@ const CMS_KNOWN_OPTS = Object.freeze({ seed: true, conservative: true });
  * query returns `f_hat >= f_true` with `f_hat - f_true <= epsilon * N` (N = total
  * count) with probability `>= 1 - delta`, where `epsilon = e / w` and
  * `delta = e^-d`. `withAccuracy(epsilon, delta)` inverts that: `w = ceil(e/epsilon)`
- * (rounded up to a power of two), `d = ceil(ln(1/delta))`. One-sided: the estimate
- * NEVER undercounts.
+ * (rounded up to a power of two), `d = ceil(ln(1/delta))`. One-sided while `!saturated`:
+ * the estimate never undercounts until a counter saturates at 2^32-1 (then the sticky
+ * `saturated` getter reads true and a query over a saturated key may read low).
  *
  * Conservative update (default, Estan-Varghese): instead of `+count` on every row,
  * raise each of the d cells only up to `min(cells) + count` -- it never changes the
@@ -493,11 +512,11 @@ export class CountMinSketch {
         // typeof guard FIRST, BEFORE any allocation -- reject non-integers / Symbol / BigInt.
         if (typeof d !== 'number' || (d | 0) !== d || d < 1 || d > CMS_D_MAX) {
             throw new RangeError(
-                '[lite-sketch] CountMinSketch d must be an integer in [1, ' + CMS_D_MAX + '], got ' + String(d));
+                '[lite-sketch] CountMinSketch d must be an integer in [1, ' + CMS_D_MAX + '], got ' + _describe(d));
         }
         if (typeof w !== 'number' || (w | 0) !== w || w < 1 || w > CMS_W_MAX) {
             throw new RangeError(
-                '[lite-sketch] CountMinSketch w must be an integer in [1, ' + CMS_W_MAX + '], got ' + String(w));
+                '[lite-sketch] CountMinSketch w must be an integer in [1, ' + CMS_W_MAX + '], got ' + _describe(w));
         }
         // Round w UP to the next power of two (no-op if already one) so column = hash & (w-1).
         let cw = 1;
@@ -516,7 +535,7 @@ export class CountMinSketch {
         if (options !== undefined) {
             if (typeof options !== 'object' || options === null || Array.isArray(options)) {
                 throw new TypeError(
-                    '[lite-sketch] CountMinSketch options must be a plain object, got ' + String(options));
+                    '[lite-sketch] CountMinSketch options must be a plain object, got ' + _describe(options));
             }
             const keys = Object.keys(options);
             for (let i = 0; i < keys.length; i++) {
@@ -526,14 +545,14 @@ export class CountMinSketch {
                 seed = options.seed;
                 if (typeof seed !== 'number' || !Number.isInteger(seed)) {
                     throw new RangeError(
-                        '[lite-sketch] CountMinSketch seed must be an integer, got ' + String(seed));
+                        '[lite-sketch] CountMinSketch seed must be an integer, got ' + _describe(seed));
                 }
             }
             if (options.conservative !== undefined) {
                 conservative = options.conservative;
                 if (typeof conservative !== 'boolean') {
                     throw new TypeError(
-                        '[lite-sketch] CountMinSketch conservative must be a boolean, got ' + String(conservative));
+                        '[lite-sketch] CountMinSketch conservative must be a boolean, got ' + _describe(conservative));
                 }
             }
         }
@@ -546,12 +565,15 @@ export class CountMinSketch {
         this._counts = new Uint32Array(d * cw);
         this._idx = new Int32Array(d);  // pre-allocated per-row flat-index scratch (0-alloc conservative update)
         this._total = 0;
+        this._saturated = false;        // sticky: set on any CMS_MAX_COUNT clamp; while false, estimate is one-sided
     }
 
     /**
-     * Build a sketch sized to a target accuracy: `w = ceil(e/epsilon)` (rounded up to
-     * a power of two, clamped to the width cap), `d = ceil(ln(1/delta))` (clamped to
-     * [1, 32]). Delegates ALL remaining validation (incl. the SMI cap) to the ctor.
+     * Build a sketch sized to a target accuracy: `w = ceil(e/epsilon)` (then rounded up to
+     * a power of two), `d = ceil(ln(1/delta))` (clamped UP to >= 1, which only strengthens
+     * the guarantee). An UNATTAINABLE request -- `w > 2^25` or `d > 32` (F16/S6) -- throws
+     * a tagged RangeError rather than silently clamping down to a weaker guarantee.
+     * Delegates ALL remaining validation (incl. the SMI cap) to the ctor.
      * @param {number} epsilon relative error, in (0, 1).
      * @param {number} delta   failure probability, in (0, 1).
      * @param {{seed?: number, conservative?: boolean}} [options]
@@ -560,22 +582,30 @@ export class CountMinSketch {
     static withAccuracy(epsilon, delta, options) {
         if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
             throw new RangeError(
-                '[lite-sketch] CountMinSketch.withAccuracy epsilon must be in (0, 1), got ' + String(epsilon));
+                '[lite-sketch] CountMinSketch.withAccuracy epsilon must be in (0, 1), got ' + _describe(epsilon));
         }
         if (typeof delta !== 'number' || !(delta > 0 && delta < 1)) {
             throw new RangeError(
-                '[lite-sketch] CountMinSketch.withAccuracy delta must be in (0, 1), got ' + String(delta));
+                '[lite-sketch] CountMinSketch.withAccuracy delta must be in (0, 1), got ' + _describe(delta));
         }
-        // Clamp the target width to the cap BEFORE rounding up: `cw <<= 1` is an int32
-        // shift, so a w > 2^30 (epsilon < ~2.53e-9, still inside (0,1)) would overflow cw
-        // to 0 and spin forever. Clamped here, the round-up tops out at CMS_W_MAX.
-        let w = Math.ceil(Math.E / epsilon);
-        if (w > CMS_W_MAX) w = CMS_W_MAX;
+        // F16/S6: a request that needs w > 2^25 or d > 32 is UNATTAINABLE, so throw tagged
+        // rather than silently clamp to a weaker guarantee. Infinity (a denormal epsilon/delta)
+        // exceeds the cap and throws too. Both checks precede the power-of-two round-up loop.
+        const w = Math.ceil(Math.E / epsilon);
+        if (w > CMS_W_MAX) {
+            throw new RangeError(
+                '[lite-sketch] CountMinSketch.withAccuracy epsilon ' + epsilon + ' needs w=' + w +
+                ' > the width cap 33554432 (2^25); it is unattainable');
+        }
+        let d = Math.ceil(Math.log(1 / delta));
+        if (d > CMS_D_MAX) {
+            throw new RangeError(
+                '[lite-sketch] CountMinSketch.withAccuracy delta ' + delta + ' needs d=' + d +
+                ' > the depth cap 32; it is unattainable');
+        }
+        if (d < 1) d = 1;
         let cw = 1;
         while (cw < w) cw <<= 1;
-        let d = Math.ceil(Math.log(1 / delta));
-        if (d < 1) d = 1;
-        if (d > CMS_D_MAX) d = CMS_D_MAX;
         return new CountMinSketch(d, cw, options);
     }
 
@@ -589,6 +619,13 @@ export class CountMinSketch {
     get conservative() { return this._conservative; }
     /** Total count added (sum of all `count`s). O(1). */
     get total() { return this._total; }
+    /**
+     * Whether any counter has saturated at CMS_MAX_COUNT (2^32-1). Sticky: once true it
+     * stays true until `clear()`, and `merge` carries it from either side. While it is
+     * false the estimate is strictly one-sided (never undercounts); once true a saturated
+     * cell may read low, so a query over a saturated key is no longer an upper bound. O(1).
+     */
+    get saturated() { return this._saturated; }
     /** The theoretical relative error e / w. O(1). */
     get epsilon() { return Math.E / this._w; }
     /** The theoretical failure probability e^-d. O(1). */
@@ -602,7 +639,8 @@ export class CountMinSketch {
      * guards run FIRST. The hot body distinguishes the FULL magnitude (low word + high word +
      * sign), so the accepted domain is every safe integer |key| <= 2^53 - 1, matching
      * HyperLogLog / SpaceSaving; a non-integer or an Infinity would truncate/alias under
-     * `>>> 0`, so both fail closed.
+     * `>>> 0`, so both fail closed. An add that would push the running `total` past 2^53-1
+     * throws tagged (F15/S5) -- the aggregate stays exact -- as a byte-identical no-op.
      *
      * The two-lane murmur is INLINED (identical math to mix64) into int32 LOCALS so it
      * never writes the module HASH_HI / HASH_LO slots (a uint32 >= 2^31 lane never boxes
@@ -617,6 +655,7 @@ export class CountMinSketch {
         if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT) {
             return this._badCount(count);
         }
+        if (this._total + count > 9007199254740991) return this._badTotal(count);
         let a = key;
         let neg = 0;
         if (a < 0) { a = -a; neg = 1; }
@@ -653,6 +692,7 @@ export class CountMinSketch {
         if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > CMS_MAX_COUNT) {
             return this._badCount(count);
         }
+        if (this._total + count > 9007199254740991) return this._badTotal(count);
         const base = (hi ^ lo) | 0;
         if (this._conservative) return this._applyCons(base, count);
         return this._applyPlain(base, count);
@@ -676,7 +716,7 @@ export class CountMinSketch {
             if (v < mn) mn = v;
         }
         let target = mn + count;
-        if (target > CMS_MAX_COUNT) target = CMS_MAX_COUNT;
+        if (target > CMS_MAX_COUNT) { target = CMS_MAX_COUNT; this._saturated = true; }
         for (let i = 0; i < d; i++) {
             const id = idx[i];
             if (counts[id] < target) counts[id] = target;
@@ -695,7 +735,7 @@ export class CountMinSketch {
             const x = _m3final((base ^ Math.imul(i, ODD_CONST)) | 0);
             const id = i * w + (x & mask);
             let v = counts[id] + count;
-            if (v > CMS_MAX_COUNT) v = CMS_MAX_COUNT;
+            if (v > CMS_MAX_COUNT) { v = CMS_MAX_COUNT; this._saturated = true; }
             counts[id] = v;
         }
         this._total += count;
@@ -704,13 +744,15 @@ export class CountMinSketch {
 
     /**
      * Estimate a key's frequency: the MINIMUM over its d cells (the tightest one-sided
-     * over-estimate). HOT, 0 B/op. NEVER throws -- a non-number / NaN key returns 0
-     * (fail-closed: an un-addable key has frequency 0).
+     * over-estimate). HOT, 0 B/op. NEVER throws -- a key that `add` would REJECT (a
+     * non-number / NaN / +-Infinity / non-integer / out-of-safe-range key) returns 0
+     * (fail-closed: an un-addable key has frequency 0, and never aliases a real key).
      * @param {number} key
      * @returns {number}
      */
     estimate(key) {
-        if (typeof key !== 'number' || key !== key) return 0;
+        if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
+            Math.abs(key) > 9007199254740991) return 0;
         let a = key;
         let neg = 0;
         if (a < 0) { a = -a; neg = 1; }
@@ -760,8 +802,11 @@ export class CountMinSketch {
     /**
      * Merge `other` into this by element-wise saturating add (the mergeability of plain
      * Count-Min; for conservative sketches merge is a valid upper bound, not exact).
-     * O(d*w), 0 alloc. Fails closed `[lite-sketch]` if `other` is not a CountMinSketch
-     * or differs in d / w / seed.
+     * O(d*w), 0 alloc. A cross-flag merge is allowed (S7): `this` keeps its own
+     * `conservative` flag, and the result stays one-sided (exact only when both sides are
+     * plain). `saturated` is carried from either side, and any clamp during the merge sets
+     * it. Fails closed `[lite-sketch]` if `other` is not a CountMinSketch, differs in
+     * d / w / seed, or would push the running `total` past 2^53-1 (F15/S5, byte-identical).
      * @param {CountMinSketch} other
      * @returns {CountMinSketch} this
      */
@@ -770,37 +815,49 @@ export class CountMinSketch {
             other._d !== this._d || other._w !== this._w || other._seed !== this._seed) {
             return this._badMerge(other);
         }
+        // Total guard BEFORE the first write (F15): a merged total past 2^53-1 is no longer exact.
+        if (this._total + other._total > 9007199254740991) return this._badTotal(other._total);
         const a = this._counts, b = other._counts, n = a.length;
+        let sat = other._saturated;
         for (let i = 0; i < n; i++) {
             let v = a[i] + b[i];
-            if (v > CMS_MAX_COUNT) v = CMS_MAX_COUNT;
+            if (v > CMS_MAX_COUNT) { v = CMS_MAX_COUNT; sat = true; }
             a[i] = v;
         }
         this._total += other._total;
+        if (sat) this._saturated = true;
         return this;
     }
 
-    /** Reset every counter to 0 and the running total. O(d*w). @returns {CountMinSketch} this */
+    /** Reset every counter to 0, the running total, and the sticky `saturated` flag. O(d*w). @returns {CountMinSketch} this */
     clear() {
         this._counts.fill(0);
         this._total = 0;
+        this._saturated = false;
         return this;
     }
 
-    /** @private Cold thrower for a bad key (String is Symbol / BigInt-safe). */
+    /** @private Cold thrower for a bad key (_describe runs no user code -- F20). */
     _badKey(key) {
-        throw new TypeError('[lite-sketch] CountMinSketch.add key must be a number, got ' + String(key));
+        throw new TypeError('[lite-sketch] CountMinSketch.add key must be a number, got ' + _describe(key));
     }
 
     /** @private Cold thrower for a bad pre-hashed lane. */
     _badLane(x) {
-        throw new TypeError('[lite-sketch] CountMinSketch.addHashed lanes must be uint32, got ' + String(x));
+        throw new TypeError('[lite-sketch] CountMinSketch.addHashed lanes must be uint32, got ' + _describe(x));
     }
 
     /** @private Cold thrower for a bad count. */
     _badCount(count) {
         throw new RangeError(
-            '[lite-sketch] CountMinSketch count must be an integer in [1, ' + CMS_MAX_COUNT + '], got ' + String(count));
+            '[lite-sketch] CountMinSketch count must be an integer in [1, ' + CMS_MAX_COUNT + '], got ' + _describe(count));
+    }
+
+    /** @private Cold thrower: the running total would exceed the exact-aggregate ceiling 2^53-1. */
+    _badTotal(n) {
+        throw new RangeError(
+            '[lite-sketch] CountMinSketch total would exceed the exact integer ceiling 9007199254740991 (2^53-1): ' +
+            'current total ' + this._total + ' + ' + _describe(n));
     }
 
     /** @private Cold thrower for an incompatible merge (non-instance vs d/w/seed mismatch). */
@@ -817,7 +874,7 @@ export class CountMinSketch {
     /** @private Cold thrower for an unknown option key (did-you-mean listing known keys). */
     _badOption(key) {
         throw new TypeError(
-            '[lite-sketch] CountMinSketch unknown option "' + String(key) +
+            '[lite-sketch] CountMinSketch unknown option "' + _describe(key) +
             '"; known options: ' + Object.keys(CMS_KNOWN_OPTS).join(', '));
     }
 }
@@ -905,14 +962,14 @@ export class DDSketch {
         // a smaller alpha is rejected here, before the indexable-bound math runs.
         if (typeof alpha !== 'number' || !(alpha >= DD_ALPHA_MIN && alpha < 1)) {
             throw new RangeError(
-                '[lite-sketch] DDSketch alpha must be a number in [' + DD_ALPHA_MIN.toExponential() + ', 1), got ' + String(alpha));
+                '[lite-sketch] DDSketch alpha must be a number in [' + DD_ALPHA_MIN.toExponential() + ', 1), got ' + _describe(alpha));
         }
         let maxBins = DD_MAX_BINS_DEFAULT;
         let range;
         if (options !== undefined) {
             if (typeof options !== 'object' || options === null || Array.isArray(options)) {
                 throw new TypeError(
-                    '[lite-sketch] DDSketch options must be a plain object, got ' + String(options));
+                    '[lite-sketch] DDSketch options must be a plain object, got ' + _describe(options));
             }
             const keys = Object.keys(options);
             for (let i = 0; i < keys.length; i++) {
@@ -924,7 +981,7 @@ export class DDSketch {
                     maxBins < 1 || maxBins > DD_MAX_BINS_CAP) {
                     throw new RangeError(
                         '[lite-sketch] DDSketch maxBins must be an integer in [1, ' +
-                        DD_MAX_BINS_CAP + '], got ' + String(maxBins));
+                        DD_MAX_BINS_CAP + '], got ' + _describe(maxBins));
                 }
             }
             if (options.range !== undefined) range = options.range;
@@ -936,7 +993,7 @@ export class DDSketch {
         // a non-log base (gamma <= 1, or a non-finite multiplier / lnGamma) fails closed, not silently.
         if (!(gamma > 1) || !Number.isFinite(multiplier) || !Number.isFinite(lnGamma)) {
             throw new RangeError(
-                '[lite-sketch] DDSketch could not derive a finite log base from alpha ' + String(alpha));
+                '[lite-sketch] DDSketch could not derive a finite log base from alpha ' + _describe(alpha));
         }
         // The KEY bounds for which the representative `2*gamma^K/(gamma+1)` stays a finite,
         // NORMAL (full-relative-precision) double: above _maxKeyIndexable it overflows to
@@ -978,7 +1035,7 @@ export class DDSketch {
         }
         if (!boundOk) {
             throw new RangeError(
-                '[lite-sketch] DDSketch could not bound the indexable key range for alpha ' + String(alpha));
+                '[lite-sketch] DDSketch could not bound the indexable key range for alpha ' + _describe(alpha));
         }
         // EXACT acceptance edges of add's OWN key expression `ceil(log(x) * multiplier)` (F17),
         // found by bit-level bisection of THAT expression with THIS multiplier -- so the
@@ -1022,7 +1079,7 @@ export class DDSketch {
         const maxIndexable = eLo;   // INCLUSIVE ceiling: the last accepted double (always < MAX_VALUE)
         if (!edgeOk) {
             throw new RangeError(
-                '[lite-sketch] DDSketch could not resolve the exact indexable edges for alpha ' + String(alpha));
+                '[lite-sketch] DDSketch could not resolve the exact indexable edges for alpha ' + _describe(alpha));
         }
         let strict = false;
         let minKey = 0, maxKeyStrict = 0, nb = 0;
@@ -1134,19 +1191,24 @@ export class DDSketch {
      * object, no boxed slot -- so the in-window path is a true 0 B/op.
      *
      * Fails closed: a non-number / NaN / +-Infinity value throws, a negative value throws
-     * (positive+zero domain), a non-positive-integer count throws -- all `[lite-sketch]`,
-     * typeof guards FIRST.
+     * (positive+zero domain), a count outside [1, 2^32-1] throws, and an add that would push
+     * the running `count` past 2^53-1 throws (F15/S5, the aggregate stays exact) -- all
+     * `[lite-sketch]`, typeof guards FIRST, each a byte-identical no-op.
      * @param {number} value a finite number >= 0 (negatives throw).
-     * @param {number} [count=1] a positive integer.
+     * @param {number} [count=1] a positive integer in [1, 2^32-1].
      * @returns {DDSketch} this
      */
     add(value, count = 1) {
         // ALL validation precedes ANY state write: every throwing path is a byte-identical no-op.
-        if (typeof value !== 'number' || value !== value ||
-            value === Infinity || value === -Infinity) return this._badValue(value);
-        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
-            return this._badCount(count);
-        }
+        // Number.isFinite rejects a non-number / NaN / +-Infinity in one non-coercing call (identical
+        // accept/reject set to the explicit chain, and no user code runs on a non-number), which keeps
+        // the hot body under the V8 inline-bytecode cap.
+        if (!Number.isFinite(value)) return this._badValue(value);
+        // ONE cold branch for count-domain AND running-total overflow: Number.isInteger never coerces,
+        // so the typeof check folds in, and `_badCount` picks the count-domain vs total-ceiling message.
+        // Runs BEFORE the value<0 check.
+        if (!(Number.isInteger(count) && count >= 1 && count <= 4294967295) ||
+            this._count + count > 9007199254740991) return this._badCount(count);
         if (value < 0) return this._badValue(value);   // negatives fail closed BEFORE any aggregate write
         if (value === 0) {                             // zeros are the smallest values (0 can be a new min/max)
             this._count += count;
@@ -1196,11 +1258,14 @@ export class DDSketch {
      */
     addFrom(buf, i) {
         // Validate the buffer + index on the COLD branch first (a bad handle is a byte-identical no-op).
-        if (!(buf instanceof Float64Array) || typeof i !== 'number' ||
-            !Number.isInteger(i) || i < 0 || i >= buf.length) return this._badBuf(buf, i);
+        if (!(buf instanceof Float64Array) || !Number.isInteger(i) ||
+            i < 0 || i >= buf.length) return this._badBuf(buf, i);
         const value = buf[i];   // UNBOXED Float64Array read -- the whole point (no argument box).
         // From here the body mirrors add(value, 1) exactly; count is a literal 1 (a Smi, never boxed).
-        if (value !== value || value === Infinity || value === -Infinity) return this._badValue(value);
+        // Number.isFinite rejects NaN / +-Infinity in one call (buf[i] is always a number), keeping the
+        // hot body under the V8 inline-bytecode cap.
+        if (!Number.isFinite(value)) return this._badValue(value);
+        if (this._count + 1 > 9007199254740991) return this._badTotal(1);
         if (value < 0) return this._badValue(value);
         if (value === 0) {
             this._count += 1;
@@ -1229,7 +1294,7 @@ export class DDSketch {
     _badBuf(buf, i) {
         throw new TypeError(
             '[lite-sketch] DDSketch.addFrom(buf, i) needs a Float64Array and an in-bounds integer index, got ' +
-            String(buf) + ', ' + String(i));
+            _describe(buf) + ', ' + _describe(i));
     }
 
     /**
@@ -1338,6 +1403,8 @@ export class DDSketch {
      * and a COLLAPSED `other` is rejected outright (S3): its low-end mass has already folded,
      * so a strict sketch cannot absorb it without breaking its range guarantee. A non-strict
      * `this` carries `other._collapsed` forward (merging collapsed mass makes `this` collapsed).
+     * A merge that would push the running `count` past 2^53-1 throws tagged (F15/S5), as a
+     * byte-identical no-op.
      * @param {DDSketch} other
      * @returns {DDSketch} this
      */
@@ -1362,7 +1429,9 @@ export class DDSketch {
                 }
             }
         }
-        // Past every throw (gamma, strict-collapsed, strict pre-scan): carry other's collapsed
+        // Total guard BEFORE the first write (F15): a merged count past 2^53-1 is no longer exact.
+        if (this._count + other._count > 9007199254740991) return this._badTotal(other._count);
+        // Past every throw (gamma, strict-collapsed, strict pre-scan, total): carry other's collapsed
         // state, then write the aggregates and fold each populated bin.
         if (other._collapsed) this._collapsed = true;
         this._zeroCount += other._zeroCount;
@@ -1401,25 +1470,37 @@ export class DDSketch {
     _badValue(value) {
         throw new TypeError(
             '[lite-sketch] DDSketch value must be finite, non-negative, and within the strict ' +
-            'range if configured, got ' + String(value));
+            'range if configured, got ' + _describe(value));
     }
 
     /** @private Cold thrower for a value outside the indexable range (representative would over/underflow). */
     _badIndexable(value) {
         throw new RangeError(
-            '[lite-sketch] DDSketch.add value ' + String(value) + ' is outside the sketch\'s indexable range');
+            '[lite-sketch] DDSketch.add value ' + _describe(value) + ' is outside the sketch\'s indexable range');
     }
 
-    /** @private Cold thrower for a bad count. */
+    /**
+     * @private Cold thrower for the folded count branch: dispatches to the running-total ceiling
+     * message when the count itself is valid (so the only cause left is overflow), else the
+     * count-domain message. Keeps both H2.3 messages byte-identical while the hot `add` uses one branch.
+     */
     _badCount(count) {
+        if (Number.isInteger(count) && count >= 1 && count <= 4294967295) return this._badTotal(count);
         throw new RangeError(
-            '[lite-sketch] DDSketch.add count must be a positive integer, got ' + String(count));
+            '[lite-sketch] DDSketch count must be an integer in [1, 4294967295], got ' + _describe(count));
+    }
+
+    /** @private Cold thrower: the running count would exceed the exact-aggregate ceiling 2^53-1. */
+    _badTotal(n) {
+        throw new RangeError(
+            '[lite-sketch] DDSketch count would exceed the exact integer ceiling 9007199254740991 (2^53-1): ' +
+            'current count ' + this._count + ' + ' + _describe(n));
     }
 
     /** @private Cold thrower for a bad strict range. */
     _badRange(range) {
         throw new RangeError(
-            '[lite-sketch] DDSketch range must be [min, max] with finite 0 < min < max, got ' + String(range));
+            '[lite-sketch] DDSketch range must be [min, max] with finite 0 < min < max, got ' + _describe(range));
     }
 
     /** @private Cold thrower: a strict sketch cannot absorb a collapsed sketch's low-end mass (S3). */
@@ -1442,7 +1523,7 @@ export class DDSketch {
     /** @private Cold thrower for an unknown option key (did-you-mean listing known keys). */
     _badOption(key) {
         throw new TypeError(
-            '[lite-sketch] DDSketch unknown option "' + String(key) +
+            '[lite-sketch] DDSketch unknown option "' + _describe(key) +
             '"; known options: ' + Object.keys(DD_KNOWN_OPTS).join(', '));
     }
 }
@@ -1532,7 +1613,7 @@ export class SpaceSaving {
      */
     constructor(capacity, options) {
         // typeof guard FIRST, BEFORE any allocation (Number.isInteger never coerces; false on
-        // a Symbol / BigInt), and String(x) in the cold message is Symbol / BigInt-safe.
+        // a Symbol / BigInt), and _describe(x) in the cold message runs no user code (F20).
         if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
             capacity < 1 || capacity > SS_CAP_MAX) {
             return this._badCapacity(capacity);
@@ -1541,7 +1622,7 @@ export class SpaceSaving {
         if (options !== undefined) {
             if (typeof options !== 'object' || options === null || Array.isArray(options)) {
                 throw new TypeError(
-                    '[lite-sketch] SpaceSaving options must be a plain object, got ' + String(options));
+                    '[lite-sketch] SpaceSaving options must be a plain object, got ' + _describe(options));
             }
             const keys = Object.keys(options);
             for (let i = 0; i < keys.length; i++) {
@@ -1551,7 +1632,7 @@ export class SpaceSaving {
                 seed = options.seed;
                 if (typeof seed !== 'number' || !Number.isInteger(seed)) {
                     throw new RangeError(
-                        '[lite-sketch] SpaceSaving seed must be an integer, got ' + String(seed));
+                        '[lite-sketch] SpaceSaving seed must be an integer, got ' + _describe(seed));
                 }
             }
         }
@@ -1601,8 +1682,9 @@ export class SpaceSaving {
     get seed() { return this._seed >>> 0; }
 
     /**
-     * Build a SpaceSaving sized to a target relative error: `k = min(ceil(1/epsilon),
-     * 2^24)`. Delegates all remaining validation to the ctor.
+     * Build a SpaceSaving sized to a target relative error: `k = ceil(1/epsilon)`. An
+     * UNATTAINABLE request -- `k > 2^24` (F16/S6) -- throws a tagged RangeError rather than
+     * silently clamping down to a weaker guarantee. Delegates all remaining validation to the ctor.
      * @param {number} epsilon relative error, in (0, 1). epsilon = 1 / k.
      * @param {{seed?: number}} [options]
      * @returns {SpaceSaving}
@@ -1610,9 +1692,14 @@ export class SpaceSaving {
     static withError(epsilon, options) {
         if (typeof epsilon !== 'number' || !(epsilon > 0 && epsilon < 1)) {
             throw new RangeError(
-                '[lite-sketch] SpaceSaving.withError epsilon must be in (0, 1), got ' + String(epsilon));
+                '[lite-sketch] SpaceSaving.withError epsilon must be in (0, 1), got ' + _describe(epsilon));
         }
-        const k = Math.min(Math.ceil(1 / epsilon), SS_CAP_MAX);
+        const k = Math.ceil(1 / epsilon);
+        if (k > SS_CAP_MAX) {
+            throw new RangeError(
+                '[lite-sketch] SpaceSaving.withError epsilon ' + epsilon + ' needs k=' + k +
+                ' > the capacity cap 16777216 (2^24); it is unattainable');
+        }
         return new SpaceSaving(k, options);
     }
 
@@ -1626,18 +1713,21 @@ export class SpaceSaving {
      * writes the module HASH_HI / HASH_LO slots (a uint32 >= 2^31 home never boxes a
      * HeapNumber on the hot path).
      *
-     * Fails closed: a non-number / NaN / non-integer / out-of-safe-range key or a
-     * non-positive-integer count throws `[lite-sketch]` -- the typeof guards run FIRST.
+     * Fails closed: a non-number / NaN / non-integer / out-of-safe-range key or a count
+     * outside [1, 2^32-1] throws `[lite-sketch]` (typeof guards FIRST), and an add that would
+     * push the running `total` past 2^53-1 throws (F15/S5, the aggregate stays exact), each a
+     * byte-identical no-op.
      * @param {number} key   a safe integer, |key| <= 2^53 - 1
-     * @param {number} [count=1] a positive integer
+     * @param {number} [count=1] a positive integer in [1, 2^32-1]
      * @returns {SpaceSaving} this
      */
     add(key, count = 1) {
         if (typeof key !== 'number' || key !== key || !Number.isInteger(key) ||
             Math.abs(key) > 9007199254740991) return this._badKey(key);
-        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+        if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 4294967295) {
             return this._badCount(count);
         }
+        if (this._total + count > 9007199254740991) return this._badTotal(count);
         // inline HI-lane murmur into an int32 local (the map needs one lane).
         let a = key;
         let neg = 0;
@@ -1781,7 +1871,8 @@ export class SpaceSaving {
      * contributes its min as error). Keeps the k highest merged counts, rebuilds this's map +
      * forest, and adds `other._total`. The bracket is preserved but LOOSER after a merge.
      * COLD, with a bounded scratch allocation (disclosed). Fails closed `[lite-sketch]` if
-     * `other` is not a SpaceSaving or differs in capacity / seed.
+     * `other` is not a SpaceSaving, differs in capacity / seed, or would push the running
+     * `total` past 2^53-1 (F15/S5, byte-identical no-op).
      * @param {SpaceSaving} other
      * @returns {SpaceSaving} this
      */
@@ -1790,6 +1881,8 @@ export class SpaceSaving {
             other._capacity !== this._capacity || other._seed !== this._seed) {
             return this._badMerge(other);
         }
+        // Total guard BEFORE the first write (F15): a merged total past 2^53-1 is no longer exact.
+        if (this._total + other._total > 9007199254740991) return this._badTotal(other._total);
         // Imputation floors: each summary's min counter, or 0 if it is not yet full.
         const minThis = this._size < this._capacity ? 0 : this._minCount();
         const minOther = other._size < other._capacity ? 0 : other._minCount();
@@ -2010,23 +2103,30 @@ export class SpaceSaving {
         }
     }
 
-    /** @private Cold thrower for a bad key (String is Symbol / BigInt-safe). */
+    /** @private Cold thrower for a bad key (_describe runs no user code -- F20). */
     _badKey(key) {
         throw new TypeError(
-            '[lite-sketch] SpaceSaving.add key must be a safe integer, got ' + String(key));
+            '[lite-sketch] SpaceSaving.add key must be a safe integer, got ' + _describe(key));
     }
 
     /** @private Cold thrower for a bad count. */
     _badCount(count) {
         throw new RangeError(
-            '[lite-sketch] SpaceSaving count must be a positive integer, got ' + String(count));
+            '[lite-sketch] SpaceSaving count must be an integer in [1, 4294967295], got ' + _describe(count));
+    }
+
+    /** @private Cold thrower: the running total would exceed the exact-aggregate ceiling 2^53-1. */
+    _badTotal(n) {
+        throw new RangeError(
+            '[lite-sketch] SpaceSaving total would exceed the exact integer ceiling 9007199254740991 (2^53-1): ' +
+            'current total ' + this._total + ' + ' + _describe(n));
     }
 
     /** @private Cold thrower for a bad capacity. */
     _badCapacity(capacity) {
         throw new RangeError(
             '[lite-sketch] SpaceSaving capacity must be an integer in [1, ' + SS_CAP_MAX +
-            '], got ' + String(capacity));
+            '], got ' + _describe(capacity));
     }
 
     /** @private Cold thrower for an incompatible merge (non-instance vs capacity/seed mismatch). */
@@ -2043,7 +2143,7 @@ export class SpaceSaving {
     /** @private Cold thrower for an unknown option key (did-you-mean listing known keys). */
     _badOption(key) {
         throw new TypeError(
-            '[lite-sketch] SpaceSaving unknown option "' + String(key) +
+            '[lite-sketch] SpaceSaving unknown option "' + _describe(key) +
             '"; known options: ' + Object.keys(SS_KNOWN_OPTS).join(', '));
     }
 }

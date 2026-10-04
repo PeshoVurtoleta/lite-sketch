@@ -319,6 +319,7 @@ async function main() {
     const SCAV_HOT = 2000000;
     const SCAV_CLEAN = 0;    // int32-clean lanes: exactly 0 (transient churn isolated away)
     const SCAV_BOX = 48;     // uint32 >= 2^31 boxed-double lanes: pinned floor (see above)
+    const SCAV_ADD_INLINE = 2;  // N7 teeth: DDSketch.add(fractional) stays inlined (bytecode < V8 cap); the pre-fix 483-byte shape read 15
     async function scavLane(step) {
         for (let i = 0; i < 50000; i++) step();       // JIT warm
         globalThis.gc(); await sleep(30);
@@ -341,14 +342,17 @@ async function main() {
     // ---- N7: FRACTIONAL-input lane -- DDSketch.addFrom(buf, i) vs add(value) ------
     // WHY addFrom exists: a FRACTIONAL double passed as an ARGUMENT to add(value) is boxed
     // (~16 B HeapNumber) at a NON-INLINED call boundary; addFrom reads it UNBOXED from a
-    // Float64Array. This lane feeds genuinely fractional values (v + 0.5) and GATES that
-    // addFrom stays at the clean floor (0). It also prints add(value) for visibility.
-    // HONEST LIMIT: in this ISOLATED tight loop V8 INLINES dd.add(x), so the argument box
-    // does NOT reproduce here (measured add=~0..1, addFrom=0) -- the box only manifests at a
-    // real non-inlined CONSUMER boundary (the lite-hud M2 review measured add=43 vs a 24
-    // baseline, addFrom=24). So the "add(value) MUST show the box" teeth-control lives in
-    // lite-hud M2's gate (its real write() boundary), per LiteHud/ROADMAP section 6.1; here we
-    // gate only the delta-0 half we can honestly reproduce: addFrom on fractional input = 0.
+    // Float64Array. This lane feeds genuinely fractional values (v + 0.5) and GATES BOTH halves:
+    // addFrom stays at the clean floor (0), AND add(value) stays <= SCAV_ADD_INLINE here.
+    // The add(value) gate has TEETH as an INLINE-STATUS guard. In this isolated tight loop V8
+    // inlines dd.add(x) ONLY while add's bytecode stays under the --max-inlined-bytecode-size cap
+    // (~460 bytes); once the body grows past it, V8 stops inlining and the fractional argument
+    // boxes. H2.3's first draft pushed DDSketch.add to 483 bytecode bytes (count cap + total guard
+    // as two extra branches) and this lane read 15 scavenges -- the fix folds those into one branch
+    // (Number.isFinite + a single count/total branch) to bring add back to 448 bytes. So this lane
+    // FAILs the moment add deopts out of the inline budget again.
+    // (The cross-module box at a real non-inlined CONSUMER boundary -- lite-hud M2 measured add=43
+    // vs a 24 baseline, addFrom=24 -- is gated in lite-hud M2's own suite, per LiteHud/ROADMAP 6.1.)
     const ddFrac = new DDSketch(0.01);
     for (let k = 1; k <= 100000; k++) ddFrac.add(k);   // warm the window
     const ddFracBuf = new Float64Array(1);
@@ -372,7 +376,8 @@ async function main() {
         scAh <= SCAV_BOX && scCh <= SCAV_BOX &&                                 // addHashed caller-boxed lanes (F6)
         scAdd <= SCAV_CLEAN && scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&
         scDd <= SCAV_CLEAN && scSsE <= SCAV_CLEAN && scSsB <= SCAV_CLEAN &&
-        scDdFrom <= SCAV_CLEAN;   // N7: addFrom on FRACTIONAL input stays at the clean floor (the delta-0 proof)
+        scDdFrom <= SCAV_CLEAN &&  // N7: addFrom on FRACTIONAL input stays at the clean floor (the delta-0 proof)
+        scDdAdd <= SCAV_ADD_INLINE;  // N7: add(value) stays INLINED (bytecode < V8 cap); teeth: the pre-fix 483-byte shape read 15
 
     // ---- verdict + GATE line ----
     const cmsAllocOk = ccOk && cpOk && chOk && ceOk;
@@ -404,7 +409,7 @@ async function main() {
     console.log(
         'N7 DDSketch fractional lane (add(value) boxes at a non-inlined boundary; addFrom reads unboxed): ' +
         'addFrom=' + scDdFrom + ' (gated <=' + SCAV_CLEAN + ') add(value)=' + scDdAdd +
-        ' (isolated -- V8 inlines it; the box teeth-control is lite-hud M2\'s at its real write() boundary)');
+        ' (gated <=' + SCAV_ADD_INLINE + ' -- an INLINE-STATUS guard: the pre-fix 483-byte add deinlined and read 15)');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: HLL tracker held ' + trackedMid + ' (expected > 0)');

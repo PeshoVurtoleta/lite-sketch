@@ -33,6 +33,14 @@ void VERSION; // VERSION-pin is asserted once, centrally, by the other suites; n
 
 const liteSketch = (e) => e instanceof Error && /^\[lite-sketch]/.test(e.message);
 
+// Cold test helper: the adjacent double below x, via a bit view (probe the exact edges).
+function nextDown(x) {
+    const f = new Float64Array([x]);
+    const u = new BigUint64Array(f.buffer);
+    u[0] -= 1n;
+    return f[0];
+}
+
 // Deterministic PRNG (mulberry32-style) so no test ever flakes -- matches the convention in
 // CountMinSketch.test.js / DDSketch.test.js.
 function makeRng(seed) {
@@ -430,7 +438,8 @@ test('add() rejects a bad count [lite-sketch]: 0, -1, 1.5, NaN -- byte-identical
     s.add(5);
     // NOTE: `undefined` is NOT a bad count -- `add(key, count = 1)` has a default parameter,
     // so `add(5, undefined)` means count=1 (a valid no-op-safe add), it does not throw.
-    const badCounts = [0, -1, 1.5, NaN, Infinity, -Infinity, '1', null, {}];
+    const badCounts = [0, -1, 1.5, NaN, Infinity, -Infinity, '1', null, {},
+        2 ** 32, 1e308, Number.MAX_SAFE_INTEGER];   // F15: count > 2^32-1 throws
     for (const count of badCounts) {
         const before = snapshot(s);
         assert.throws(() => s.add(5, count), liteSketch, 'count=' + String(count));
@@ -532,9 +541,18 @@ test('ctor getters: capacity/epsilon are correct; withError derives k=ceil(1/eps
     assert.equal(w.epsilon, 0.01);
 });
 
-test('withError clamps k to SS_CAP_MAX (2^24) for a tiny epsilon', () => {
-    const w = SpaceSaving.withError(1e-9);
-    assert.equal(w.capacity, 1 << 24);
+test('withError rejects an unattainable epsilon (F16/S6); accepts the exact 2^-24 boundary', () => {
+    // double-rounding preconditions: the boundary accepts at exactly 2^24, the N+1 needs 2^24+1.
+    assert.equal(Math.ceil(1 / (2 ** -24)), 2 ** 24);
+    assert.equal(Math.ceil(1 / nextDown(2 ** -24)), 2 ** 24 + 1);
+    // rejects match the FACTORY's "capacity cap 16777216" wording (NOT the bare number, which the
+    // ctor message "capacity must be an integer in [1, 16777216]" also contains), so a `k > SS_CAP_MAX + 1`
+    // mutant that merely falls through to the ctor dies.
+    const capMsg = (e) => liteSketch(e) && /capacity cap 16777216/.test(e.message);
+    assert.throws(() => SpaceSaving.withError(1e-9), capMsg);                    // needs k > 2^24
+    assert.throws(() => SpaceSaving.withError(5e-324), capMsg);                  // Infinity k
+    assert.throws(() => SpaceSaving.withError(nextDown(2 ** -24)), capMsg);      // k === 2^24+1
+    assert.equal(SpaceSaving.withError(2 ** -24).capacity, 1 << 24);            // exact boundary accepted
 });
 
 test('size grows to capacity then stops; total tracks summed counts (incl. count>1 adds)', () => {
@@ -690,4 +708,102 @@ test('ADVERSARIAL: a key exactly at the safe-integer ceiling used as BOTH a posi
     assert.equal(s.estimate(big), 3);
     assert.equal(s.estimate(-big), 5);
     assert.equal(s.size, 2);
+});
+
+// ===========================================================================
+// H2.3 gates (F15 count cap + total ceiling, F20 no-user-code throwers)
+// ===========================================================================
+
+const SS_MAX_SAFE = 9007199254740991;   // 2^53 - 1
+// Fill the running total of a single monitored key to `target` via 2^32-1-capped adds.
+function fillTotal(s, key, target) {
+    const step = 4294967295;
+    const n = Math.floor(target / step);
+    for (let i = 0; i < n; i++) s.add(key, step);
+    const rem = target - n * step;
+    if (rem > 0) s.add(key, rem);
+    assert.equal(s.total, target, 'fillTotal target');
+}
+function ssSnap(s) {
+    return { size: s.size, total: s.total, key: Array.from(s._key), count: Array.from(s._count),
+             error: Array.from(s._error) };
+}
+function ssUnchanged(before, s, label) {
+    const a = ssSnap(s);
+    assert.equal(a.size, before.size, label + ': size');
+    assert.equal(a.total, before.total, label + ': total');
+    assert.deepEqual(a.key, before.key, label + ': _key');
+    assert.deepEqual(a.count, before.count, label + ': _count');
+    assert.deepEqual(a.error, before.error, label + ': _error');
+}
+
+test('G-F15 (SS): count cap 2^32-1 + running-total ceiling 2^53-1, byte-identical reject', () => {
+    const s = new SpaceSaving(8, { seed: 1 });
+    assert.doesNotThrow(() => s.add(5, 4294967295));
+    for (const bad of [2 ** 32, 1e308, SS_MAX_SAFE]) {
+        const before = ssSnap(s);
+        assert.throws(() => s.add(5, bad), (e) => liteSketch(e) && /\[1, 4294967295]/.test(e.message), 'count=' + bad);
+        ssUnchanged(before, s, 'count=' + bad);
+    }
+    // insert + bump: a capacity-3 sketch filled to 2^53-1 on key 1 (slots still free).
+    const a = new SpaceSaving(3, { seed: 1 });
+    fillTotal(a, 1, SS_MAX_SAFE);
+    for (const [fn, label] of [[() => a.add(1, 1), 'bump'], [() => a.add(2, 1), 'insert']]) {
+        const before = ssSnap(a);
+        assert.throws(fn, (e) => liteSketch(e) && /9007199254740991/.test(e.message), label);
+        ssUnchanged(before, a, label);
+    }
+    // evict: a capacity-1 sketch filled to 2^53-1 (full), a new key would evict.
+    const b = new SpaceSaving(1, { seed: 1 });
+    fillTotal(b, 1, SS_MAX_SAFE);
+    const beforeE = ssSnap(b);
+    assert.throws(() => b.add(99, 1), (e) => liteSketch(e) && /9007199254740991/.test(e.message), 'evict');
+    ssUnchanged(beforeE, b, 'evict');
+});
+
+test('G-F15 (SS): merge at total 2^53-6 rejects an other of 6, accepts an other of 5', () => {
+    const base = new SpaceSaving(4, { seed: 1 });
+    fillTotal(base, 1, SS_MAX_SAFE - 5);
+    const other6 = new SpaceSaving(4, { seed: 1 }); other6.add(2, 6);
+    const b6 = ssSnap(base);
+    assert.throws(() => base.merge(other6), (e) => liteSketch(e) && /9007199254740991/.test(e.message));
+    ssUnchanged(b6, base, 'merge total+1 reject');
+    const other5 = new SpaceSaving(4, { seed: 1 }); other5.add(2, 5);
+    assert.doesNotThrow(() => base.merge(other5));
+    assert.equal(base.total, SS_MAX_SAFE);
+});
+
+test('G-F20 (SS): a rejected arg never runs caller code (tagged, calls===0, byte-identical)', () => {
+    let calls = 0;
+    let sRef;
+    const H = () => ({ [Symbol.toPrimitive]() { calls++; if (sRef) sRef.add(1); return 1; },
+                       toString() { calls++; if (sRef) sRef.add(1); return 'x'; },
+                       valueOf() { calls++; if (sRef) sRef.add(1); return 1; } });
+    const hostile = () => [Object.create(null), { toString() { calls++; throw new Error('boom'); } }, H(),
+        Object.assign(function () {}, { toString() { calls++; return 'f'; } })];
+    for (const h of hostile()) assert.throws(() => new SpaceSaving(h), liteSketch);
+    for (const h of hostile()) assert.throws(() => new SpaceSaving(8, { seed: h }), liteSketch);
+    for (const h of hostile()) assert.throws(() => SpaceSaving.withError(h), liteSketch);
+    sRef = new SpaceSaving(8, { seed: 1 }); sRef.add(3);
+    for (const h of hostile()) { const b = ssSnap(sRef); assert.throws(() => sRef.add(h), liteSketch); ssUnchanged(b, sRef, 'add key'); }
+    for (const h of hostile()) { const b = ssSnap(sRef); assert.throws(() => sRef.add(3, h), liteSketch); ssUnchanged(b, sRef, 'add count'); }
+    assert.equal(calls, 0, 'no hostile toString/valueOf/toPrimitive ran');
+    let msg = '';
+    try { new SpaceSaving(Object.create(null)); } catch (e) { msg = e.message; }
+    assert.ok(/got \[object]$/.test(msg), 'null-proto message: ' + msg);
+});
+
+// QA H2.3 boundary gap: self-merge (this === other) at the total ceiling, and the _badTotal
+// message is a RangeError printing the current total and the rejected n.
+test('QA H2.3 (SS): self-merge at the total ceiling; _badTotal prints current total + n', () => {
+    const s = new SpaceSaving(4, { seed: 1 });
+    fillTotal(s, 1, 2 ** 52 - 1);
+    assert.equal(s.merge(s).total, 2 ** 53 - 2);
+    const b = ssSnap(s);
+    assert.throws(() => s.merge(s), (e) => e instanceof RangeError && liteSketch(e) &&
+        e.message.includes('current total ' + (2 ** 53 - 2) + ' + ' + (2 ** 53 - 2)));
+    ssUnchanged(b, s, 'self-merge total+1 reject');
+    assert.throws(() => s.add(1, 2), (e) => e instanceof RangeError &&
+        e.message.includes('current total ' + (2 ** 53 - 2) + ' + 2'));
+    ssUnchanged(b, s, 'add total+1 reject');
 });
