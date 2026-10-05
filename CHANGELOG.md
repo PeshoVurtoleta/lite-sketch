@@ -8,6 +8,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Option bags are validated by own-property, not by `in` against an `Object.prototype`-rooted set
+  (F18).** `CountMinSketch` / `DDSketch` / `SpaceSaving` tested `key in KNOWN_OPTS` where `KNOWN_OPTS`
+  inherited `Object.prototype`, so `{ toString: 1 }`, `{ constructor: 1 }`, `{ hasOwnProperty: 1 }`
+  and a JSON `{"__proto__": 1}` bag were all ACCEPTED, and a `Map` / `Date` / `/x/` passed as a bag.
+  Worse, option VALUES were read through the prototype chain: `new CountMinSketch(4, 64,
+  Object.create({ seed: 5 }))` picked up `seed: 5`, and `Object.create({ conservative: false })` /
+  `Object.create({ maxBins: 8 })` applied the same way. The ctor now classifies the argument as a
+  PLAIN bag (own string keys only, on a `null` prototype, THIS realm's `Object.prototype`, or another
+  root prototype carrying no own known key) and reads only own DATA descriptors, so no inherited value
+  is read and no getter (an own accessor) ever runs. The KNOWN set is a `null`-proto frozen object; the
+  rejection reuses HEAD's plain-object / `_badOption` / `_badRange` texts (byte-identical, same key
+  order). A revoked or throwing-trap `Proxy` -- previously an UNTAGGED engine `IsArray` / trap
+  `TypeError` -- is caught and re-thrown as the tagged plain-object `[lite-sketch]` TypeError (`range`
+  as the tagged `_badRange`).
+- **A `DDSketch` strict `range` is read exactly once per index (F18 TOCTOU).** The ctor validated
+  `range[0]` / `range[1]` inside the guarded `try` but then RE-READ them outside it to store
+  `rangeMin` / `rangeMax`, so a two-faced index getter (returns `1` then `'pwned'`) stored a value it
+  never validated, and a getter that threw on the second read escaped untagged. The ctor now keeps the
+  validated locals and never re-reads the indices.
+- **`SpaceSaving.forEach` no longer visits ghosts under mutation (F18).** The loop bound was hoisted
+  (`const n = this._size`), so mutating the sketch inside the callback walked stale slots: `clear()`
+  in the first callback visited all 5 original entries (4 ghosts), and a mid-walk `merge` revisited a
+  key. The bound is now the LIVE `this._size` -- `clear()` in the first callback now visits exactly 1
+  entry. (Mutating inside `forEach` is still unsupported and documented so: no ghosts, but entries may
+  be skipped or revisited.)
+- **`-0` no longer leaks out of a query (F18).** After `SpaceSaving.add(-0)`, `topK()[0].key`, the
+  `forEach` key and `heavyHitters(0)[0].key` all read `-0` (distinguishable by `Object.is`); after
+  `DDSketch.add(-0)`, `min` and `max` read `-0`. All six outputs (plus the new `topKInto`) now
+  normalize to `+0` with a `+ 0` at the OUTPUT (`SpaceSaving` `forEach` / `topK` / `heavyHitters` /
+  `topKInto`, the `DDSketch` `min` / `max` getters); storage is untouched, so no hot byte changes.
+- **`merge` is brand-checked, so a forged `other` can no longer slip past `instanceof` (F21).** Every
+  `merge` tested `other instanceof X`, which a forgery passes: a FIELD-COPY (`Object.assign(
+  Object.create(X.prototype), real)`) and a `new Proxy(real, {})` both merged silently in all four
+  members, and a `DDSketch` forgery carrying only `_gamma` merged and left `count` / `sum` = NaN.
+  Each `merge` (and `_badMerge`) now tests a class-private `#brand` (`typeof other === 'object' &&
+  other !== null && #brand in other`), the FIRST statement before any read of `other` -- `#brand in o`
+  runs no user code and is `false` for a `Proxy` (private names are not forwarded) and for a field
+  copy. A forgery now throws the tagged `[lite-sketch]` TypeError (was a `RangeError`, or -- for a
+  `DDSketch` `_gamma`-only forgery -- a silent NaN merge), as a byte-identical no-op. Subclasses still
+  merge (`super()` installs the brand). The H2.3 RISK (a forged `other` running caller code through
+  the merge total guards) is closed: the brand precedes every read.
 - **`add` no longer boxes a non-Smi key or count inside the library, and the F2 murmur hand-inline is
   complete (F5 + F2).** `HyperLogLog` / `CountMinSketch` / `SpaceSaving` `add` is now a typeof-only
   wrapper that stages its arguments in a per-instance `Float64Array` scratch and defers to a shared
@@ -134,6 +175,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`SpaceSaving.topKInto(outKeys, outCounts, outErrors, n?)` -- a 0-alloc top-N render (F7).**
+  Writes the top-`n` monitored entries best-first into three caller-owned `Float64Array`s in EXACTLY
+  `topK(n)`'s order (count DESCENDING, ties by ASCENDING slot), via an in-place bounded min-heap of
+  slot ids and an in-place heapsort -- allocation-free where `topK(n)` allocates ~160 B/entry. `n`
+  follows `topK`'s rule (a non-integer / negative `n` is treated as `size`, never throws); the count
+  written `w = min(n, size, the three lengths)` is returned; a too-short out receives its own length;
+  each key is normalized (a stored -0 reads +0). An out that is not a `Float64Array`, two of the
+  three overlapping in memory, or two backed by DIFFERENT `SharedArrayBuffer` objects (aliasing
+  cannot be verified), throws a tagged `[lite-sketch]` TypeError BEFORE any write (a wrong
+  array type would silently truncate a key `>= 2^32`); disjoint views over one buffer are allowed.
+  Monomorphic, no boxing: the `ni/ss.topKInto.n16|n64/big` lanes read **0** young-gen scavenges over
+  1.6M entries (N8 gate `<= 2`). The lite-hud M3 render (keys `>= 2^32`, counts past `2^31`).
+- **`DDSketch.quantilesInto(qs, out)` -- a 0-alloc multi-quantile render (F8).** Estimates several
+  quantiles at once: for each `j`, `out[j]` receives `quantile(qs[j])` BIT-FOR-BIT (quantile's walk is
+  duplicated per `q`, so no double crosses a call boundary), and the count written
+  `min(qs.length, out.length)` is returned. A bad `q` value (NaN / outside `[0, 1]` / empty sketch)
+  writes NaN and NEVER throws, exactly like `quantile`; in-place `qs === out` is allowed (each index
+  is read before it is written). A `qs` / `out` that is not a `Float64Array`, two distinct views
+  that PARTIALLY overlap, or two backed by DIFFERENT `SharedArrayBuffer` objects (aliasing cannot be
+  verified), throws a tagged `[lite-sketch]` TypeError BEFORE any write. The
+  `ni/dd.quantilesInto.q4` lane reads **0** scavenges over 1.6M quantiles (N8 gate `<= 2`), against
+  the `Q-CTRL[ni/dd.quantile]` control of 24 (one 16 B return box per `quantile` call). The 0-alloc
+  p50/p90/p99/p999 render M2 (`Hud.js`) needed.
 - **The zero-box `addFrom` / `addHashedFrom` family (F5, F6)** -- five new methods:
   `HyperLogLog.addFrom(buf, i)` / `addHashedFrom(buf, i)`, `CountMinSketch.addFrom(buf, i)` /
   `addHashedFrom(buf, i)`, and `SpaceSaving.addFrom(buf, i)`. Each reads the key (and count, or the
@@ -165,6 +229,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **An option bag built on a custom prototype is now rejected (F18).** `CountMinSketch` / `DDSketch`
+  / `SpaceSaving` previously accepted ANY object as the options bag and read its keys through the
+  prototype chain; they now require a PLAIN bag (own string keys, on a `null` prototype, THIS realm's
+  `Object.prototype`, or another root prototype that carries NO own known key). A `Map` / `Date` /
+  `RegExp` / array / class instance / `Object.create(proto)` (including `Object.create(defaults)`), an
+  object with an own ACCESSOR, or an object with an own Symbol key is now rejected with the plain-object
+  `[lite-sketch]` TypeError. A bag whose prototype is a null-proto object carrying a known key (e.g.
+  `Object.create({ __proto__: null, seed: 5 })`), or a cross-realm `Object.prototype` polluted with a
+  known key, is also rejected -- the inherited value would be silently dropped, so it fails closed. (A
+  polluted THIS-realm `Object.prototype` is still ignored: a literal `{}` bag yields the default.) (No
+  suite consumer passes a custom-prototype bag; every in-repo call site passes a literal.)
+- **A `Proxy`-wrapped instance is now rejected by `merge`.** `new Proxy(realSketch, {})` passed
+  `instanceof` and merged on all four members; the `#brand` check returns `false` for it (private
+  names are not forwarded through a `Proxy`), so it now throws the tagged `[lite-sketch]` TypeError.
+- **A bare prototype forgery passed to `merge` now throws the `TypeError`, not the `RangeError`.** A
+  `Object.create(X.prototype)` used to reach the shape-mismatch `RangeError` (m / d,w,seed / gamma /
+  capacity); the brand check rejects it first, so it now throws the brand `TypeError` ("expects a
+  <Member>"). Existing tests that used a bare forgery to reach the `RangeError` were rewritten to a
+  real mismatched instance.
+- **A query no longer returns `-0` (F18).** `SpaceSaving` `forEach` / `topK` / `heavyHitters` /
+  `topKInto` keys and `DDSketch` `min` / `max` now read `+0` for a stored `-0` (`Object.is` can no
+  longer tell them apart); storage is unchanged.
+- **`SpaceSaving.forEach` under mutation no longer visits ghosts.** The loop bound is the live
+  `size`, not a hoisted snapshot, so a sketch cleared / merged inside the callback no longer walks
+  stale slots (mutating inside `forEach` remains unsupported; entries may be skipped or revisited).
 - **`HyperLogLog.add` costs about +1.5 ns/op.** It is now a typeof wrapper over `_addAt`, so it makes
   one real (non-inlined) call where the 1.1.2 body ran the mix + register update inline (~4.7-6.7 ->
   ~6.2-7.3 ns/op at load ~6). Zero-GC on a full-range key is worth the nanosecond, and

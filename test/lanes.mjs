@@ -373,6 +373,63 @@ minGate('AH-CTRL[noop/ni]', (mn) => mn >= 12);
 for (const kc of ['small', 'b31']) minGate('N1e[df/cmsest.c31/' + kc + ']', (mn) => mn <= 2);
 for (const kc of ['b31', 'n31', 'safe']) minGate('N3c[cap120/cms.cmax/' + kc + ']', (mn) => mn <= 2);
 
+// ---- N8 (H2.7, F7/F8): the cold-read query zero-box lanes. Each gate min-of-3, every rep ----
+// printed. A new `query` laneType in lane.mjs; 1.6M units/lane. topKInto / quantilesInto are
+// ABSENT on HEAD (--lib revert-check FAILs exactly these 6 as ABSENT); forEach / quantile exist,
+// so both CTRLs stay live. ~30 children (+5-8 s at N3_JOBS=4).
+function queryJob(job) {
+    const flags = [...BASE, ...(job.mode === 'ni' ? NOINL : [])];
+    const extra = job.n != null ? ['--n', String(job.n)] : [];
+    const args = [...flags, LANE, 'query', job.qkind, ...extra, ...LIBFLAGS];
+    return new Promise((resolve, reject) => {
+        execFile(process.execPath, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+            if (err) return reject(new Error('query ' + job.key + ': ' + err.message));
+            const obj = JSON.parse(stdout.trim().split('\n').pop());
+            if (obj && obj.absent) return resolve(ABSENT);
+            const v = obj.scav;
+            if (!Number.isInteger(v) || v < 0) return reject(new Error('query ' + job.key + ' returned ' + v));
+            resolve(v);
+        });
+    });
+}
+const N8_SPECS = [];
+const push8 = (job) => { for (let r = 0; r < 3; r++) N8_SPECS.push(Object.assign({}, job)); };
+for (const mode of ['df', 'ni']) {
+    for (const n of [16, 64]) {
+        push8({ qkind: 'ss.topKInto.big', n, mode, key: 'N8[' + mode + '/ss.topKInto.n' + n + '/big]' });
+    }
+    push8({ qkind: 'dd.quantilesInto.q4', mode, key: 'N8[' + mode + '/dd.quantilesInto.q4]' });
+    push8({ qkind: 'ss.forEach.small', mode, key: 'N8[' + mode + '/ss.forEach/small]' });
+}
+push8({ qkind: 'dd.quantile', mode: 'ni', key: 'Q-CTRL[ni/dd.quantile]' });
+push8({ qkind: 'ss.forEach.big', mode: 'ni', key: 'FE-CTRL[ni/ss.forEach/big]' });
+
+const r8 = {};
+{
+    let next8 = 0;
+    const worker8 = async () => {
+        while (next8 < N8_SPECS.length) {
+            const job = N8_SPECS[next8++];
+            const v = await queryJob(job);
+            (r8[job.key] || (r8[job.key] = [])).push(v);
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(N3_JOBS, N8_SPECS.length) }, worker8));
+}
+function n8Gate(key, ok) {
+    const all = r8[key] || [];
+    if (all.includes(ABSENT)) { gate(key, ABSENT, false); return; }
+    const mn = Math.min(...all);
+    gate(key, 'min=' + mn + '[' + all.join(',') + ']', ok(mn));
+}
+for (const mode of ['df', 'ni']) {
+    for (const n of [16, 64]) n8Gate('N8[' + mode + '/ss.topKInto.n' + n + '/big]', (mn) => mn <= 2);
+    n8Gate('N8[' + mode + '/dd.quantilesInto.q4]', (mn) => mn <= 2);
+    n8Gate('N8[' + mode + '/ss.forEach/small]', (mn) => mn <= 2);
+}
+n8Gate('Q-CTRL[ni/dd.quantile]', (mn) => mn >= 12);
+n8Gate('FE-CTRL[ni/ss.forEach/big]', (mn) => mn >= 12);
+
 const ok = fails === 0;
 console.log('GATE lanes' + (libArg ? ' (lib=' + libArg + ')' : '') + ': ' + results.join(' ') +
     ' | ' + (ok ? 'ok' : 'FAIL (' + fails + ')'));

@@ -27,6 +27,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { SpaceSaving, mix64, hashHi, VERSION } from '../Sketch.js';
 
 void VERSION; // VERSION-pin is asserted once, centrally, by the other suites; not duplicated here.
@@ -636,7 +637,10 @@ test('dispose-during-iteration: clear() called mid-forEach leaves no partial sta
             if (seen === 3) ss.clear(); // reset mid-iteration
         });
     });
-    assert.equal(seen, 8, 'forEach iterates the size captured at call start, not re-checked per-step');
+    // H2.7 (F18): forEach now reads the LIVE `this._size` each step. clear() at seen===3 sets
+    // _size=0, so the loop stops after the 3rd entry (no ghosts; entries may be skipped). The
+    // old code hoisted `n = this._size` and visited all 8 (4 of them stale ghosts).
+    assert.equal(seen, 3, 'forEach reads the LIVE this._size: a mid-walk clear() truncates the loop, no ghosts');
     assert.equal(s.size, 0);
     assert.equal(s.total, 0);
     for (let i = 0; i < 8; i++) assert.equal(s.estimate(i), 0);
@@ -1513,4 +1517,544 @@ test('H2.6 (SS, D1 re-entry): a Proxy that re-enters add() while slot i+1 is rea
     b.addFrom(px, 0);
     h26Watch(b, 'reentry addFrom');   // per-op _mapOcc watchdog
     assert.deepEqual([b.estimate(111), b.estimate(999), b.total], [5, 2, 7]);
+});
+
+// ===========================================================================
+// H2.7 G-F21 (merge brand), G-F18o (option bags, D2), G-F18f (forEach live bound), G-F18z (-0
+// outputs), G-F7 (topKInto). The brand is a class-private #brand installed by the ctor; the
+// predicate is the FIRST statement of merge / _badMerge, before any read of `other`. The bag rule
+// accepts only a root-prototype (any realm) or null-proto object with own DATA keys from the KNOWN
+// set; a polluted Object.prototype is ignored. topKInto's order is EXACTLY topK(n)'s (count DESC,
+// ties by ascending slot). See headrun/ in the scratchpad for the HEAD-failure evidence.
+// ===========================================================================
+
+function ssCountingProxy(real, counter) {
+    return new Proxy(real, {
+        get(t, k, r) { counter.n++; return Reflect.get(t, k, r); },
+        has(t, k) { counter.n++; return Reflect.has(t, k); },
+        getPrototypeOf(t) { counter.n++; return Reflect.getPrototypeOf(t); },
+    });
+}
+
+test('G-F21 (SS): merge rejects a field-copy forgery + a Proxy over a real instance, TAGGED, 0 traps', () => {
+    const base = new SpaceSaving(64, { seed: 7 });
+    for (let i = 0; i < 500; i++) base.add(i % 97, 1 + (i % 3));
+    const real = new SpaceSaving(64, { seed: 7 });
+    for (let i = 0; i < 500; i++) real.add(i % 89, 2);
+    const snap = ssSnap(base);
+
+    const forged = Object.assign(Object.create(SpaceSaving.prototype), real);
+    assert.ok(forged instanceof SpaceSaving, 'the forgery passes instanceof');
+    assert.throws(() => base.merge(forged), (e) => e instanceof TypeError && liteSketch(e), 'field-copy forgery');
+    ssUnchanged(snap, base, 'field-copy reject');
+
+    const counter = { n: 0 };
+    const px = ssCountingProxy(real, counter);
+    assert.ok(px instanceof SpaceSaving);
+    counter.n = 0;
+    assert.throws(() => base.merge(px), (e) => e instanceof TypeError && liteSketch(e), 'Proxy merge');
+    assert.equal(counter.n, 0, 'the brand check ran NO proxy trap');
+    ssUnchanged(snap, base, 'Proxy reject');
+});
+
+test('G-F21 (SS): merge(primitive / null / undefined) throws TAGGED; a subclass merges', () => {
+    const base = new SpaceSaving(64, { seed: 7 });
+    base.add(1, 1);
+    const snap = ssSnap(base);
+    for (const o of [5, 0, 'x', true, Symbol('s'), null, undefined, NaN]) {
+        assert.throws(() => base.merge(o), liteSketch, 'merge(' + String(o) + ')');
+    }
+    ssUnchanged(snap, base, 'primitive / null rejects');
+    class SubSS extends SpaceSaving {}
+    const sub = new SubSS(64, { seed: 7 });
+    for (let i = 0; i < 100; i++) sub.add(i + 7, 1);
+    assert.doesNotThrow(() => base.merge(sub), 'a subclass carries the brand and merges');
+});
+
+test('G-F18o (SS): unknown-key bags throw _badOption; non-bags throw the plain-object TypeError (ctor + withError)', () => {
+    const badOpt = (e) => e instanceof TypeError && /unknown option/.test(e.message) && liteSketch(e);
+    const plain = (e) => e instanceof TypeError && /must be a plain object/.test(e.message) && liteSketch(e);
+    for (const make of [(bag) => new SpaceSaving(8, bag), (bag) => SpaceSaving.withError(0.1, bag)]) {
+        for (const bag of [{ toString: 1 }, { constructor: 1 }, { hasOwnProperty: 1 }, JSON.parse('{"__proto__":1}'), { [Symbol('x')]: 1 }]) {
+            assert.throws(() => make(bag), badOpt, 'unknown-key bag');
+        }
+        let accCalls = 0;
+        const accessorBag = {};
+        Object.defineProperty(accessorBag, 'seed', { enumerable: true, configurable: true, get() { accCalls++; return 5; } });
+        const { proxy, revoke } = Proxy.revocable({ seed: 5 }, {});
+        revoke();
+        const nonbags = [new Map(), new Date(), /x/, [], new (class {})(), Object.create({ seed: 5 }),
+            accessorBag, proxy, new Proxy({}, { getPrototypeOf() { throw new Error('boom'); } })];
+        for (const bag of nonbags) assert.throws(() => make(bag), plain, 'non-bag');
+        assert.equal(accCalls, 0, 'an accessor bag never runs its getter');
+    }
+});
+
+test('G-F18o (SS): accepts literal / null-proto / cross-realm / non-enumerable bags; polluted Object.prototype is ignored', () => {
+    const DEF = new SpaceSaving(8).seed;
+    const neBag = {};
+    Object.defineProperty(neBag, 'seed', { value: 7, enumerable: false });
+    for (const bag of [{ seed: 7 }, { __proto__: null, seed: 7 }, runInNewContext('({ seed: 7 })'), neBag]) {
+        assert.equal(new SpaceSaving(8, bag).seed, 7 >>> 0, 'bag seed applied');
+    }
+    assert.doesNotThrow(() => new SpaceSaving(8, Object.create(null)), 'Object.create(null) is a legal empty bag');
+    const orig = Object.getOwnPropertyDescriptor(Object.prototype, 'seed');
+    try {
+        Object.prototype.seed = 999;
+        assert.equal(new SpaceSaving(8, {}).seed, DEF, 'polluted seed ignored for {}');
+        assert.equal(new SpaceSaving(8).seed, DEF, 'polluted seed ignored for no-options');
+    } finally {
+        if (orig) Object.defineProperty(Object.prototype, 'seed', orig); else delete Object.prototype.seed;
+    }
+});
+
+test('G-F18f (SS): clear() in the FIRST forEach callback visits exactly 1 entry (live this._size bound)', () => {
+    const s = new SpaceSaving(8, { seed: 1 });
+    for (let i = 0; i < 8; i++) s.add(i, 1);
+    let seen = 0;
+    s.forEach((k, c, e, ss) => { seen++; if (seen === 1) ss.clear(); });
+    assert.equal(seen, 1, 'the live bound truncates the walk right after clear() (HEAD hoisted n=8 -> 5 ghosts)');
+    assert.equal(s.size, 0);
+});
+
+test('G-F18z (SS): add(-0) reads +0 from forEach / topK / heavyHitters / topKInto', () => {
+    const s = new SpaceSaving(4);
+    s.add(-0, 3);
+    let feKey;
+    s.forEach((k) => { feKey = k; });
+    assert.ok(Object.is(feKey, 0), 'forEach key is +0');
+    assert.ok(Object.is(s.topK(1)[0].key, 0), 'topK key is +0');
+    assert.ok(Object.is(s.heavyHitters(0)[0].key, 0), 'heavyHitters key is +0');
+    const ok = new Float64Array(1), oc = new Float64Array(1), oe = new Float64Array(1);
+    s.topKInto(ok, oc, oe, 1);
+    assert.ok(Object.is(ok[0], 0), 'topKInto key is +0');
+});
+
+test('G-F7 (SS): topKInto matches topK(n) exactly (count DESC, ties by slot) over caps x streams x n', () => {
+    const streams = {
+        zipf: (s, cap) => { for (let i = 0; i < cap * 20; i++) { const k = Math.floor(cap / (1 + (i % cap))); s.add(k, 1); } },
+        equal: (s, cap) => { for (let r = 0; r < 3; r++) for (let i = 0; i < cap; i++) s.add(i, 1); },   // all-equal counts: pure tie-break
+        evict: (s, cap) => { for (let i = 0; i < cap * 5; i++) s.add(i, 1 + (i % 7)); },                 // forces eviction + errors
+    };
+    for (const cap of [1, 7, 64, 1000]) {
+        for (const [name, fill] of Object.entries(streams)) {
+            const s = new SpaceSaving(cap, { seed: 3 });
+            fill(s, cap);
+            const size = s.size;
+            for (const n of [0, 1, 3, size - 1, size, size + 5, undefined, -1, 2.5]) {
+                const expected = s.topK(n);   // the oracle
+                const len = Math.max(size, 8);
+                const kA = new Float64Array(len), cA = new Float64Array(len), eA = new Float64Array(len);
+                const w = s.topKInto(kA, cA, eA, n);
+                const tag = cap + '/' + name + '/n=' + String(n);
+                assert.equal(w, expected.length, tag + ': w == topK(n).length');
+                for (let j = 0; j < w; j++) {
+                    assert.ok(Object.is(kA[j], expected[j].key), tag + ': key[' + j + ']');
+                    assert.ok(Object.is(cA[j], expected[j].count), tag + ': count[' + j + ']');
+                    assert.ok(Object.is(eA[j], expected[j].error), tag + ': error[' + j + ']');
+                }
+            }
+        }
+    }
+});
+
+test('G-F7 (SS): topKInto writes w = min(n, size, lengths) into short outs', () => {
+    const s = new SpaceSaving(64, { seed: 3 });
+    for (let i = 0; i < 64; i++) s.add(i, 100 - i);
+    // short outs: w clamps to the shortest out length
+    const k = new Float64Array(5), c = new Float64Array(5), e = new Float64Array(5);
+    assert.equal(s.topKInto(k, c, e, 64), 5, 'w clamps to the shortest out (5)');
+    const top = s.topK(5);
+    for (let j = 0; j < 5; j++) assert.ok(Object.is(k[j], top[j].key) && Object.is(c[j], top[j].count));
+    // unequal lengths: min wins
+    const k2 = new Float64Array(10), c2 = new Float64Array(3), e2 = new Float64Array(7);
+    assert.equal(s.topKInto(k2, c2, e2, 64), 3, 'w = min(10, 3, 7)');
+});
+
+test('G-F7 (SS): topKInto rejects non-Float64Array / overlap TAGGED before any write; disjoint views + subclass ok', () => {
+    const badOut = (e) => e instanceof TypeError && /needs three non-overlapping Float64Arrays/.test(e.message) && liteSketch(e);
+    const s = new SpaceSaving(8, { seed: 3 });
+    for (let i = 0; i < 8; i++) s.add(i, 10 - i);
+    const before = ssSnap(s);
+    const fresh = () => new Float64Array(8);
+
+    for (const bad of [new Float32Array(8), new Int32Array(8), new Array(8).fill(0), [1, 2], null, undefined, { length: 8 }]) {
+        const a = fresh(), b = fresh();
+        assert.throws(() => s.topKInto(bad, a, b, 8), badOut, 'bad outKeys');
+        assert.throws(() => s.topKInto(a, bad, b, 8), badOut, 'bad outCounts');
+        assert.throws(() => s.topKInto(a, b, bad, 8), badOut, 'bad outErrors');
+        assert.ok(a.every((x) => x === 0) && b.every((x) => x === 0), 'no write before the throw');
+    }
+
+    // A Proxy over a real Float64Array: the cached %TypedArray% tag getter returns undefined for a
+    // Proxy -> -1 -> reject, running 0 traps.
+    const counter = { n: 0 };
+    const pf = new Proxy(fresh(), {
+        get(t, k, r) { counter.n++; return Reflect.get(t, k, r); },
+        getPrototypeOf(t) { counter.n++; return Reflect.getPrototypeOf(t); },
+    });
+    assert.throws(() => s.topKInto(pf, fresh(), fresh(), 8), badOut, 'Proxy(F64) outKeys');
+    assert.equal(counter.n, 0, 'the tag-getter check runs no proxy trap');
+
+    // Aliased + overlapping views over one buffer.
+    const buf = new ArrayBuffer(8 * 8);
+    const v1 = new Float64Array(buf, 0, 4), v2 = new Float64Array(buf, 0, 4);        // aliased
+    assert.throws(() => s.topKInto(v1, v2, fresh(), 4), badOut, 'aliased views');
+    const vA = new Float64Array(buf, 0, 4), vB = new Float64Array(buf, 2 * 8, 4);     // partial overlap
+    assert.throws(() => s.topKInto(vA, vB, fresh(), 4), badOut, 'overlapping views');
+
+    // Disjoint views over one buffer: accepted.
+    const buf2 = new ArrayBuffer(3 * 4 * 8);
+    const d1 = new Float64Array(buf2, 0, 4), d2 = new Float64Array(buf2, 4 * 8, 4), d3 = new Float64Array(buf2, 8 * 8, 4);
+    assert.doesNotThrow(() => s.topKInto(d1, d2, d3, 4), 'disjoint views over one buffer');
+
+    // A Float64Array subclass with a length getter: the cached %TypedArray% length getter bypasses
+    // the override, so it is accepted and the override is never consulted.
+    let lenCalls = 0;
+    class F64Sub extends Float64Array { get length() { lenCalls++; return 999; } }
+    assert.doesNotThrow(() => s.topKInto(new F64Sub(8), fresh(), fresh(), 8), 'F64 subclass accepted');
+    assert.equal(lenCalls, 0, 'the subclass length override is never consulted');
+
+    ssUnchanged(before, s, 'every topKInto reject is a byte-identical no-op');
+});
+
+test('G-F18o (SS): a polluted Object.prototype.value cannot smuggle an accessor bag (own-value check)', () => {
+    // A descriptor's data-vs-accessor test must read its OWN `value`, not the prototype chain:
+    // with `Object.prototype.value` present, a plain `'value' in d` is true for an ACCESSOR
+    // descriptor too, so an accessor bag would read (data pollution) or RUN (getter pollution) the
+    // inherited value. _hasOwn(d, 'value') is own-only -> the accessor bag stays a non-bag.
+    const plain = (e) => e instanceof TypeError && /must be a plain object/.test(e.message) && liteSketch(e);
+    const DEF = new SpaceSaving(8).seed;
+    let getterCalls = 0;
+    const orig = Object.getOwnPropertyDescriptor(Object.prototype, 'value');
+    try {
+        Object.prototype.value = 5;                       // (a) DATA pollution
+        assert.throws(() => new SpaceSaving(8, { get seed() { getterCalls++; return 9; } }), plain,
+            'accessor bag rejected with Object.prototype.value = 5 (pre-fix: accepted, seed 5)');
+        delete Object.prototype.value;
+        Object.defineProperty(Object.prototype, 'value', { configurable: true, get() { getterCalls++; return 3; } });   // (b) GETTER pollution
+        assert.throws(() => new SpaceSaving(8, { get seed() { getterCalls++; return 9; } }), plain,
+            'accessor bag rejected with an Object.prototype.value getter (pre-fix: ran user code)');
+    } finally {
+        if (orig) Object.defineProperty(Object.prototype, 'value', orig); else delete Object.prototype.value;
+    }
+    assert.equal(getterCalls, 0, 'neither the bag accessor nor the polluted-proto getter ever runs');
+    assert.equal(new SpaceSaving(8).seed, DEF, 'default seed intact after cleanup');
+});
+
+test('G-F7 (SS): topKInto fails closed on SharedArrayBuffer aliasing (distinct SAB objects)', () => {
+    if (typeof SharedArrayBuffer !== 'function') return;   // host without SAB
+    const badOut = (e) => e instanceof TypeError && /needs three non-overlapping Float64Arrays/.test(e.message) && liteSketch(e);
+    const s = new SpaceSaving(16, { seed: 3 });
+    for (let i = 0; i < 16; i++) for (let j = 0; j <= i; j++) s.add(1000 + i);
+    const before = ssSnap(s);
+    // Two DISTINCT SAB objects that alias the SAME memory (structuredClone) cannot be verified -> reject.
+    let clone;
+    try { clone = structuredClone(new SharedArrayBuffer(8 * 16)); } catch { clone = null; }
+    if (clone !== null) {
+        const sab = new SharedArrayBuffer(8 * 16);
+        let cl; try { cl = structuredClone(sab); } catch { cl = null; }
+        if (cl !== null && cl !== sab) {
+            const a = new Float64Array(sab, 0, 8), b = new Float64Array(cl, 8, 8), c = new Float64Array(8);
+            const bBefore = Array.from(b);
+            assert.throws(() => s.topKInto(a, b, c, 8), badOut, 'cross-SAB alias rejected (fail closed)');
+            assert.deepEqual(Array.from(b), bBefore, 'no write before the SAB-alias throw');
+        }
+    }
+    // Two distinct, NON-aliased SABs are also rejected -- the documented fail-closed cost.
+    assert.throws(() => s.topKInto(
+        new Float64Array(new SharedArrayBuffer(8 * 8), 0, 8),
+        new Float64Array(new SharedArrayBuffer(8 * 8), 0, 8),
+        new Float64Array(new SharedArrayBuffer(8 * 8), 0, 8), 8), badOut, 'distinct non-aliased SABs rejected');
+    // Disjoint views on ONE SAB object are accepted (the same-object offset logic still applies).
+    const one = new SharedArrayBuffer(8 * 24);
+    assert.doesNotThrow(() => s.topKInto(
+        new Float64Array(one, 0, 8), new Float64Array(one, 8 * 8, 8), new Float64Array(one, 8 * 16, 8), 8),
+        'disjoint views on one SAB accepted');
+    // One SAB-backed out + plain-ArrayBuffer outs: distinct objects, not both SAB -> no clash.
+    assert.doesNotThrow(() => s.topKInto(
+        new Float64Array(new SharedArrayBuffer(8 * 8), 0, 8), new Float64Array(8), new Float64Array(8), 8),
+        'one SAB out + plain outs accepted');
+    ssUnchanged(before, s, 'every SAB reject is a byte-identical no-op');
+});
+
+// ===========================================================================
+// H2.7 qa boundary suite -- topKInto / forEach / option bags / merge brand edges
+// (adversarial cases beyond the G-F7 / G-F18 / G-F21 gates above)
+// ===========================================================================
+
+const qaBadOut = (e) => e instanceof TypeError && /needs three non-overlapping Float64Arrays/.test(e.message) && liteSketch(e);
+const qaPlain = (e) => e instanceof TypeError && /SpaceSaving options must be a plain object/.test(e.message) && liteSketch(e);
+const qaBadOpt = (e) => e instanceof TypeError && /SpaceSaving unknown option/.test(e.message) && liteSketch(e);
+function qaFixture() {
+    const s = new SpaceSaving(8);
+    for (const [k, c] of [[5, 3], [6, 3], [2 ** 40, 9], [-0, 1], [9, 3], [2 ** 53 - 1, 2 ** 31 + 7]]) s.add(k, c);
+    return s;
+}
+// Compare topKInto's first w entries to topK(n) with Object.is, and the tail to a sentinel.
+function qaMatchTopK(s, n, len, label) {
+    const a = new Float64Array(len).fill(-7), b = new Float64Array(len).fill(-7), c = new Float64Array(len).fill(-7);
+    const w = s.topKInto(a, b, c, n);
+    const ref = s.topK(n);
+    const want = Math.min(ref.length, len);
+    assert.ok(Object.is(w, want), label + ': w=' + String(w) + ' want ' + want);
+    for (let j = 0; j < want; j++) {
+        assert.ok(Object.is(a[j], ref[j].key), label + ': key[' + j + ']');
+        assert.ok(Object.is(b[j], ref[j].count), label + ': count[' + j + ']');
+        assert.ok(Object.is(c[j], ref[j].error), label + ': error[' + j + ']');
+    }
+    for (let j = want; j < len; j++) {
+        assert.ok(a[j] === -7 && b[j] === -7 && c[j] === -7, label + ': wrote past w at ' + j);
+    }
+}
+
+test('QA H2.7 (SS): topKInto n matrix -- NaN / +-Infinity / -0 / 2^31 / 2^53 / MAX_VALUE / non-numbers follow topK(n), w is a +0 Smi', () => {
+    const s = qaFixture();
+    const size = s.size;
+    const ns = [NaN, Infinity, -Infinity, -0, 0, 1, size - 1, size, size + 1, 2.5, -1, 2 ** 31, 2 ** 31 - 1,
+        2 ** 32, 2 ** 53, 2 ** 53 + 2, 1e308, Number.MAX_VALUE, Number.MIN_VALUE, Number.EPSILON,
+        '3', 3n, new Number(3), true, null, undefined, {}, [3]];
+    for (const n of ns) {
+        const label = 'n=' + (typeof n === 'bigint' ? '3n' : Object.is(n, -0) ? '-0' : String(n));
+        qaMatchTopK(s, n, 8, label);
+        qaMatchTopK(s, n, 2, label + ' short');
+    }
+    const z = new Float64Array(8);
+    assert.ok(Object.is(s.topKInto(z, new Float64Array(8), new Float64Array(8), -0), 0), 'n = -0 returns +0, not -0');
+});
+
+test('QA H2.7 (SS): topKInto at capacity 1 -- size 0 writes nothing; one big entry (key 2^40, count 2^32-5) round-trips exactly', () => {
+    const s = new SpaceSaving(1);
+    const a = new Float64Array([11]), b = new Float64Array([12]), c = new Float64Array([13]);
+    assert.ok(Object.is(s.topKInto(a, b, c), 0), 'size 0 -> 0');
+    assert.deepEqual([a[0], b[0], c[0]], [11, 12, 13], 'size 0 writes nothing');
+    s.add(2 ** 40, 2 ** 32 - 5);
+    assert.equal(s.topKInto(a, b, c), 1);
+    assert.deepEqual([a[0], b[0], c[0]], [2 ** 40, 2 ** 32 - 5, 0]);
+    s.add(7, 1);   // evicts: 7 inherits min (2^32-5) as error, count 2^32-4
+    assert.equal(s.topKInto(a, b, c, 1), 1);
+    assert.deepEqual([a[0], b[0], c[0]], [7, 2 ** 32 - 4, 2 ** 32 - 5]);
+    assert.ok(Object.is(s.topKInto(a, b, c, 0), 0), 'n = 0 -> 0');
+});
+
+test('QA H2.7 (SS): topKInto zero-length outs -- separate buffers return 0; two empty views at ONE offset of one buffer reject (conservative)', () => {
+    const s = qaFixture();
+    const before = ssSnap(s);
+    assert.ok(Object.is(s.topKInto(new Float64Array(0), new Float64Array(0), new Float64Array(0)), 0));
+    const k = new Float64Array([1, 2]);
+    assert.ok(Object.is(s.topKInto(k, new Float64Array(0), new Float64Array(2)), 0), 'one empty out caps w at 0');
+    assert.deepEqual(Array.from(k), [1, 2], 'w = 0 writes nothing (not even the slot-id scratch)');
+    const buf = new ArrayBuffer(64);
+    assert.throws(() => s.topKInto(new Float64Array(buf, 8, 0), new Float64Array(buf, 8, 0), new Float64Array(2)), qaBadOut,
+        'equal offsets on one buffer are a clash even at length 0');
+    assert.ok(Object.is(s.topKInto(new Float64Array(buf, 8, 0), new Float64Array(buf, 16, 0), new Float64Array(2)), 0),
+        'empty views at different offsets never intersect');
+    ssUnchanged(before, s, 'zero-length outs');
+});
+
+test('QA H2.7 (SS): topKInto same array passed twice (every position pair) rejects TAGGED, outs + sketch unchanged', () => {
+    const s = qaFixture();
+    const before = ssSnap(s);
+    const a = new Float64Array([1, 2, 3, 4, 5, 6, 7, 8]), b = new Float64Array(8).fill(9);
+    const keep = () => [Array.from(a), Array.from(b)];
+    const k0 = keep();
+    for (const [x, y, z] of [[a, a, b], [a, b, a], [b, a, a], [a, a, a]]) {
+        assert.throws(() => s.topKInto(x, y, z, 3), qaBadOut);
+        assert.deepEqual(keep(), k0, 'outs untouched on reject');
+    }
+    // A subarray covering the SAME bytes at the same offset is the same memory: rejected.
+    assert.throws(() => s.topKInto(a, a.subarray(0), b), qaBadOut);
+    assert.throws(() => s.topKInto(a.subarray(2, 3), a.subarray(2, 6), b), qaBadOut, 'equal offset, different lengths');
+    ssUnchanged(before, s, 'same-array rejects');
+});
+
+test('QA H2.7 (SS): topKInto views on one buffer -- touching ranges accepted + exact; a 1-element overlap in any pair rejects', () => {
+    const s = qaFixture();
+    const buf = new ArrayBuffer(8 * 12);
+    const ka = new Float64Array(buf, 0, 4), ca = new Float64Array(buf, 32, 4), ea = new Float64Array(buf, 64, 4);
+    assert.equal(s.topKInto(ka, ca, ea, 4), 4, 'touching [0,32) [32,64) [64,96) accepted');
+    const ref = s.topK(4);
+    for (let j = 0; j < 4; j++) {
+        assert.ok(Object.is(ka[j], ref[j].key) && ca[j] === ref[j].count && ea[j] === ref[j].error, 'entry ' + j);
+    }
+    // reversed order in memory is fine too
+    assert.equal(s.topKInto(ea, ca, ka, 4), 4);
+    const ov = new Float64Array(buf, 24, 4);   // [24,56) overlaps ka's last element and ca's first three
+    const snapBuf = () => Array.from(new Float64Array(buf));
+    const b0 = snapBuf();
+    assert.throws(() => s.topKInto(ka, ov, new Float64Array(4), 4), qaBadOut, 'keys x counts overlap');
+    assert.throws(() => s.topKInto(new Float64Array(4), ka, ov, 4), qaBadOut, 'counts x errors overlap');
+    assert.throws(() => s.topKInto(ov, new Float64Array(4), ka, 4), qaBadOut, 'keys x errors overlap');
+    assert.deepEqual(snapBuf(), b0, 'no write before an overlap reject');
+});
+
+test('QA H2.7 (SS): topKInto detached outs are length 0 (writes 0, no throw); two detached views of one buffer reject', () => {
+    const s = qaFixture();
+    const ab = new ArrayBuffer(64);
+    const det = new Float64Array(ab), det2 = new Float64Array(ab, 32, 2);
+    structuredClone(ab, { transfer: [ab] });
+    assert.equal(det.length, 0, 'detached');
+    const k = new Float64Array([3, 3, 3]);
+    assert.ok(Object.is(s.topKInto(det, new Float64Array(8), new Float64Array(8)), 0));
+    assert.ok(Object.is(s.topKInto(k, det, new Float64Array(8)), 0));
+    assert.deepEqual(Array.from(k), [3, 3, 3], 'a detached out caps w at 0: nothing written');
+    assert.throws(() => s.topKInto(det, det2, new Float64Array(8)), qaBadOut, 'detached views of one buffer both read offset 0');
+});
+
+test('QA H2.7 (SS): topKInto on a resizable ArrayBuffer -- length-tracking views clash by live range; a shrink lowers w', () => {
+    let rab;
+    try { rab = new ArrayBuffer(8 * 16, { maxByteLength: 8 * 32 }); } catch { return; }
+    if (typeof rab.resize !== 'function') return;
+    const s = qaFixture();
+    const track = new Float64Array(rab);              // length-tracking, [0, live)
+    const tail = new Float64Array(rab, 8 * 8);         // length-tracking from byte 64
+    const head = new Float64Array(rab, 0, 8);          // fixed [0, 64)
+    assert.throws(() => s.topKInto(track, tail, new Float64Array(8)), qaBadOut, 'tracking views overlap');
+    assert.equal(s.topKInto(head, tail, new Float64Array(8)), s.size, 'fixed head + tracking tail disjoint');
+    rab.resize(8 * 3);                                 // head is now OUT OF BOUNDS (length 0), track has 3
+    assert.equal(head.length, 0);
+    assert.equal(track.length, 3);
+    qaMatchTopK(s, undefined, 3, 'baseline');
+    const c = new Float64Array(8), e = new Float64Array(8);
+    assert.equal(s.topKInto(track, c, e), 3, 'a shrunk tracking out writes its live length');
+    const ref = s.topK(3);
+    for (let j = 0; j < 3; j++) assert.ok(Object.is(track[j], ref[j].key), 'tracking key ' + j);
+    assert.ok(Object.is(s.topKInto(head, c, e), 0), 'an out-of-bounds view is length 0');
+    rab.resize(8 * 32);
+    assert.equal(s.topKInto(track, c, e), s.size, 'a grown tracking out writes min(size, ...)');
+});
+
+test('QA H2.7 (SS): topKInto rejects a Float32Array subclass forging @@toStringTag / a tagged plain object; accepts a re-prototyped real Float64Array', () => {
+    const s = qaFixture();
+    let tagCalls = 0, lenCalls = 0;
+    class Fake extends Float32Array {
+        get [Symbol.toStringTag]() { tagCalls++; return 'Float64Array'; }
+        get length() { lenCalls++; return 8; }
+    }
+    const k = new Float64Array(8).fill(4);
+    assert.throws(() => s.topKInto(k, new Fake(8), new Float64Array(8)), qaBadOut);
+    assert.throws(() => s.topKInto({ [Symbol.toStringTag]: 'Float64Array', length: 8, buffer: new ArrayBuffer(64), byteOffset: 0 },
+        new Float64Array(8), new Float64Array(8)), qaBadOut);
+    assert.equal(tagCalls + lenCalls, 0, 'no user getter ran');
+    assert.ok(k.every((x) => x === 4), 'outs untouched');
+    const sw = new Float64Array(8);
+    Object.setPrototypeOf(sw, Array.prototype);   // still a real Float64Array internally
+    qaMatchTopK(s, undefined, 8, 'baseline');
+    assert.equal(s.topKInto(sw, new Float64Array(8), new Float64Array(8)), s.size, 'internal slots decide, not the prototype');
+});
+
+test('QA H2.7 (SS): topKInto heap order under adversarial count layouts (ascending / descending / sawtooth / all-equal) equals topK(n)', () => {
+    for (const cap of [2, 3, 17, 257]) {
+        for (const shape of ['asc', 'desc', 'saw', 'eq']) {
+            const s = new SpaceSaving(cap);
+            for (let i = 0; i < cap; i++) {
+                const c = shape === 'asc' ? i + 1 : shape === 'desc' ? cap - i : shape === 'saw' ? 1 + (i % 3) : 4;
+                s.add(1000 + i, c);
+            }
+            for (const n of [1, 2, cap >> 1, cap - 1, cap, cap + 1]) qaMatchTopK(s, n, cap + 2, cap + '/' + shape + '/n' + n);
+        }
+    }
+});
+
+test('QA H2.7 (SS): topKInto re-entrant from inside a forEach callback equals topK, and never mutates the sketch', () => {
+    const s = qaFixture();
+    const before = ssSnap(s);
+    let calls = 0;
+    s.forEach(() => { calls++; qaMatchTopK(s, 3, 4, 're-entrant'); });
+    assert.equal(calls, s.size);
+    ssUnchanged(before, s, 're-entrant topKInto');
+});
+
+test('QA H2.7 (SS): forEach with add() inside fn -- live bound visits the new entry, no ghost, evicting add never revisits past size', () => {
+    const s = new SpaceSaving(8);
+    s.add(1); s.add(2);
+    const seen = [];
+    s.forEach((k) => { seen.push(k); if (seen.length === 1) s.add(3); });
+    assert.deepEqual(seen, [1, 2, 3], 'the entry added mid-walk is visited (live this._size)');
+    const f = new SpaceSaving(2);
+    f.add(1, 1); f.add(2, 5);
+    const seen2 = [];
+    f.forEach((k, c) => { seen2.push([k, c]); if (seen2.length === 1) f.add(9, 1); });
+    assert.equal(seen2.length, 2, 'a full sketch: size stays 2, the walk stays 2');
+    for (const [, c] of seen2) assert.ok(c > 0, 'no zero-count ghost');
+    // nested forEach + a throwing fn
+    let inner = 0, depth = 0;
+    s.forEach(() => { if (depth++ === 0) s.forEach(() => { inner++; }); });
+    assert.equal(inner, s.size);
+    const before = ssSnap(s);
+    const boom = new Error('user');
+    assert.throws(() => s.forEach(() => { throw boom; }), (e) => e === boom, 'the user error propagates as-is');
+    ssUnchanged(before, s, 'throwing fn');
+});
+
+test('QA H2.7 (SS): forEach / topK / heavyHitters / topKInto read +0 for a -0 key with a count >= 2^31', () => {
+    const s = new SpaceSaving(4);
+    s.add(-0, 2 ** 31 + 3);
+    s.add(2 ** 33, 1);
+    s.forEach((k, c) => { if (c > 1) assert.ok(Object.is(k, 0), 'forEach'); });
+    assert.ok(Object.is(s.topK(1)[0].key, 0), 'topK');
+    assert.ok(Object.is(s.heavyHitters(0.5)[0].key, 0), 'heavyHitters');
+    const a = new Float64Array(2);
+    s.topKInto(a, new Float64Array(2), new Float64Array(2));
+    assert.ok(Object.is(a[0], 0), 'topKInto');
+    assert.equal(s.estimate(0), 2 ** 31 + 3, 'lookups treat -0 === 0');
+});
+
+test('QA H2.7 (SS): option bags -- frozen / sealed / Proxy(ownKeys only) / Proxy(proto null) accepted; computed __proto__ / Symbol / getter / accessor-reporting Proxy / function rejected TAGGED', () => {
+    assert.equal(new SpaceSaving(8, Object.freeze({ seed: 7 }))._seed, 7, 'frozen');
+    assert.equal(new SpaceSaving(8, Object.seal({ seed: 7 }))._seed, 7, 'sealed');
+    assert.equal(SpaceSaving.withError(0.1, Object.freeze({ seed: 7 }))._seed, 7, 'withError frozen');
+    let traps = 0;
+    assert.equal(new SpaceSaving(8, new Proxy({ seed: 7 }, { ownKeys(t) { traps++; return Reflect.ownKeys(t); } }))._seed, 7);
+    assert.equal(traps, 1, 'ownKeys trapped exactly once');
+    assert.equal(new SpaceSaving(8, new Proxy({ seed: 7 }, { getPrototypeOf() { return null; } }))._seed, 7, 'proto null via trap');
+    assert.throws(() => new SpaceSaving(8, { ['__proto__']: 1 }), (e) => qaBadOpt(e) && /"__proto__"/.test(e.message));
+    assert.throws(() => new SpaceSaving(8, { [Symbol('qa')]: 1 }), (e) => qaBadOpt(e) && /"Symbol\(qa\)"/.test(e.message));
+    let g = 0;
+    assert.throws(() => new SpaceSaving(8, { get seed() { g++; return 7; } }), qaPlain);
+    assert.throws(() => new SpaceSaving(8, new Proxy({ seed: 7 }, {
+        getOwnPropertyDescriptor() { return { get() { g++; return 1; }, configurable: true, enumerable: true }; },
+    })), qaPlain, 'a trap that reports an accessor -> non-bag');
+    assert.equal(g, 0, 'no getter ran');
+    assert.throws(() => new SpaceSaving(8, function () {}), qaPlain, 'a function is not a bag');
+    let vo = 0;
+    assert.throws(() => new SpaceSaving(8, { seed: { valueOf() { vo++; return 3; } } }),
+        (e) => e instanceof RangeError && /seed must be an integer/.test(e.message) && liteSketch(e));
+    assert.equal(vo, 0, 'the value check runs no valueOf');
+    assert.equal(new SpaceSaving(8, { seed: undefined })._seed, new SpaceSaving(8)._seed, 'an own undefined is the default');
+});
+
+test('QA H2.7 (SS): a prototype carrying a KNOWN key (null-proto parent or cross-realm polluted Object.prototype) is rejected TAGGED, no getter runs', () => {
+    // A non-(this realm) root prototype carrying an own KNOWN key would smuggle a silently-dropped
+    // option, so it fails closed. Inherited values are never read (getOwnPropertyDescriptor only).
+    let calls = 0;
+    const parent = Object.create(null);
+    Object.defineProperty(parent, 'seed', { get() { calls++; return 5; }, enumerable: true });
+    for (const bag of [Object.create(parent), Object.create(Object.assign(Object.create(null), { seed: 5 }))]) {
+        assert.throws(() => new SpaceSaving(8, bag), qaPlain, 'a prototype carrying a known key fails closed');
+    }
+    assert.throws(() => new SpaceSaving(8, runInNewContext('Object.prototype.seed = 5; ({})')),
+        qaPlain, 'cross-realm polluted Object.prototype rejected');
+    assert.equal(calls, 0, 'the inherited getter never ran');
+});
+
+test('QA H2.7 (SS): merge brand -- an instance from a SECOND module instance is rejected TAGGED both ways; an overriding subclass merges via super', async () => {
+    const url = new URL('../Sketch.js', import.meta.url).href + '?qa-second-instance';
+    const M2 = await import(url);
+    assert.notEqual(M2.SpaceSaving, SpaceSaving, 'a distinct class (dual-package / cross-realm analogue)');
+    const a = new SpaceSaving(8), b = new M2.SpaceSaving(8);
+    a.add(1, 3); b.add(2, 4);
+    const before = ssSnap(a);
+    assert.throws(() => a.merge(b), (e) => e instanceof TypeError && /merge expects a SpaceSaving/.test(e.message) && liteSketch(e));
+    assert.throws(() => b.merge(a), (e) => e instanceof TypeError && /merge expects a SpaceSaving/.test(e.message));
+    ssUnchanged(before, a, 'second-instance reject');
+    let over = 0;
+    class Sub extends SpaceSaving { merge(o) { over++; return super.merge(o); } }
+    const x = new Sub(8), y = new SpaceSaving(8);
+    x.add(5, 2); y.add(6, 3);
+    x.merge(y);
+    y.merge(new Sub(8));
+    assert.equal(over, 1);
+    assert.equal(x.estimate(6), 3);
+    assert.equal(x.total, 5);
 });

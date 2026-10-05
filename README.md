@@ -189,8 +189,8 @@ hll.add(key) -> this             // HOT, O(1), 0 B/op. Hash a SAFE-INTEGER key (
 hll.addHashed(hi, lo) -> this    // HOT, O(1), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
 hll.addFrom(buf, i) -> this      // HOT, O(1), 0 library B/op. Add buf[i] UNBOXED from a Float64Array -- the zero-box entry for a key >= 2^31 (add boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws as add.
 hll.addHashedFrom(buf, i) -> this// HOT, O(1), 0 library B/op. Add two uint32 lanes read UNBOXED at buf[i], buf[i+1] (Uint32Array or Int32Array) -- the zero-box sibling of addHashed. Throws on a bad buffer / index, or (addHashed's lane error) on a lane read that is neither uint32 nor int32.
-hll.count() -> number            // COLD, O(m). Estimated distinct count (Ertl's improved estimator -- table-free, full-range).
-hll.merge(other) -> this         // Register-wise max into this. Throws [lite-sketch] on a non-HLL or unequal m OR seed.
+hll.count() -> number            // COLD, O(m). Estimated distinct count (Ertl's improved estimator -- table-free, full-range). A Smi below 2^31 (Node) / 2^30 (Chrome) -> unboxed there; a larger estimate boxes ~16 B on the return.
+hll.merge(other) -> this         // Register-wise max into this. Throws [lite-sketch] on a non-HLL or unequal m OR seed. Brand-checked (#brand, not instanceof): a Proxy over an instance or a field-copy forgery throws tagged before any read of other.
 hll.clear() -> this              // Zero the registers; reuse the same allocation.
 hll.p -> number                  // the precision p (getter)
 hll.m -> number                  // register count, 2^p (getter)
@@ -210,15 +210,15 @@ Error roughly halves each time `p` rises by 2 (`m` quadruples) -- the space/accu
 ```js
 new CountMinSketch(d, w, options?)                     // d in [1,32]; w rounds up to a power of two, <= 2^25; d*w <= 2^31.
 CountMinSketch.withAccuracy(epsilon, delta, options?)  // w = ceil(e/epsilon) (pow2), d = ceil(ln 1/delta). epsilon, delta in (0,1). THROWS when unattainable (w > 2^25 or d > 32) -- no silent clamp.
-// options: { seed?, conservative = true }             // an unknown option key throws [lite-sketch] with a did-you-mean hint.
+// options: { seed?, conservative = true }             // a PLAIN bag only (own string keys, null-, this-realm-Object.prototype-, or clean-root-prototype-rooted (a cross-realm Object.prototype polluted with a known key is rejected)). A Map/Date/array/class instance/Object.create(proto), an own accessor (no getter runs), or a Symbol key throws the plain-object TypeError; an unknown string key throws with a did-you-mean hint; a revoked/throwing-trap Proxy is rejected tagged.
 
 cms.add(key, count = 1) -> this          // HOT, O(d), 0 B/op. Hash a SAFE-INTEGER key (|key| <= 2^53-1) + increment the d cells. count in [1, 2^32-1]. Throws on a non-number / +-Infinity / non-integer / out-of-safe-range key, a bad count, or a running total past 2^53-1.
 cms.addHashed(hi, lo, count = 1) -> this // HOT, O(d), 0 B/op. Pre-hashed fast path: two uint32 lanes you hashed yourself.
 cms.addFrom(buf, i) -> this              // HOT, O(d), 0 library B/op. Add buf[i] with count buf[i+1] UNBOXED from a Float64Array -- the zero-box entry for a key or count >= 2^31 (add boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws as add.
 cms.addHashedFrom(buf, i) -> this        // HOT, O(d), 0 library B/op. Add three slots [hi, lo, count] read UNBOXED at buf[i..i+2] (Uint32Array or Int32Array; an Int32Array caps count at 2^31-1). Zero-box sibling of addHashed. Throws on a bad buffer / index / count, or (addHashed's lane error) on a lane read that is neither uint32 nor int32.
-cms.estimate(key) -> number              // HOT, O(d), 0 B/op. The min of the d cells (one-sided over-estimate). NEVER throws -- a key add would reject estimates 0 (never aliases a real key).
+cms.estimate(key) -> number              // HOT, O(d), 0 B/op. The min of the d cells (one-sided over-estimate). NEVER throws -- a key add would reject estimates 0 (never aliases a real key). A Smi below 2^31 (Node) -> unboxed; a cell value >= 2^31 boxes ~16 B on the return (no estimateInto, by design).
 cms.estimateHashed(hi, lo) -> number     // HOT, O(d), 0 B/op. Query form of the pre-hashed path (bad lane -> 0).
-cms.merge(other) -> this                 // Element-wise saturating add. Throws [lite-sketch] on a non-CMS, mismatched d/w/seed, or a running total past 2^53-1. A cross-conservative merge is allowed (this keeps its flag); saturated is carried.
+cms.merge(other) -> this                 // Element-wise saturating add. Throws [lite-sketch] on a non-CMS, mismatched d/w/seed, or a running total past 2^53-1. A cross-conservative merge is allowed (this keeps its flag); saturated is carried. Brand-checked (#brand, not instanceof): a Proxy over an instance or a field-copy forgery throws tagged before any read of other.
 cms.clear() -> this                      // Zero the counters + running total + saturated; reuse the allocation.
 cms.d / cms.w / cms.seed                 // the frozen shape + hash seed (getters)
 cms.conservative -> boolean              // whether conservative update is on (getter)
@@ -238,7 +238,7 @@ cms.delta -> number                      // e^-d -- the theoretical failure prob
 More columns `w` shrink the error `epsilon`; more rows `d` shrink the failure probability `delta` -- the two independent dials, at `d * w * 4` bytes.
 
 ```js
-new DDSketch(alpha, options?)            // alpha in [1e-6, 1) = relative accuracy (floor is the exported DD_ALPHA_MIN). options: { maxBins = 2048, range?: [min, max] }.
+new DDSketch(alpha, options?)            // alpha in [1e-6, 1) = relative accuracy (floor is the exported DD_ALPHA_MIN). options: { maxBins = 2048, range?: [min, max] } -- a PLAIN bag only (own string keys, null-, this-realm-Object.prototype-, or clean-root-prototype-rooted (a cross-realm Object.prototype polluted with a known key is rejected); a Map/array/class instance/Object.create(proto)/own accessor/Symbol key throws the plain-object TypeError; a revoked/throwing-trap Proxy bag or range is rejected tagged).
                                          //   Throws [lite-sketch] on a bad alpha (incl. < DD_ALPHA_MIN) / maxBins / range BEFORE allocating. range present = strict fixed-range.
 
 dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite value (x=0 -> zero counter). count in [1, 2^32-1]. Throws on x<0, non-finite,
@@ -246,13 +246,14 @@ dd.add(value, count = 1) -> this         // HOT, O(1), 0 B/op. Bucket a finite v
 dd.addFrom(buf, i) -> this               // HOT, O(1), 0 B/op. Add buf[i] (count=1) read UNBOXED from a Float64Array -- the zero-box entry
                                          //   point for a FRACTIONAL value (add(fractionalDouble) boxes its argument ~16 B/call when not inlined).
                                          //   Same validation as add; throws on a bad buf / index or a value add would reject.
-dd.quantile(q) -> number                 // COLD, O(bins). The q-quantile (q in [0,1]) within alpha relative error. NEVER throws (empty/bad q -> NaN).
-dd.merge(other) -> this                  // Fold other in (collapsing as needed), carrying other.collapsed forward. Throws [lite-sketch] on a non-DDSketch, unequal alpha, a running count past 2^53-1, a strict out-of-range key, or a collapsed other merged into a strict sketch.
+dd.quantile(q) -> number                 // COLD, O(bins). The q-quantile (q in [0,1]) within alpha relative error. NEVER throws (empty/bad q -> NaN). Returns a fractional double on a non-inlined call, so EVERY call boxes ~16 B on the return (Q-CTRL[ni/dd.quantile] lane reads 24).
+dd.quantilesInto(qs, out) -> number      // out[j] = quantile(qs[j]) BIT-FOR-BIT into a caller-owned Float64Array, allocation-free -- the 0-alloc p50/p90/p99/p999 render (ni/dd.quantilesInto.q4 reads 0; N8 gate <= 2). Returns min(qs.length, out.length). A bad q value writes NaN, never throws; in-place qs === out works. Throws [lite-sketch] BEFORE any write when qs/out is not a Float64Array, the two partially overlap, or they are backed by different SharedArrayBuffer objects (aliasing cannot be verified).
+dd.merge(other) -> this                  // Fold other in (collapsing as needed), carrying other.collapsed forward. Throws [lite-sketch] on a non-DDSketch, unequal alpha, a running count past 2^53-1, a strict out-of-range key, or a collapsed other merged into a strict sketch. Brand-checked (#brand, not instanceof): a Proxy over an instance or a field-copy forgery throws tagged before any read of other (a _gamma-only forgery previously merged, leaving count/sum NaN).
 dd.clear() -> this                       // Zero the bins + all scalars; reuse the allocation.
 dd.alpha -> number                       // the relative-accuracy knob (getter)
 dd.count -> number                       // exact element count N (getter)
 dd.sum -> number                         // exact sum of all added values (getter)
-dd.min / dd.max -> number                // the EXACT min / max (not bucketed; NaN when empty) (getters)
+dd.min / dd.max -> number                // the EXACT min / max (not bucketed; NaN when empty); a stored -0 reads as +0 (getters)
 dd.zeroCount -> number                   // exact count of zero values (getter)
 dd.maxBins -> number                     // the bin capacity (getter)
 dd.numBins -> number                     // the live (populated) bin count (getter)
@@ -271,17 +272,18 @@ dd.rangeMin / dd.rangeMax                // STRICT mode: the configured range en
 Smaller `alpha` -> finer buckets -> more bins used for a given value range (raise `maxBins` to avoid collapsing the smallest values); the guarantee holds at *every* quantile equally, and `min`/`max` are always exact. `alpha` is floored at the exported constant `DD_ALPHA_MIN` (`1e-6`); a smaller value throws `[lite-sketch]` at the ctor door (at the `2^20`-bin cap it spans only ~8x of value range, and smaller alphas once hung the bound search).
 
 ```js
-new SpaceSaving(capacity, options?)      // capacity = k monitored counters, integer in [1, 2^24]. options: { seed? }.
+new SpaceSaving(capacity, options?)      // capacity = k monitored counters, integer in [1, 2^24]. options: { seed? } -- a PLAIN bag only (own string keys, null-, this-realm-Object.prototype-, or clean-root-prototype-rooted (a cross-realm Object.prototype polluted with a known key is rejected); a Map/array/class instance/Object.create(proto)/own accessor/Symbol key throws the plain-object TypeError; unknown string key did-you-mean; a revoked/throwing-trap Proxy rejected tagged).
 SpaceSaving.withError(epsilon, options?) // k = ceil(1/epsilon); a monitored key's over-count is then <= epsilon*N. epsilon in (0,1). THROWS when unattainable (k > 2^24) -- no silent clamp.
 
 ss.add(key, count = 1) -> this           // HOT, O(1) amortized, 0 B/op. Increment / insert / evict-min. count in [1, 2^32-1]. Throws on a non-safe-integer key, a bad count, or a running total past 2^53-1.
 ss.addFrom(buf, i) -> this               // HOT, O(1) amortized, 0 library B/op. Add buf[i] with count buf[i+1] UNBOXED from a Float64Array -- the zero-box entry for a key or count >= 2^31 (add boxes a non-Smi argument (~16 B) at a non-inlined call). Snapshots both slots (D1). Same validation / throws as add.
 ss.estimate(key) -> number               // HOT, O(1). Monitored count (an upper bound), or 0. NEVER throws.
 ss.errorOf(key) -> number                // HOT, O(1). Over-count bound (true is in [estimate - errorOf, estimate]), or 0. NEVER throws.
-ss.forEach(fn) -> void                   // Alloc-free walk (storage order): fn(key, count, error, ss).
-ss.topK(n = size) -> Array<{key,count,error}>   // Top n by count DESC. COLD, allocates. NEVER throws.
-ss.heavyHitters(threshold) -> Array<{key,count,error}>  // count > threshold*total -- a SUPERSET, no false negatives. COLD, allocates.
-ss.merge(other) -> this                  // Union + keep top-k. Throws [lite-sketch] on a non-SpaceSaving, unequal capacity/seed, or a running total past 2^53-1.
+ss.forEach(fn) -> void                   // Alloc-free walk (storage order): fn(key, count, error, ss). LIVE size bound -- do NOT mutate inside fn (no ghosts, entries may skip/revisit). key normalized (-0 -> +0). A non-inlined fn boxes ~49 B/entry for entries >= 2^31 (ni/ss.forEach/big reads 73); use topKInto for a 0-alloc render.
+ss.topK(n = size) -> Array<{key,count,error}>   // Top n by count DESC, ties by ascending slot. COLD, allocates (~160 B/entry, approx); key normalized (-0 -> +0). NEVER throws.
+ss.heavyHitters(threshold) -> Array<{key,count,error}>  // count > threshold*total -- a SUPERSET, no false negatives. COLD, allocates (~135 B/entry, approx); key normalized.
+ss.topKInto(outKeys, outCounts, outErrors, n = size) -> number  // Write the top-n best-first into three caller-owned Float64Arrays, allocation-free, in EXACTLY topK(n)'s order (count DESC, ties by ascending slot). Returns w = min(n, size, three lengths); a non-integer/negative n -> size; key normalized (-0 -> +0). O(size log w), no boxing (ni/ss.topKInto.n16|n64/big read 0; N8 gate <= 2). Throws [lite-sketch] BEFORE any write when an out is not a Float64Array, two overlap, or two are backed by different SharedArrayBuffer objects (aliasing cannot be verified); disjoint views over one buffer are fine. The lite-hud M3 render.
+ss.merge(other) -> this                  // Union + keep top-k. Throws [lite-sketch] on a non-SpaceSaving, unequal capacity/seed, or a running total past 2^53-1. Brand-checked (#brand, not instanceof): a Proxy over an instance or a field-copy forgery throws tagged before any read of other. Bounded cold scratch (~300 B/entry, approx).
 ss.clear() -> this                       // Drop all monitored keys; reuse the pools.
 ss.capacity / ss.size / ss.total         // k; monitored count (<= k); exact running sum N (getters)
 ss.epsilon -> number                     // 1 / capacity -- the theoretical error fraction (getter)
@@ -338,9 +340,9 @@ Every hot op allocates **0 bytes** after construction; the only allocator is the
 
 CountMinSketch is the same discipline: `add` / `addHashed` / `estimate` are **0 B/op** (the murmur is inlined into int32 locals and the `d` chosen cell indices are staged in a pre-allocated `Int32Array(d)` scratch, so even conservative update's two passes allocate nothing); `merge` / `clear` are in-place; only the constructor allocates (one `Uint32Array(d * w)`). The torture gate proves all of it.
 
-DDSketch too: `add` is **0 B/op** -- the log-scale key is a transient double (never stored to the heap), the bin array is a single `Float64Array(maxBins)` allocated once and never re-grown, and both window-extend and lowest-bucket-collapse shift counts *within* that fixed array (a `copyWithin`, no allocation). `quantile` / `merge` / `clear` are cold in-place walks. The torture gate proves `add` at 0 B/op even after collapse.
+DDSketch too: `add` is **0 B/op** -- the log-scale key is a transient double (never stored to the heap), the bin array is a single `Float64Array(maxBins)` allocated once and never re-grown, and both window-extend and lowest-bucket-collapse shift counts *within* that fixed array (a `copyWithin`, no allocation). `quantile` / `merge` / `clear` are cold in-place walks. The torture gate proves `add` at 0 B/op even after collapse. `quantile` *returns* a fractional double, so every non-inlined call boxes a ~16 B HeapNumber on the return (the `Q-CTRL[ni/dd.quantile]` lane reads 24 scavenges over 1.6M calls) -- `quantilesInto(qs, out)` renders several quantiles into a caller-owned `Float64Array` with no double crossing a call, allocation-free (the `ni/dd.quantilesInto.q4` lane reads 0 scavenges; the N8 gate is `<= 2`).
 
-SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the eviction path (delete the min key from the open-addressing map by backshift, reassign its counter, re-file it in the bucket forest to a new count) touches only preallocated typed-array pools + a free-list, never the heap. The torture gate measures `add` at 0 B/op at steady-state-full, where *every* op evicts. Only `topK` / `heavyHitters` / `merge` allocate (cold, disclosed).
+SpaceSaving is the hardest case and still **0 B/op** on `add` -- including the eviction path (delete the min key from the open-addressing map by backshift, reassign its counter, re-file it in the bucket forest to a new count) touches only preallocated typed-array pools + a free-list, never the heap. The torture gate measures `add` at 0 B/op at steady-state-full, where *every* op evicts. `topK` / `heavyHitters` / `merge` allocate (cold, disclosed): roughly 160 / 135 / 300 B per entry (approx, per the orchestrator's `alloc.mjs`). `forEach` is alloc-free, but a non-inlined callback boxes ~49 B/entry for entries with a key / count / error `>= 2^31` (three doubles cross the call; the `ni/ss.forEach/big` lane reads 73 scavenges over 1.6M entries -- the documented cost). `topKInto(outKeys, outCounts, outErrors, n)` renders the same top-n (count DESC, ties by ascending slot) into three caller-owned `Float64Array`s with an in-place bounded heap of slot ids -- allocation-free and no boxing (the `ni/ss.topKInto.n16|n64/big` lanes read 0 scavenges; the N8 gate is `<= 2`), the 0-alloc top-N render that `topK` is not.
 
 **`addFrom` for keys >= 2^31 on a hot path.** The `add(key)` / `add(key, count)` entry points are 0 **library** B/op, but V8 boxes a non-Smi argument into a ~16 B HeapNumber when it crosses a call it does not inline -- so a key or count `>= 2^31` (e.g. lite-hud's `channelIdx * 2^32 + tag`, or a cumulative-microseconds count) costs the caller's own box. HyperLogLog / CountMinSketch / SpaceSaving each ship an `addFrom(buf, i)` sibling (and HyperLogLog / CountMinSketch an `addHashedFrom(buf, i)`) that reads the value out of a caller-owned `Float64Array` / `Uint32Array` / `Int32Array` slot UNBOXED, identical validation and throws, so a full-range hot path stays at the clean floor (DDSketch's `addFrom` set the precedent in 1.1.0).
 

@@ -142,6 +142,36 @@ Bit-identical output over the N9 parity sweep (incl. `estimate` across 1.5 / NaN
    `addFrom(key, count)` and `addHashed(hi, lo, count)`. An `Int32Array` cannot carry a count `>=
    2^31`, so that cap is documented.
 
+## H2.7 amendment (2026-10-05) -- plain-bag options (F18, D2) + the merge brand (F21)
+
+Cold paths only; the hot bodies are byte-identical.
+
+1. **Options are an own-property plain bag (F18, D2).** `CMS_KNOWN_OPTS` inherited `Object.prototype`,
+   so the `key in CMS_KNOWN_OPTS` test accepted `{ toString: 1 }` / `{ constructor: 1 }`, and option
+   values were read through the prototype chain (`new CountMinSketch(4, 64, Object.create({ seed: 5 }))`
+   picked up `seed: 5`; `Object.create({ conservative: false })` the flag). The KNOWN set is now
+   `Object.freeze({ __proto__: null, seed: true, conservative: true })` (same key order), and the ctor
+   classifies the argument through the module helper `_optScan`: a valid bag is a non-null object whose
+   prototype is `null`, is THIS realm's `Object.prototype` (its keys ignored, so a polluted
+   `Object.prototype.seed` still yields the default), or is another root prototype
+   (`Object.getPrototypeOf(p) === null`) that carries NO own KNOWN key -- otherwise an inherited option
+   would be silently dropped, so it fails closed (a clean `vm` / iframe literal still passes; a
+   cross-realm `Object.prototype` polluted with a known key is rejected). `Map` / `Date` / `RegExp` /
+   arrays / class instances / `Object.create(proto)` are not bags. Every own key (`Reflect.ownKeys`, symbols and non-enumerable keys
+   included) must be a string in the KNOWN set, and every own property must be a DATA descriptor -- an
+   own accessor makes the object a non-bag, so no getter runs. Values are read with `_optOwn` (the own
+   data descriptor, never `[[Get]]`). The scan + the own reads sit in ONE `try`; a revoked or
+   throwing-trap `Proxy` is caught and rejected with the plain-object `[lite-sketch]` TypeError (not the
+   untagged engine `IsArray` throw it used to). The value checks run AFTER the `try`, verbatim from the
+   prior code, so a tagged `RangeError` / `TypeError` is never swallowed. No new message text.
+2. **The merge brand (F21).** `merge` brand-checked with `instanceof`, which a field copy and a
+   `new Proxy(real, {})` pass (a forged CMS previously threw an UNTAGGED TypeError on some paths). A
+   private `#brand` field is installed by the ctor, and `merge` / `_badMerge` test `typeof other ===
+   'object' && other !== null && #brand in other` first, before any read of `other` (closing the H2.3
+   RISK that a forged `other` runs caller code through `this._total + other._total`). A forgery throws
+   the tagged `[lite-sketch]` TypeError as a byte-identical no-op; subclasses still merge. The d / w /
+   seed shape test follows, minus the dropped `instanceof`.
+
 ## Non-goals
 
 No range / heavy-hitter queries (that is SpaceSaving, M4, and DDSketch, M3); no serialization

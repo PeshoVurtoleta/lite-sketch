@@ -154,6 +154,67 @@ Bit-identical output over the N9 parity sweep (full pools, merge, post-merge add
    `_probeAt(this._key, sl, home)` -- reading OUR stored copy, never the caller's buffer, so a caller
    buffer is read only before any write.
 
+## H2.7 amendment (2026-10-05) -- topKInto (F7) + forEach / -0 (F18) + plain-bag options (F18) + the merge brand (F21)
+
+Cold paths only; `add` / `addFrom` / `_addAt` / `_homeAt` and the map / forest helpers are
+byte-identical.
+
+1. **`topKInto(outKeys, outCounts, outErrors, n?)` (F7, D4).** `topK` allocates ~160 B/entry (an array
+   of `{ key, count, error }` objects) and `heavyHitters` ~135 B/entry (approx, `alloc.mjs`); lite-hud
+   M3 renders an SS top-N every frame with keys `>= 2^32` and counts past `2^31`, so `forEach` boxes
+   three doubles per entry (~49 B/entry, the `ni/ss.forEach/big` lane's 73 scavenges). `topKInto` writes
+   the top-`n` into three caller-owned `Float64Array`s with ZERO allocation and no boxing (it takes
+   objects + a Smi and returns a Smi; slot ids are read `| 0`; the sifts are inline loops with no helper
+   call): the `ni/ss.topKInto.n16|n64/big` lanes read 0 scavenges (N8 gate `<= 2`).
+   - **Order = EXACTLY `topK(n)`.** `topK` sorts slot indices with a stable sort by count, so ties break
+     by ASCENDING slot. `topKInto` reproduces that with a bounded MIN-heap of slot ids in
+     `outKeys[0..w-1]` whose root is the WORST kept entry, `worse(a, b) = count[a] < count[b] ||
+     (count[a] === count[b] && a > b)`: seed with slots `0..w-1`, heapify, then replace the root with
+     any later slot that beats it; an in-place heapsort to best-first; then materialize `key + 0`,
+     count, error per slot. O(size log w), in place. A selection scan was REJECTED (O(n*size) hangs at
+     n = size = 2^16). The parity oracle gates `topKInto == topK(n)` by `Object.is` over capacities
+     1 / 7 / 64 / 1000 and Zipf / all-equal / evicting streams, for `n` in {0, 1, 3, size-1, size,
+     size+5, undefined, -1, 2.5}.
+   - **`n` and `w` never throw.** `n` follows `topK`'s rule (a non-integer / negative `n` -> `size`);
+     `w = min(n, size, la, lb, lc)` is RETURNED, and a too-short out gets its own length.
+   - **Bad outs throw tagged, before any write (like `addFrom`).** An out that is not a real
+     `Float64Array`, two of the three sharing a buffer with intersecting byte ranges, or two backed by
+     DIFFERENT `SharedArrayBuffer` objects, calls the new cold `_badOut` TypeError -- a wrong array type
+     would silently truncate a key `>= 2^32`. The real-array check uses cached `%TypedArray%.prototype`
+     getters (`Symbol.toStringTag` / `length` / `buffer` / `byteOffset`) that run NO `Proxy` trap and no
+     subclass override; disjoint views over one buffer are accepted. The cross-SAB case FAILS CLOSED:
+     two distinct `SharedArrayBuffer` objects can alias one memory block (`structuredClone`, a worker
+     round-trip) that a buffer-identity test cannot see, so a cross-SAB pair is rejected -- a SAB is told
+     from a plain `ArrayBuffer` with no user code (the cached `ArrayBuffer.prototype.byteLength` getter
+     throws only on a SAB). The overlap check probes the PLAIN buffer FIRST (the prototype picks only the
+     probe ORDER, never the answer -- a SAB with a swapped prototype is still probed and still rejected),
+     so EVERY ACCEPTED call is allocation-free: only a two-SAB pair, which is rejected anyway, pays the
+     internal throw. A prior version probed unconditionally and threw per accepted SAB-first mixed call
+     (~1200 / ~1900 B/call); the torture `topKInto SAB-first` scavenge lane gates it at 0.
+2. **`forEach` live bound + `-0` (F18, D6 / D7).** The loop bound was a hoisted `const n = this._size`,
+   so a `clear()` / `merge` inside the callback walked stale slots (`clear()` in the first callback
+   visited all 5 original entries -- 4 ghosts). It is now `for (let i = 0; i < this._size; i++)` against
+   the live field (the arrays stay hoisted, never reallocated): no ghosts, though entries may be skipped
+   or revisited, so the docs say "do not mutate the sketch inside `fn`". `add(-0)` stored `-0`, so
+   `forEach` / `topK` / `heavyHitters` / `topKInto` keys read `-0`; each now emits `this._key[x] + 0`
+   (a `-0` reads `+0`). `_addAt` is 751 bytes and never inlined, so the `+ 0` costs no inlining (but it
+   is a hot-body byte change -- gated by parity). `merge` already normalized `-0` (its Map rebuild uses
+   SameValueZero). No `estimate` / `errorOf` change (they compare `-0 === 0` already).
+3. **Options are an own-property plain bag (F18, D2).** `SS_KNOWN_OPTS` is now `{ __proto__: null,
+   seed: true }`, and the ctor classifies the bag through `_optScan` / `_optOwn` (own string keys only,
+   on a `null` prototype, THIS realm's `Object.prototype`, or another root prototype carrying no own
+   known key -- a cross-realm `Object.prototype` polluted with a known key is rejected; own DATA
+   descriptors only, so no getter
+   runs; inherited values not read) inside one `try`, so a revoked / throwing-trap `Proxy` becomes the
+   tagged plain-object TypeError; the value check runs after the `try`, verbatim.
+4. **The merge brand (F21).** A field copy and a `new Proxy(real, {})` passed `instanceof` and merged.
+   A private `#brand` is installed by the ctor, and `merge` / `_badMerge` test `typeof other ===
+   'object' && other !== null && #brand in other` first, before any read of `other` (closing the H2.3
+   RISK via the `_total` guards). A forgery throws the tagged `[lite-sketch]` TypeError as a byte-
+   identical no-op; the capacity / seed shape test follows, minus `instanceof`. `merge`'s cold scratch
+   is still ~300 B/entry (approx, `alloc.mjs`; the former llms.txt "bounded cold scratch" wording now
+   carries the measured figure) -- F8 is settled by wording, not a preallocated scratch.
+
 ## Non-goals
 
 No sliding-window / decay variant (a future member); no serialization format in the

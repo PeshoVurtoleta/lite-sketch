@@ -198,6 +198,16 @@ const ddMerged: DDSketch = dd.merge(new DDSketch(0.01));
 const ddCleared: DDSketch = dd.clear();
 void ddChained; void ddQuantile; void ddMerged; void ddCleared;
 
+// quantilesInto(qs, out) -> the number of quantiles written; both args are Float64Array (H2.7).
+const ddQs: Float64Array = new Float64Array([0.5, 0.9, 0.99]);
+const ddOut: Float64Array = new Float64Array(3);
+const ddWritten: number = dd.quantilesInto(ddQs, ddOut);
+void ddWritten;
+// @ts-expect-error -- quantilesInto qs must be a Float64Array, not a number[].
+dd.quantilesInto([0.5, 0.9, 0.99], ddOut);
+// @ts-expect-error -- quantilesInto out must be a Float64Array, not a Float32Array.
+dd.quantilesInto(ddQs, new Float32Array(3));
+
 // @ts-expect-error -- alpha must be a number.
 new DDSketch('0.01');
 // @ts-expect-error -- options.maxBins must be a number.
@@ -277,6 +287,19 @@ const ek: number = ssEntry.key;
 const ec: number = ssEntry.count;
 const ee: number = ssEntry.error;
 void ssTopAll; void ssHH; void ek; void ec; void ee;
+
+// topKInto(outKeys, outCounts, outErrors, n?) -> the number of entries written; all three outs
+// are Float64Array and n is optional (H2.7).
+const ssOK: Float64Array = new Float64Array(8);
+const ssOC: Float64Array = new Float64Array(8);
+const ssOE: Float64Array = new Float64Array(8);
+const ssWritten: number = ss.topKInto(ssOK, ssOC, ssOE, 3);
+const ssWrittenAll: number = ss.topKInto(ssOK, ssOC, ssOE);
+void ssWritten; void ssWrittenAll;
+// @ts-expect-error -- topKInto outKeys must be a Float64Array, not a Float32Array.
+ss.topKInto(new Float32Array(8), ssOC, ssOE, 3);
+// @ts-expect-error -- topKInto n must be a number.
+ss.topKInto(ssOK, ssOC, ssOE, '3');
 
 // @ts-expect-error -- capacity must be a number.
 new SpaceSaving('1024');

@@ -74,6 +74,20 @@ Bit-identical output (the `_reg[]` registers and `count()` match b4e378f over th
    | 0` from a `Uint32Array` / `Int32Array` (needs `i+1` in bounds; cold `_badHashBuf`). `addHashed` is
    byte-identical. The class jsdoc now names both siblings.
 
+## H2.7 amendment (2026-10-05) -- the merge brand (F21)
+
+`merge` brand-checked with `other instanceof HyperLogLog`, which a forgery passes: a field copy
+(`Object.assign(Object.create(HyperLogLog.prototype), real)`) and a `new Proxy(real, {})` both merged
+silently. The class now carries a private `#brand` field (installed by the ctor on every real
+instance), and both `merge` and `_badMerge` test `typeof other === 'object' && other !== null &&
+#brand in other` as the FIRST statement, before any read of `other`. `#brand in o` runs no user code,
+is `false` for a `Proxy` (private names are not forwarded) and for a field copy, is O(1), and adds no
+module state (a module `WeakSet` was rejected -- it would add ephemeron work to every major GC, against
+the torture `maxMajor` / `maxPauseMs` budget). The typeof / null guard is required because `#b in 5`
+throws an untagged `TypeError`. A forgery now throws the tagged `[lite-sketch]` TypeError as a
+byte-identical no-op; subclasses still merge (`super()` installs the brand; engines are node >= 18 and
+`#x in` needs 16.4). The m / seed shape test follows, unchanged, minus the dropped `instanceof`.
+
 ## Non-goals
 
 No sparse representation (deferred); no crypto hashing; no serialization format in

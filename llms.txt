@@ -65,7 +65,9 @@ Members share no mutable module state, so a bundler that imports one drops the o
   bucket `ceil(ln(x)/ln(gamma))`). `add(value, count = 1)` is worst-case O(1), 0 B/op;
   `quantile(q)` is a cold O(bins) cumulative walk returning a value within a HARD relative
   error `|v - v_true| <= alpha * v_true` (the family's sharpest guarantee -- per-query, not
-  statistical). Collapsing-lowest by default (bounded memory, tail-accurate p50/p90/p99);
+  statistical); it returns a fractional double so EVERY call boxes ~16 B on the return, and
+  `quantilesInto(qs, out)` renders several quantiles (p50/p90/p99/p999) into a caller-owned
+  Float64Array allocation-free (bit-identical to `quantile` per q). Collapsing-lowest by default (bounded memory, tail-accurate p50/p90/p99);
   a `{ range: [min, max] }` option is strict fixed-range fail-closed. Positive + zero domain
   (a negative value throws). `merge(other)` is same-alpha-or-throw; `min`/`max` are EXACT
   (not bucketed). Fail closed on a bad alpha / value / out-of-indexable-range / count (throws
@@ -84,8 +86,11 @@ Members share no mutable module state, so a bundler that imports one drops the o
   both slots snapshotted first; D1) -- 0 library B/op for a key or count >= 2^31 (`add` boxes a
   non-Smi argument (~16 B) at a non-inlined call); there is no `addHashedFrom` (as there is no addHashed).
   `estimate(key)` / `errorOf(key)` are O(1) (0 if not monitored); `topK(n)` / `heavyHitters(threshold)`
-  return sorted entries (COLD, ALLOCATE); `forEach` is alloc-free; `merge(other)` (same-capacity/seed)
-  keeps the top-k. `SpaceSaving.withError(epsilon)` sizes k = ceil(1/epsilon). There is deliberately
+  return sorted entries (COLD, ALLOCATE ~160 / ~135 B/entry); `topKInto(outKeys, outCounts, outErrors, n)`
+  renders the same top-n (count DESC, ties by ascending slot) into three caller-owned Float64Arrays
+  allocation-free (0-alloc, the lite-hud M3 render); `forEach` is alloc-free but a non-inlined callback
+  boxes ~49 B/entry for entries >= 2^31; `merge(other)` (same-capacity/seed, brand-checked) keeps the
+  top-k. `SpaceSaving.withError(epsilon)` sizes k = ceil(1/epsilon). There is deliberately
   NO addHashed (it stores key identities, so there is no honest pre-hashed path). Fail closed on a
   bad ctor arg / key / count (typeof-first, byte-identical no-op); queries never throw.
 - `VERSION` -- string, '1.1.2'.
@@ -135,10 +140,15 @@ Hot surface (add / addHashed are worst-case O(1), zero allocation):
                             register multiplicity vector through the self-terminating
                             sigma/tau corrections) accurate across the WHOLE range: no
                             range-switching, no HLL++ empirical bias tables. A disclosed
-                            co-headline (the O(m) scan), NOT a per-add cost. Never throws.
+                            co-headline (the O(m) scan), NOT a per-add cost. Never throws. The
+                            result is Math.round(...), a Smi below 2^31 on Node (2^30 on 31-bit-Smi
+                            Chrome), so it returns UNBOXED there; an estimate above that boxes ~16 B
+                            on the non-inlined return (not reached at realistic cardinalities).
 - merge(other) -> this      Register-wise max of `other` into `this` (the union).
                             Throws [lite-sketch] on a non-HyperLogLog or unequal m
-                            (equal-m-or-throw, the same-capacity discipline).
+                            (equal-m-or-throw, the same-capacity discipline). Brand-checked (a
+                            private #brand, not instanceof): a Proxy over an instance or a field-copy
+                            forgery is NOT a HyperLogLog and throws tagged before any read of other.
 - clear() -> this           Zero the registers; reuse the same allocation.
 - p (getter)                The precision p.
 - m (getter)                Register count, 2^p.
@@ -158,8 +168,14 @@ fixed m bytes (the space co-headline). Uniformity is STATISTICAL, not cryptograp
 - d: depth (hash rows); integer in [1, 32]. w: width (columns/row); integer in
   [1, 2^25], ROUNDED UP to a power of two. A hard d*w <= 2^31 cap keeps every flat
   counter index a SMI. Memory = d * w * 4 bytes.
-- options (object): { seed = <default uint32> (coerced |0), conservative = true }. An
-  unknown option key throws [lite-sketch] with a did-you-mean hint.
+- options (object): { seed = <default uint32> (coerced |0), conservative = true }. Must be a PLAIN
+  bag -- own string keys only, on a null prototype, THIS realm's Object.prototype, or another root
+  prototype carrying no own known key (a clean vm / iframe literal is legal; a cross-realm
+  Object.prototype polluted with a known key is rejected). A Map / Date / RegExp / array / class
+  instance / Object.create(proto), an own
+  ACCESSOR (no getter is ever run), or an own Symbol key throws the plain-object [lite-sketch]
+  TypeError; inherited values are not read; an unknown string key throws with a did-you-mean hint. A
+  revoked or throwing-trap Proxy is caught and rejected tagged, never an untagged engine error.
 - withAccuracy inverts the bound: w = ceil(e/epsilon) (rounded up to a power of two),
   d = ceil(ln(1/delta)) (clamped UP to >= 1); epsilon in (0,1), delta in (0,1). An
   UNATTAINABLE request -- w > 2^25 or d > 32 -- THROWS [lite-sketch], it does not clamp
@@ -195,11 +211,16 @@ Hot surface (add / addHashed / estimate are worst-case O(d), zero allocation):
                                   int32 (e.g. through a Proxy), before any write.
 - estimate(key) -> number         The estimated frequency: the MIN of the key's d cells. QUERY,
                                   NEVER throws -- a key `add` would reject (non-integer / non-finite
-                                  / out-of-safe-range) returns 0 and never aliases a real key.
+                                  / out-of-safe-range) returns 0 and never aliases a real key. The
+                                  returned count is a Smi below 2^31 (Node); a cell value >= 2^31
+                                  boxes ~16 B on the non-inlined return (documented, not fixed: there
+                                  is deliberately no estimateInto).
 - estimateHashed(hi, lo) -> number  Query form of the pre-hashed path; a non-uint32 lane returns 0.
 - merge(other) -> this            Element-wise SATURATING ADD of other into this. Throws
                                   [lite-sketch] on a non-CountMinSketch, mismatched d / w / seed, or
-                                  a running total past 2^53-1. EXACT for plain (conservative:false)
+                                  a running total past 2^53-1 (brand-checked: a Proxy over an instance
+                                  or a field-copy forgery is NOT a CountMinSketch, throws tagged before
+                                  any read of other). EXACT for plain (conservative:false)
                                   sketches; a valid but looser upper bound for conservative ones; a
                                   cross-`conservative` merge is allowed (this keeps its own flag),
                                   and `saturated` is carried from either side.
@@ -233,8 +254,14 @@ set and that key may read low; the guarantee is probabilistic (delta), the hashi
   bound search for seconds). gamma = (1+alpha)/(1-alpha); a value x>0 lands in bucket
   key(x) = ceil(ln(x)/ln(gamma)), and the representative 2*gamma^key/(gamma+1) is within alpha
   relative error of every x in the bucket.
-- options (object): { maxBins = 2048, range?: [min, max] }. An unknown option key throws
-  [lite-sketch] (did-you-mean).
+- options (object): { maxBins = 2048, range?: [min, max] }. Must be a PLAIN bag -- own string keys
+  only, on a null prototype, THIS realm's Object.prototype, or another root prototype carrying no own
+  known key (a cross-realm Object.prototype polluted with a known key is rejected). A Map / Date /
+  RegExp / array / class
+  instance / Object.create(proto), an own ACCESSOR (no getter runs), or an own Symbol key throws the
+  plain-object [lite-sketch] TypeError; inherited values are not read; an unknown string key throws
+  (did-you-mean). A revoked or throwing-trap Proxy -- the bag OR the `range` -- is caught and rejected
+  tagged (the bag plain-object, `range` _badRange), never an untagged engine error.
   - DEFAULT (no range) = COLLAPSING-LOWEST: a dense Float64Array(maxBins); when the value range
     exceeds the budget, the SMALLEST-value buckets collapse into the floor bin. Unbounded value
     range, bounded memory; the relative-error guarantee is PRESERVED for the UPPER quantiles
@@ -272,16 +299,33 @@ Hot surface (add is worst-case O(1), zero allocation):
 - quantile(q) -> number           The q-quantile (q in [0,1]) within alpha relative error. COLD,
                                   O(bins) cumulative walk; rank = floor(q*(count-1)); returns the
                                   bucket representative (or 0 if the rank falls in the zero bucket).
-                                  NEVER throws -- an empty sketch or a bad q returns NaN.
+                                  NEVER throws -- an empty sketch or a bad q returns NaN. Returns a
+                                  fractional double on a non-inlined call, so EVERY call boxes ~16 B
+                                  on the return (gated: the Q-CTRL[ni/dd.quantile] lane reads 24).
+- quantilesInto(qs, out) -> number  Estimate several quantiles at once into a caller-owned
+                                  Float64Array, allocation-free: out[j] = quantile(qs[j]) BIT-FOR-BIT
+                                  (quantile's walk duplicated per q, so no double crosses a call), the
+                                  count written (min(qs.length, out.length)) returned. A bad q value
+                                  (NaN / outside [0,1] / empty sketch) writes NaN and NEVER throws;
+                                  in-place qs === out is allowed (each index read before written).
+                                  Throws [lite-sketch] BEFORE any write when qs / out is not a
+                                  Float64Array, the two partially overlap, or they are on different
+                                  SharedArrayBuffer objects (aliasing cannot be verified). The 0-alloc
+                                  p50/p90/p99/p999 render (ni/dd.quantilesInto.q4 reads 0; N8 gate <= 2).
 - merge(other) -> this            Fold other's bins/zeroCount/count/sum into this (collapsing as
                                   needed), carrying other.collapsed forward (collapsed mass makes this
                                   collapsed). Same-alpha (same gamma)-or-throw; a strict `this` throws if
                                   an incoming key is out of range OR if `other` is collapsed (its low-end
                                   mass has already folded). min/max combined exactly. O(other bins).
+                                  Brand-checked (a private #brand, not instanceof): a Proxy over an
+                                  instance or a field-copy forgery is NOT a DDSketch and throws tagged
+                                  before any read of other (a _gamma-only forgery previously merged and
+                                  left count / sum NaN).
 - clear() -> this                 Zero the bins + all scalars; reuse the allocation.
 - alpha / count / sum             Getters: the accuracy knob; the exact element count N; the exact sum.
 - min / max                       Getters: the EXACT tracked min / max (NOT bucketed -- exact while
-                                  quantile is alpha-approximate); NaN on an empty sketch.
+                                  quantile is alpha-approximate); NaN on an empty sketch. A stored -0
+                                  reads as +0 (`+ 0` in the getter; F18).
 - zeroCount / maxBins / numBins   Getters: the exact count of zeros; the bin capacity; the live
                                   (populated) bin count.
 - collapsed (getter)              Whether any smallest-value collapse has occurred (the small-value
@@ -307,7 +351,13 @@ co-headline: maxBins*8 bytes (fixed) vs the exact sorted array's 8*N bytes. Unif
     SpaceSaving.withError(epsilon, options?) -> SpaceSaving
 
 - capacity: k, the number of monitored counters; integer in [1, 2^24]. options { seed = <default
-  uint32> }; an unknown option key throws [lite-sketch] (did-you-mean). Memory is fixed at k counters.
+  uint32> } must be a PLAIN bag -- own string keys only, on a null prototype, THIS realm's
+  Object.prototype, or another root prototype carrying no own known key (a cross-realm Object.prototype
+  polluted with a known key is rejected). A Map / Date / RegExp / array / class instance /
+  Object.create(proto), an own ACCESSOR
+  (no getter runs), or an own Symbol key throws the plain-object [lite-sketch] TypeError; inherited
+  values are not read; an unknown string key throws (did-you-mean); a revoked / throwing-trap Proxy is
+  rejected tagged. Memory is fixed at k counters.
 - withError inverts the guarantee: k = ceil(1/epsilon), epsilon in (0,1); an UNATTAINABLE request
   (k > 2^24) THROWS [lite-sketch], it does not clamp down. The achieved epsilon (= 1/k) reads back via a getter.
 - Constructor throws [lite-sketch] typeof-first on a bad capacity / seed / option BEFORE allocation.
@@ -338,15 +388,35 @@ Hot surface (add is amortized O(1), zero allocation):
 - errorOf(key) -> number          The over-estimate bound (true count in [estimate - errorOf, estimate]),
                                   or 0 if not monitored. O(1), never throws.
 - forEach(fn) -> void             Alloc-free walk of monitored entries (storage order, NOT sorted):
-                                  fn(key, count, error, ss).
-- topK(n = size) -> Array<{key,count,error}>   The top n by count, DESC. COLD, ALLOCATES. Never throws.
+                                  fn(key, count, error, ss). The loop bound is the LIVE size -- do NOT
+                                  mutate the sketch inside fn (no ghosts, but entries may be skipped or
+                                  revisited). key is normalized (a stored -0 reads +0). A non-inlined
+                                  fn boxes ~49 B/entry for entries >= 2^31 (three doubles cross the
+                                  call; ni/ss.forEach/big reads 73 scavenges over 1.6M entries) -- use
+                                  topKInto for a 0-alloc render of large-keyed entries.
+- topK(n = size) -> Array<{key,count,error}>   The top n by count DESC, ties by ascending slot. COLD,
+                                  ALLOCATES (~160 B/entry, approx); each key is normalized (-0 reads
+                                  +0). Never throws.
 - heavyHitters(threshold) -> Array<{key,count,error}>   Every monitored key with count > threshold*total
                                   -- a SUPERSET with NO false negatives (may include false positives);
                                   filter by (count - error) > threshold*total for the guaranteed subset.
-                                  COLD, ALLOCATES. Never throws.
+                                  COLD, ALLOCATES (~135 B/entry, approx); each key normalized. Never throws.
+- topKInto(outKeys, outCounts, outErrors, n = size) -> number   Write the top-n entries best-first
+                                  into three caller-owned Float64Arrays, allocation-free, in EXACTLY
+                                  topK(n)'s order (count DESC, ties by ascending slot). n follows topK's
+                                  rule (a non-integer / negative n -> size, never throws); the count
+                                  written w = min(n, size, the three lengths) is returned; each key
+                                  normalized (-0 reads +0). O(size log w), no boxing (ni/ss.topKInto
+                                  .n16|n64/big read 0 scavenges; N8 gate <= 2). Throws [lite-sketch]
+                                  BEFORE any write when an out is not a Float64Array, two overlap in
+                                  memory (a wrong array type would truncate a key >= 2^32), or two are
+                                  on different SharedArrayBuffer objects (aliasing cannot be verified);
+                                  disjoint views over one buffer are fine. The lite-hud M3 render.
 - merge(other) -> this            Union two summaries (min-imputation for absent keys), keep the top-k.
-                                  Throws [lite-sketch] on a non-SpaceSaving or unequal capacity/seed;
-                                  the bracket guarantee survives (looser). O(k), a bounded cold scratch.
+                                  Throws [lite-sketch] on a non-SpaceSaving or unequal capacity/seed
+                                  (brand-checked: a Proxy over an instance or a field-copy forgery is
+                                  NOT a SpaceSaving, throws tagged before any read of other); the bracket
+                                  guarantee survives (looser). O(k), a bounded cold scratch (~300 B/entry, approx).
 - clear() -> this                 Drop all monitored keys; reuse the pools.
 - capacity / size / total         Getters: k; the monitored count (<= k); the exact running sum N.
 - epsilon (getter)                1 / capacity -- the theoretical error fraction.

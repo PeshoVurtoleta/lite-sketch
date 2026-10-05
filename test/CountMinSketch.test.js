@@ -23,6 +23,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { CountMinSketch, mix64, hashHi, hashLo, VERSION } from '../Sketch.js';
 
 const liteSketch = (e) => e instanceof Error && /^\[lite-sketch]/.test(e.message);
@@ -1388,4 +1389,191 @@ test('QA H2.6 (CMS): addHashedFrom at the end of the buffer (N-3 ok; N-2 / N-1 /
     f.addHashedFrom(UM, 0); g.addHashed(1, 2, 2 ** 32 - 1);
     qa26Same(g, f, 'count 2^32-1');
     assert.equal(f.estimateHashed(1, 2), 2 ** 32 - 1);
+});
+
+// ===========================================================================
+// H2.7 G-F21 (merge brand) + G-F18o (option bags, D2). The bag rule: a bag is a non-null object
+// whose prototype is null or whose prototype's prototype is null (Object.prototype of ANY realm);
+// every own key (incl. symbols / non-enumerable) must be a known STRING key; every own property
+// must be a DATA descriptor (an accessor makes it a non-bag -> no getter runs). Values are read as
+// OWN data only, so a polluted Object.prototype is ignored. A revoked / throwing-trap Proxy becomes
+// the tagged plain-object TypeError. See headrun/ in the scratchpad for the HEAD-failure evidence.
+// ===========================================================================
+
+function cmsCountingProxy(real, counter) {
+    return new Proxy(real, {
+        get(t, k, r) { counter.n++; return Reflect.get(t, k, r); },
+        has(t, k) { counter.n++; return Reflect.has(t, k); },
+        getPrototypeOf(t) { counter.n++; return Reflect.getPrototypeOf(t); },
+    });
+}
+
+test('G-F21 (CMS): merge rejects a field-copy forgery + a Proxy over a real instance, TAGGED, 0 traps', () => {
+    const base = new CountMinSketch(4, 256, { seed: 7 });
+    for (let i = 0; i < 500; i++) base.add(i, 1 + (i % 3));
+    const real = new CountMinSketch(4, 256, { seed: 7 });
+    for (let i = 0; i < 500; i++) real.add(i + 100000, 2);
+    const snap = cmsSnap(base);
+
+    const forged = Object.assign(Object.create(CountMinSketch.prototype), real);
+    assert.ok(forged instanceof CountMinSketch, 'the forgery passes instanceof');
+    assert.throws(() => base.merge(forged), (e) => e instanceof TypeError && liteSketch(e), 'field-copy forgery');
+    cmsUnchanged(snap, base, 'field-copy reject');
+
+    const counter = { n: 0 };
+    const px = cmsCountingProxy(real, counter);
+    assert.ok(px instanceof CountMinSketch);
+    counter.n = 0;
+    assert.throws(() => base.merge(px), (e) => e instanceof TypeError && liteSketch(e), 'Proxy merge');
+    assert.equal(counter.n, 0, 'the brand check ran NO proxy trap');
+    cmsUnchanged(snap, base, 'Proxy reject');
+});
+
+test('G-F21 (CMS): merge(primitive / null / undefined) throws TAGGED; a subclass merges', () => {
+    const base = new CountMinSketch(4, 256, { seed: 7 });
+    base.add(1, 1);
+    const snap = cmsSnap(base);
+    for (const o of [5, 0, 'x', true, Symbol('s'), null, undefined, NaN]) {
+        assert.throws(() => base.merge(o), liteSketch, 'merge(' + String(o) + ')');
+    }
+    cmsUnchanged(snap, base, 'primitive / null rejects');
+    class SubCMS extends CountMinSketch {}
+    const sub = new SubCMS(4, 256, { seed: 7 });
+    for (let i = 0; i < 100; i++) sub.add(i + 7, 1);
+    assert.doesNotThrow(() => base.merge(sub), 'a subclass carries the brand and merges');
+});
+
+test('G-F18o (CMS): unknown-key bags throw _badOption; non-bags throw the plain-object TypeError (ctor + withAccuracy)', () => {
+    const badOpt = (e) => e instanceof TypeError && /unknown option/.test(e.message) && liteSketch(e);
+    const plain = (e) => e instanceof TypeError && /must be a plain object/.test(e.message) && liteSketch(e);
+    for (const make of [(bag) => new CountMinSketch(4, 64, bag), (bag) => CountMinSketch.withAccuracy(0.1, 0.01, bag)]) {
+        for (const bag of [{ toString: 1 }, { constructor: 1 }, { hasOwnProperty: 1 }, JSON.parse('{"__proto__":1}'), { [Symbol('x')]: 1 }]) {
+            assert.throws(() => make(bag), badOpt, 'unknown-key bag');
+        }
+        let accCalls = 0;
+        const accessorBag = {};
+        Object.defineProperty(accessorBag, 'seed', { enumerable: true, configurable: true, get() { accCalls++; return 5; } });
+        const { proxy, revoke } = Proxy.revocable({ seed: 5 }, {});
+        revoke();
+        const nonbags = [new Map(), new Date(), /x/, [], new (class {})(), Object.create({ seed: 5 }),
+            accessorBag, proxy, new Proxy({}, { getPrototypeOf() { throw new Error('boom'); } })];
+        for (const bag of nonbags) assert.throws(() => make(bag), plain, 'non-bag');
+        assert.equal(accCalls, 0, 'an accessor bag never runs its getter (rejected as a non-bag first)');
+    }
+});
+
+test('G-F18o (CMS): accepts literal / null-proto / cross-realm / non-enumerable bags; polluted Object.prototype is ignored', () => {
+    const DEF = new CountMinSketch(4, 64).seed;
+    const neBag = {};
+    Object.defineProperty(neBag, 'seed', { value: 7, enumerable: false });
+    for (const bag of [{ seed: 7 }, { __proto__: null, seed: 7 }, runInNewContext('({ seed: 7 })'), neBag]) {
+        const c = new CountMinSketch(4, 64, bag);
+        assert.equal(c.seed, 7 >>> 0, 'bag seed applied');
+    }
+    assert.doesNotThrow(() => new CountMinSketch(4, 64, Object.create(null)), 'Object.create(null) is a legal empty bag');
+    const origSeed = Object.getOwnPropertyDescriptor(Object.prototype, 'seed');
+    const origCons = Object.getOwnPropertyDescriptor(Object.prototype, 'conservative');
+    try {
+        Object.prototype.seed = 999;
+        Object.prototype.conservative = false;
+        const c1 = new CountMinSketch(4, 64, {});
+        assert.equal(c1.seed, DEF, 'polluted seed ignored for {}');
+        assert.equal(c1.conservative, true, 'polluted conservative ignored for {}');
+        assert.equal(new CountMinSketch(4, 64).seed, DEF, 'polluted seed ignored for no-options');
+    } finally {
+        if (origSeed) Object.defineProperty(Object.prototype, 'seed', origSeed); else delete Object.prototype.seed;
+        if (origCons) Object.defineProperty(Object.prototype, 'conservative', origCons); else delete Object.prototype.conservative;
+    }
+});
+
+test('G-F18o (CMS): a polluted Object.prototype.value cannot smuggle an accessor bag (own-value check)', () => {
+    // The descriptor data-vs-accessor test reads its OWN `value` (not the prototype chain), so a
+    // polluted `Object.prototype.value` (data or getter) cannot make an accessor bag look like a
+    // data descriptor: the bag stays a non-bag, and no getter (bag accessor or polluted proto) runs.
+    const plain = (e) => e instanceof TypeError && /must be a plain object/.test(e.message) && liteSketch(e);
+    const DEF = new CountMinSketch(4, 64).seed;
+    let getterCalls = 0;
+    const orig = Object.getOwnPropertyDescriptor(Object.prototype, 'value');
+    try {
+        Object.prototype.value = 5;                       // (a) DATA pollution
+        assert.throws(() => new CountMinSketch(4, 64, { get seed() { getterCalls++; return 9; } }), plain,
+            'accessor bag rejected with Object.prototype.value = 5 (pre-fix: accepted, seed 5)');
+        assert.throws(() => new CountMinSketch(4, 64, { get conservative() { getterCalls++; return false; } }), plain,
+            'accessor conservative bag rejected under data pollution');
+        delete Object.prototype.value;
+        Object.defineProperty(Object.prototype, 'value', { configurable: true, get() { getterCalls++; return 3; } });   // (b) GETTER pollution
+        assert.throws(() => new CountMinSketch(4, 64, { get seed() { getterCalls++; return 9; } }), plain,
+            'accessor bag rejected with an Object.prototype.value getter (pre-fix: ran user code)');
+    } finally {
+        if (orig) Object.defineProperty(Object.prototype, 'value', orig); else delete Object.prototype.value;
+    }
+    assert.equal(getterCalls, 0, 'neither the bag accessor nor the polluted-proto getter ever runs');
+    assert.equal(new CountMinSketch(4, 64).seed, DEF, 'default seed intact after cleanup');
+});
+
+// ===========================================================================
+// H2.7 qa boundary suite -- option bags + merge brand edges
+// ===========================================================================
+
+const qaCmsPlain = (e) => e instanceof TypeError && /CountMinSketch options must be a plain object/.test(e.message) && liteSketch(e);
+
+test('QA H2.7 (CMS): frozen / sealed / Proxy(ownKeys only) bags accepted (ctor + withAccuracy); Symbol / computed __proto__ / getter / accessor-reporting Proxy rejected TAGGED, no user code', () => {
+    const f = new CountMinSketch(4, 64, Object.freeze({ seed: 7, conservative: false }));
+    assert.equal(f._seed, 7);
+    assert.equal(f._conservative, false);
+    assert.equal(new CountMinSketch(4, 64, Object.seal({ conservative: false }))._conservative, false);
+    assert.equal(CountMinSketch.withAccuracy(0.01, 0.01, Object.freeze({ seed: 7 }))._seed, 7);
+    let traps = 0;
+    assert.equal(new CountMinSketch(4, 64, new Proxy({ seed: 9 }, { ownKeys(t) { traps++; return Reflect.ownKeys(t); } }))._seed, 9);
+    assert.equal(traps, 1);
+    assert.throws(() => new CountMinSketch(4, 64, { [Symbol('qa')]: true }),
+        (e) => e instanceof TypeError && /unknown option "Symbol\(qa\)"/.test(e.message) && liteSketch(e));
+    assert.throws(() => new CountMinSketch(4, 64, { ['__proto__']: { seed: 5 } }),
+        (e) => /unknown option "__proto__"/.test(e.message) && liteSketch(e));
+    let g = 0;
+    assert.throws(() => new CountMinSketch(4, 64, { get conservative() { g++; return false; } }), qaCmsPlain);
+    assert.throws(() => CountMinSketch.withAccuracy(0.01, 0.01, { get seed() { g++; return 1; } }), qaCmsPlain);
+    assert.throws(() => new CountMinSketch(4, 64, new Proxy({ seed: 1 }, {
+        getOwnPropertyDescriptor() { return { get() { g++; return 1; }, configurable: true, enumerable: true }; },
+    })), qaCmsPlain);
+    assert.throws(() => new CountMinSketch(4, 64, new Proxy({}, { ownKeys() { throw new Error('trap'); } })), qaCmsPlain,
+        'a throwing ownKeys trap -> the tagged plain-object TypeError');
+    assert.equal(g, 0, 'no getter ran');
+    let vo = 0;
+    assert.throws(() => new CountMinSketch(4, 64, { conservative: { valueOf() { vo++; return true; } } }),
+        (e) => e instanceof TypeError && /conservative must be a boolean/.test(e.message) && liteSketch(e));
+    assert.equal(vo, 0);
+});
+
+test('QA H2.7 (CMS): a prototype carrying a KNOWN key (null-proto parent or cross-realm polluted Object.prototype) is rejected TAGGED, no getter run', () => {
+    // A non-(this realm) root prototype must carry NO own KNOWN key, else an inherited option would
+    // be silently dropped: fail closed. getOwnPropertyDescriptor reads the descriptor -> no getter.
+    let calls = 0;
+    const parent = Object.create(null);
+    Object.defineProperty(parent, 'conservative', { get() { calls++; return false; }, enumerable: true });
+    for (const bag of [Object.create(parent), Object.create(Object.assign(Object.create(null), { conservative: false, seed: 5 }))]) {
+        assert.throws(() => new CountMinSketch(4, 64, bag), qaCmsPlain, 'a prototype carrying a known key fails closed');
+    }
+    // A cross-realm Object.prototype polluted with a known key is also rejected (it is not THIS realm's).
+    assert.throws(() => new CountMinSketch(4, 64, runInNewContext('Object.prototype.seed = 5; ({})')),
+        qaCmsPlain, 'cross-realm polluted Object.prototype rejected');
+    assert.equal(calls, 0, 'getOwnPropertyDescriptor reads the descriptor, never the getter');
+});
+
+test('QA H2.7 (CMS): merge brand -- a second module instance rejected TAGGED, no-op; an overriding subclass merges through super', async () => {
+    const M2 = await import(new URL('../Sketch.js', import.meta.url).href + '?qa-second-instance-cms');
+    const a = new CountMinSketch(4, 64), b = new M2.CountMinSketch(4, 64);
+    a.add(1, 3); b.add(1, 4);
+    const before = cmsSnap(a);
+    assert.throws(() => a.merge(b), (e) => e instanceof TypeError && /merge expects a CountMinSketch/.test(e.message) && liteSketch(e));
+    cmsUnchanged(before, a, 'second-instance reject');
+    let over = 0;
+    class Sub extends CountMinSketch { merge(o) { over++; return super.merge(o); } }
+    const x = new Sub(4, 64);
+    x.add(1, 2);
+    x.merge(a);
+    a.merge(x);
+    assert.equal(over, 1);
+    assert.equal(x.estimate(1), 5);
+    assert.equal(a.estimate(1), 8);
 });

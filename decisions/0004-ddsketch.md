@@ -138,6 +138,56 @@ Validation only; `add` / `addFrom` gain guard lines, the rest of the hot path is
    its rejected arg through the shared `_describe(x)` (typeof-first), so a null-proto object or a
    throwing / re-entrant `toString` can no longer escape the `[lite-sketch]` tag or mutate state.
 
+## H2.7 amendment (2026-10-05) -- quantilesInto (F8) + plain-bag options (F18) + the merge brand (F21) + -0
+
+Cold paths only; `add` (448) / `addFrom` (449) / `_addKey` / `quantile` are byte-identical.
+
+1. **`quantilesInto(qs, out)` (F8, D5).** `quantile` RETURNS a fractional double and is never inlined,
+   so every call boxes a ~16 B HeapNumber on the return (the `Q-CTRL[ni/dd.quantile]` lane reads 24
+   scavenges over 1.6M calls); M2 (`Hud.js`) calls it per frame. `quantilesInto` estimates several
+   quantiles into a caller-owned `Float64Array`: `q` is read from `qs[j]` and the value written to
+   `out[j]`, so neither crosses a call. `quantile` stays byte-identical -- the walk is DUPLICATED into
+   `quantilesInto` (each `return X` becomes `out[j] = X; break qrun`) rather than factored into a shared
+   helper, because a shared helper would return the double across a call and box it; the parity oracle
+   gates `quantilesInto == quantile(q)` bit-for-bit per `q`, NaN cases included. A bad `q` value writes
+   NaN and never throws; in-place `qs === out` is allowed (each index is read before written, so
+   `_f64Clash(qs, out, sameOk = true)`). A `qs` / `out` that is not a real `Float64Array` (checked via
+   cached `%TypedArray%` getters that run no `Proxy` trap), two distinct views that PARTIALLY
+   overlap, or two views on DIFFERENT `SharedArrayBuffer` objects, throws the new cold `_badQuantiles`
+   TypeError before any write. The SAB case FAILS CLOSED: two distinct SAB objects can alias one
+   memory block (`structuredClone`, a worker round-trip) that a buffer-identity test cannot see, so a
+   cross-SAB pair is rejected (a SAB is told from a plain `ArrayBuffer` with no user code -- the cached
+   `ArrayBuffer.prototype.byteLength` getter throws only on a SAB). The overlap check probes the PLAIN
+   buffer FIRST (the prototype picks only the probe ORDER, never the answer -- a SAB with a swapped
+   prototype is still probed by the getter and still rejected), so EVERY ACCEPTED call is
+   allocation-free: only a two-SAB pair, which is rejected anyway, pays the internal throw. A prior
+   version probed unconditionally and threw per accepted SAB-first mixed call (~1200 / ~1900 B/call);
+   the torture `quantilesInto SAB-first` scavenge lane gates it at 0. The `ni/dd.quantilesInto.q4`
+   lane reads 0 scavenges (N8 gate `<= 2`). There is no `countInto` / `estimateInto` -- HLL `count` is a
+   Smi at realistic cardinality; those return boxes stay docs only.
+2. **Options are an own-property plain bag (F18, D2).** `DD_KNOWN_OPTS` is now `{ __proto__: null,
+   maxBins: true, range: true }`, and the ctor classifies the bag through `_optScan` / `_optOwn` (own
+   string keys only, on a `null` prototype, THIS realm's `Object.prototype`, or another root prototype
+   carrying no own known key -- a cross-realm `Object.prototype` polluted with a known key is rejected;
+   own DATA descriptors
+   only, so no getter runs; inherited values not read) inside one `try`, so a revoked / throwing-trap
+   `Proxy` becomes the tagged plain-object TypeError. The `range` container reads (`Array.isArray`,
+   `.length`, `[0]`, `[1]`) ALSO sit in a `try` whose catch calls `_badRange(range)`, so a revoked /
+   throwing-trap `Proxy` range is tagged, not an engine throw. The value checks run after each `try`,
+   verbatim. Each `range` index is read EXACTLY ONCE: the ctor keeps the VALIDATED `rmin` / `rmax` and
+   stores them into `_rangeMin` / `_rangeMax`, never re-reading `range[0]` / `range[1]` (a prior version
+   re-read them outside the `try`, so a two-faced getter could store a different value than it validated,
+   or throw untagged on the second read -- F18 TOCTOU).
+3. **The merge brand (F21).** A `_gamma`-only field-copy forgery previously merged and left `count` /
+   `sum` = NaN; a `new Proxy(real, {})` passed `instanceof`. A private `#brand` is installed by the
+   ctor, and `merge` / `_badMerge` test `typeof other === 'object' && other !== null && #brand in other`
+   first, before any read of `other`. A forgery throws the tagged `[lite-sketch]` TypeError as a
+   byte-identical no-op; the gamma check and the strict / collapsed checks follow, minus `instanceof`.
+4. **`-0` normalized at the OUTPUT (F18, D6).** `add(-0)` stored `-0`, so `min` / `max` read `-0`
+   (`quantile(0)` already read `+0`). The `min` / `max` getters now return `this._min + 0` /
+   `this._max + 0` -- storage is untouched, so no hot byte changes; the normalization lives in the cold
+   getters, keeping `add` under the inline cap.
+
 ## Non-goals
 
 No negative values (deferred); no rank-error mode (relative-error is the point); no top-k /

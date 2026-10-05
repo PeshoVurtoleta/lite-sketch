@@ -747,7 +747,121 @@ try {
         '; err-identity=' + h26ErrMode + '/' + h26ErrChecks + ') checks=' + h26Checks +
         ' diffs=' + (h26Fail || 'identical') + ' | ' + (h26Ok ? 'ok' : 'FAIL'));
 
-    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '' && h25Ok && h26Ok;
+    // ---- H2.7 F7/F8/F18/F21 identity + oracles + DOC-DIFF -----------------------------------
+    // Identity: a VALID bag ({seed}/{maxBins}) builds bit-identical state on the tree and the ref;
+    // topK / forEach / heavyHitters over POSITIVE keys (both builds hash them identically regardless
+    // of the ref's F12 status) and quantile are identical. Oracles (ref-aware; both refs are
+    // pre-H2.7, so the ref lacks the Into methods): the tree's NEW topKInto == the REF's topK(n)
+    // (count DESC, ties by slot, Object.is), and the tree's quantilesInto == the REF's quantile per
+    // q (Object.is). DOC-DIFF (new-side only, A): the intended H2.7 changes are PRESENT -- -0 outputs
+    // read +0 at six sites, forEach under a mid-walk clear() visits 1 (was 5), unknown / non-bag
+    // options throw, a polluted Object.prototype is ignored, a field-copy / Proxy-wrapped instance is
+    // rejected by merge, a revoked-Proxy option / range is tagged.
+    let h27Fail = '';
+    const h27Throws = (fn) => { try { fn(); return false; } catch { return true; } };
+    const h27Msg = (fn) => { try { fn(); return ''; } catch (e) { return e.message; } };
+    const h27Tagged = (fn) => { try { fn(); return false; } catch (e) { return /^\[lite-sketch]/.test(e.message); } };
+    let h27IdChecks = 0, h27QChecks = 0;
+    for (const cap of [1, 7, 64, 1000]) {
+        if (h27Fail) break;
+        const ta = new A.SpaceSaving(cap, { seed: 7 }), rb = new B.SpaceSaving(cap, { seed: 7 });
+        for (let i = 0; i < 20000; i++) { const k = (i * 2654435761) % 5000; ta.add(k, 1 + (i % 11)); rb.add(k, 1 + (i % 11)); }
+        if (ta.seed !== rb.seed) { h27Fail = 'ss cap ' + cap + ' bag-seed'; break; }
+        for (const n of [0, 1, 3, ta.size, ta.size + 5, undefined]) {
+            const refTop = rb.topK(n);                                  // the ref's established order
+            const len = Math.max(ta.size, 8);
+            const kA = new Float64Array(len), cA = new Float64Array(len), eA = new Float64Array(len);
+            const w = ta.topKInto(kA, cA, eA, n);
+            h27IdChecks++;
+            if (w !== refTop.length) { h27Fail = 'ss cap ' + cap + ' topKInto w=' + w + ' != ref topK len ' + refTop.length + ' (n=' + n + ')'; break; }
+            for (let j = 0; j < w && !h27Fail; j++) {
+                if (!Object.is(kA[j], refTop[j].key) || !Object.is(cA[j], refTop[j].count) || !Object.is(eA[j], refTop[j].error)) {
+                    h27Fail = 'ss cap ' + cap + ' topKInto[' + j + '] != ref topK (n=' + n + ')';
+                }
+            }
+            if (h27Fail) break;
+            const treeTop = ta.topK(n);                                 // tree topK == ref topK (the +0 is a no-op on positive keys)
+            for (let j = 0; j < treeTop.length && !h27Fail; j++) {
+                if (!Object.is(treeTop[j].key, refTop[j].key) || !Object.is(treeTop[j].count, refTop[j].count)) h27Fail = 'ss cap ' + cap + ' tree topK != ref topK';
+            }
+        }
+        if (h27Fail) break;
+        const fa = [], fb = [];
+        ta.forEach((k, c, e) => { fa.push(k, c, e); });
+        rb.forEach((k, c, e) => { fb.push(k, c, e); });
+        h27IdChecks++;
+        if (fa.length !== fb.length) h27Fail = 'ss cap ' + cap + ' forEach length';
+        for (let j = 0; j < fa.length && !h27Fail; j++) if (!Object.is(fa[j], fb[j])) h27Fail = 'ss cap ' + cap + ' forEach[' + j + ']';
+        if (!h27Fail) {
+            const ha = ta.heavyHitters(0.001), hb = rb.heavyHitters(0.001);
+            h27IdChecks++;
+            if (ha.length !== hb.length) h27Fail = 'ss cap ' + cap + ' heavyHitters length';
+            for (let j = 0; j < ha.length && !h27Fail; j++) if (!Object.is(ha[j].key, hb[j].key) || !Object.is(ha[j].count, hb[j].count)) h27Fail = 'ss cap ' + cap + ' heavyHitters[' + j + ']';
+        }
+    }
+    if (!h27Fail) {
+        const qlist = [0, 1e-9, 0.25, 0.5, 0.9, 0.99, 0.999, 1, NaN, -1, 2, Infinity];
+        for (const opts of [undefined, { maxBins: 16 }, { range: [1, 1000] }]) {
+            if (h27Fail) break;
+            const da = new A.DDSketch(0.01, opts), db = new B.DDSketch(0.01, opts);
+            for (let i = 1; i <= 10000; i++) { const v = (i * 1.37) % 900 + 1; da.add(v); db.add(v); }
+            if (da.maxBins !== db.maxBins) { h27Fail = 'dd bag maxBins'; break; }
+            const qs = Float64Array.from(qlist), out = new Float64Array(qlist.length);
+            const w = da.quantilesInto(qs, out);
+            if (w !== qlist.length) { h27Fail = 'dd quantilesInto w'; break; }
+            for (let j = 0; j < qlist.length && !h27Fail; j++) {
+                h27QChecks++;
+                const refQ = db.quantile(qlist[j]);
+                if (!Object.is(da.quantile(qlist[j]), refQ)) h27Fail = 'dd quantile != ref q=' + qlist[j];
+                else if (!Object.is(out[j], refQ)) h27Fail = 'dd quantilesInto != ref quantile q=' + qlist[j];
+            }
+        }
+    }
+    // DOC-DIFF (new side A): each intended change is CHECKED present and printed (not a parity fail).
+    const sZ = new A.SpaceSaving(4); sZ.add(-0, 3);
+    let sZfe; sZ.forEach((k) => { sZfe = k; });
+    const sZok = new Float64Array(1), sZoc = new Float64Array(1), sZoe = new Float64Array(1); sZ.topKInto(sZok, sZoc, sZoe, 1);
+    const dZ = new A.DDSketch(0.01); dZ.add(-0);
+    const sClr = new A.SpaceSaving(8, { seed: 1 }); for (let i = 0; i < 8; i++) sClr.add(i, 1);
+    let sClrSeen = 0; sClr.forEach((k, c, e, ss) => { sClrSeen++; if (sClrSeen === 1) ss.clear(); });
+    const { proxy: revOpt, revoke: revOptR } = Proxy.revocable({ seed: 1 }, {}); revOptR();
+    const { proxy: revRng, revoke: revRngR } = Proxy.revocable([1, 1000], {}); revRngR();
+    const real21 = new A.SpaceSaving(8, { seed: 7 }); for (let i = 0; i < 100; i++) real21.add(i, 1);
+    const base21 = new A.SpaceSaving(8, { seed: 7 });
+    const forged21 = Object.assign(Object.create(A.SpaceSaving.prototype), real21);
+    const ddReal = new A.DDSketch(0.01); for (let i = 1; i <= 100; i++) ddReal.add(i);
+    const ddBase = new A.DDSketch(0.01); const ddBaseC = ddBase.count;
+    const gOnly = Object.create(A.DDSketch.prototype); gOnly._gamma = ddReal._gamma;
+    const polOrig = Object.getOwnPropertyDescriptor(Object.prototype, 'seed');
+    let polSeedIgnored;
+    try { Object.prototype.seed = 999; polSeedIgnored = new A.CountMinSketch(4, 64, {}).seed === new A.CountMinSketch(4, 64).seed; }
+    finally { if (polOrig) Object.defineProperty(Object.prototype, 'seed', polOrig); else delete Object.prototype.seed; }
+    const h27doc = {
+        'ss(-0)-forEach+0': Object.is(sZfe, 0),
+        'ss(-0)-topK+0': Object.is(sZ.topK(1)[0].key, 0),
+        'ss(-0)-heavyHitters+0': Object.is(sZ.heavyHitters(0)[0].key, 0),
+        'ss(-0)-topKInto+0': Object.is(sZok[0], 0),
+        'dd(-0)-min+0': Object.is(dZ.min, 0),
+        'dd(-0)-max+0': Object.is(dZ.max, 0),
+        'forEach-clear-visits-1': sClrSeen === 1,
+        'unknown-key-bag-throws': h27Throws(() => new A.CountMinSketch(4, 64, { toString: 1 })) && h27Throws(() => new A.SpaceSaving(8, { bogus: 1 })) && h27Throws(() => new A.DDSketch(0.01, { nope: 1 })),
+        'non-bag-throws-plain': /must be a plain object/.test(h27Msg(() => new A.SpaceSaving(8, new Map()))) && /must be a plain object/.test(h27Msg(() => new A.CountMinSketch(4, 64, Object.create({ seed: 5 })))),
+        'polluted-seed-ignored': polSeedIgnored === true,
+        'field-copy-forgery-rejected': h27Tagged(() => base21.merge(forged21)),
+        'proxy-instance-rejected': h27Tagged(() => base21.merge(new Proxy(real21, {}))),
+        'dd-gamma-only-forgery-noop': h27Tagged(() => ddBase.merge(gOnly)) && ddBase.count === ddBaseC,
+        'revoked-proxy-option-tagged': h27Tagged(() => new A.CountMinSketch(4, 64, revOpt)),
+        'revoked-proxy-range-tagged': /range must be \[min, max]/.test(h27Msg(() => new A.DDSketch(0.01, { range: revRng }))),
+    };
+    let h27docFail = '';
+    for (const k of Object.keys(h27doc)) if (!h27doc[k] && !h27docFail) h27docFail = k;
+    const h27Ok = h27Fail === '' && h27docFail === '';
+    console.log('PARITY H2.7 F7/F8/F18/F21 vs ' + ref + ': identity(topKInto==ref topK, quantilesInto==ref quantile; id-checks=' +
+        h27IdChecks + ' q-checks=' + h27QChecks + ')=' + (h27Fail || 'identical') +
+        ' | DOC-DIFF(new-side): ' + Object.keys(h27doc).map((k) => k + '=' + (h27doc[k] ? 'yes' : 'NO')).join(' ') +
+        ' | ' + (h27Ok ? 'ok' : 'FAIL ' + (h27Fail || h27docFail)));
+
+    const ok = hllOk && ddOk && cmsOk && ssOk && msgOk && docFail === '' && n9Ok && f12Fail === '' && h25Ok && h26Ok && h27Ok;
     if (!ok) process.exitCode = 1;
 } finally {
     rmSync(dir, { recursive: true, force: true });

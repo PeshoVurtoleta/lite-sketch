@@ -291,8 +291,8 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | F4 | A4 (M) CMS `_applyCons(base, ...)` / `_applyPlain(base, ...)` (:635-636) and per-row `_m3final` (:669/:693/:730) pass doubles. | `base` goes into an Int32Array(1) scratch and `count` into a Float64Array(1) scratch. The apply helpers take no arguments, and the per-row fmix is inlined. | CMS -2^31 keys 73 -> 24 and estimate no-inline 49 -> 24. H2.5 delta (done): the keys gate was already met by H2.4's int32 hash words; the remaining Node box was a VARIABLE count >= 2^31 crossing `_applyCons` / `_applyPlain` in df (24-25 -> 0-1, cons + plain). The `estimate` per-row fmix inline moves to H2.6 (364 -> 422 would crowd the 460 cap); the count scratch is `Float64Array(1)`. |
 | F5 | A5 (H for consumers) a key or count outside Smi range passed to `add(...)` is boxed by the CALLER at a non-inlined boundary (24 at 8N on Node, 12 B in Chrome). lite-hud's CMS key `channelIdx * 2^32 + tag` is >= 2^32 for every channel >= 1, so it ALWAYS boxes. | `add(key[, count])` validates, writes into a per-instance Float64Array scratch, and calls a shared `_addAt(buf, i)`. New `addFrom(buf, i)`: HLL reads key = buf[i]; CMS / SS read key = buf[i], count = buf[i+1]. Same validation and same throws (byte-identical no-op), like DDSketch.addFrom (1.1.0). CMS / SS `estimate` also go through the scratch. | N1: every addFrom lane <= 2 at 8N on Node (default + no-inline, fresh + warm, 6 key classes x counts {1, 2^30}). N6: 0 in Chrome. H2.6 delta (q1 pre-measured, pending qa): shipped as `_addAt` x3 + `addFrom` x3 + CMS `_estimateAt` (D3); addFrom 0-2 at 1.6M ops (N1 gate <= 2), SS add non-Smi 25 -> 1, CMS constant count 2^32-1 24 -> 1 at the cap120 lane (0-1 in the default tier), Chrome ni add 60-72 -> 0. |
 | F6 | A12 (L) the `addHashed` contract (uint32 lanes, :337/:649): any lane >= 2^31 boxes at the boundary (HLL addHashed 30, CMS 4). | `addHashedFrom(Uint32Array\|Int32Array, i)`, or accept int32 lanes. | An addHashedFrom lane at 0. H2.6 delta (q1 pre-measured, pending qa): shipped `addHashedFrom` on HLL (2-slot [hi, lo]) and CMS (3-slot [hi, lo, count], D2; an Int32Array caps count at 2^31-1); AHF lanes 0-2 at 1.6M ops (gate <= 2). |
-| F7 | A9 (M) `SpaceSaving.forEach` passes key / count / error as callback arguments: 3130 B/call at k=64 (no-inline, 2^31 keys and counts). | `topKInto(outKeys, outCounts, outErrors, n)` (the old 1.2 backlog N2) or `snapshotInto`. Document `forEach`'s per-entry boxes. | A topKInto lane at 0. |
-| F8 | A10 (M, doc) `SpaceSaving.merge` allocates fresh O(k) state per call (a Map, 2 objects per key, an array, 3 closures): 18.0 KB/call at k=64, 282.5 KB at k=1024. llms.txt:283 says "bounded cold scratch". A11 (L): HLL `count` (16.8 B/call default, 111 no-inline) and DD `quantile` (5 / 16 B) box their returns. | Fix the merge wording (or reuse a preallocated scratch). Document the returned-double boxes, and add `countInto` / `quantileInto` if a consumer needs a 0 B/op render. | The docs state the bytes, or the Into lanes are at 0. |
+| F7 | A9 (M) `SpaceSaving.forEach` passes key / count / error as callback arguments: 3130 B/call at k=64 (no-inline, 2^31 keys and counts). | `topKInto(outKeys, outCounts, outErrors, n)` (the old 1.2 backlog N2) or `snapshotInto`. Document `forEach`'s per-entry boxes. | A topKInto lane at 0. H2.7 delta (done): shipped `SpaceSaving.topKInto(outKeys, outCounts, outErrors, n?)` (D4) -- an in-place bounded min-heap of slot ids in `outKeys`, EXACTLY `topK(n)`'s order (count DESC, ties by ascending slot), 0 alloc; the `ni/ss.topKInto.n16\|n64/big` N8 lanes read 0 scavenges (gate <= 2), and the `FE-CTRL[ni/ss.forEach/big]` control stays the documented 73. `forEach`'s ~49 B/entry (non-Smi, non-inlined fn) is documented in d.ts / llms / README. |
+| F8 | A10 (M, doc) `SpaceSaving.merge` allocates fresh O(k) state per call (a Map, 2 objects per key, an array, 3 closures): 18.0 KB/call at k=64, 282.5 KB at k=1024. llms.txt:283 says "bounded cold scratch". A11 (L): HLL `count` (16.8 B/call default, 111 no-inline) and DD `quantile` (5 / 16 B) box their returns. | Fix the merge wording (or reuse a preallocated scratch). Document the returned-double boxes, and add `countInto` / `quantileInto` if a consumer needs a 0 B/op render. | The docs state the bytes, or the Into lanes are at 0. H2.7 delta (done): shipped `DDSketch.quantilesInto(qs, out)` (D5) -- `quantile`'s walk duplicated per q, read / write via the Float64Arrays so no double crosses a call; the `ni/dd.quantilesInto.q4` N8 lane reads 0 scavenges (gate <= 2) against the `Q-CTRL[ni/dd.quantile]` control of 24. No `countInto` / `estimateInto` (HLL count is a Smi; both return boxes are docs only). The merge / topK / heavyHitters bytes (~300 / ~160 / ~135 B/entry, approx per alloc.mjs) and the quantile / estimate 16 B return box are stated in d.ts / llms / README; the llms "bounded cold scratch" wording now carries the ~300 B/entry figure. |
 | F9 | A6 + A7 (H, harness) the perf gate's `maxScavenges: 64` (PerfGate.test.mjs:226) admits ~2.7 boxes/op, and its only mustFail allocates ~528 B/op. The torture `SCAV_BOX = 48` (torture.mjs:303) admits 1.6 boxes/op and pins F1 as "acceptable". The comments at torture.mjs:288-299 and PerfGate:215-225 misattribute the floor. torture.mjs:335-341 says the add-box teeth "live in lite-hud", but they reproduce here. | Lower `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. Add the N4 one-box mustFail. Fix the comments. | N4 trips. All lanes pass at the new thresholds after F1-F5/N7. |
 
 **Fail-closed + correctness fixes (F)**
@@ -307,10 +307,10 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | F15 | B-A6 (M) `count` is unbounded in DDSketch (:1060) and SpaceSaving (:1536), while CMS caps at 2^32-1. The "exact" running aggregates go inexact past 2^53, then Infinity, and `heavyHitters` then drops the heaviest key (`add(1,1e308)` twice gives total Infinity and `heavyHitters(0)` returns []). | Reject count > 2^32-1 and any add that would push total past MAX_SAFE, tagged and byte-identical (S5). | `add(1,1e308)` throws with an unchanged snapshot. `add(1, 2**32-1)` is accepted. |
 | F16 | B-A7 (M) `withAccuracy` / `withError` silently clamp to a weaker guarantee (:570-576, :1513): `withAccuracy(1e-12,1e-20)` returns epsilon 8.1e-8, and `withError(1e-9)` returns capacity 2^24 / epsilon 5.96e-8. README:167/270 and llms.txt:71 say "k = ceil(1/epsilon)". | Throw when the request is unattainable (w > 2^25, d > 32, k > 2^24) (S6). | `withAccuracy(1e-12,0.01)` and `withError(1e-9)` throw. `withError(2**-24)` succeeds. |
 | F17 | B-A8 (L) `minIndexable` / `maxIndexable` (:976-977) are not the EXACT accepted bounds (off by ulps, up to ~4e-13 relative). Across 3000 alphas, 2428 reject `nextUp(min)` and 2465 accept `nextUp(max)`. A consumer pre-check (lite-hud M2's band) can pass a value that `add` throws on. | Find the exact acceptance edges in the ctor with a bit-level search using `add`'s own key expression. | Over a 3000-alpha sweep: add(nextUp(min)) accepted, add(min) rejected, add(max) accepted, add(nextUp(max)) rejected. |
-| F18 | B-A9 / A10 / A11 (L) the option check uses `in` against a frozen object that inherits Object.prototype (:521, :906, :1446): `{constructor:1}` / `{toString:1}` are accepted, `{__proto__:{seed:5}}` sets the seed, and Map / Date are accepted as bags. `SpaceSaving.forEach` uses a stale loop bound under mutation (:1620-1624: `clear()` at the first entry visits 4 ghosts, `merge()` mid-walk visits key 1 twice). -0 is stored as-is (SS key, DD min). | Use own-property checks and read only own values. Use the live `_size` bound and document "no mutation in forEach". Normalize with `key + 0`. | `{toString:1}` throws in all three classes. `clear()` mid-walk visits 1 entry. `Object.is(topK()[0].key, 0)`. |
+| F18 | B-A9 / A10 / A11 (L) the option check uses `in` against a frozen object that inherits Object.prototype (:521, :906, :1446): `{constructor:1}` / `{toString:1}` are accepted, `{__proto__:{seed:5}}` sets the seed, and Map / Date are accepted as bags. `SpaceSaving.forEach` uses a stale loop bound under mutation (:1620-1624: `clear()` at the first entry visits 4 ghosts, `merge()` mid-walk visits key 1 twice). -0 is stored as-is (SS key, DD min). | Use own-property checks and read only own values. Use the live `_size` bound and document "no mutation in forEach". Normalize with `key + 0`. | `{toString:1}` throws in all three classes. `clear()` mid-walk visits 1 entry. `Object.is(topK()[0].key, 0)`. H2.7 delta (done): shipped the plain-bag rule (D2) via `_optScan` / `_optOwn` + null-proto KNOWN sets -- own string DATA keys only, no inherited read, no getter run, a revoked / throwing-trap Proxy (bag or DD `range`) rejected tagged; `forEach`'s live `this._size` bound (no ghosts; `clear()` in the first callback now visits 1); and `+ 0` at the OUTPUTS (SS forEach / topK / heavyHitters / topKInto, DD min / max getters). Docs updated in d.ts / llms / README / ADR 0003-0005; CHANGELOG Fixed + Changed. |
 | F19 | D1-D4 (L) docs. README:137 overclaims "p50/p90/p99 within alpha" under collapse (probe: p50 6187 vs 147), and says strict throws by value when it really works by bucket key (`range [1,100]` accepts 0.99 and 101). The README:322-330 allocation table describes module-scope slots the code never writes, and omits `_hist` / `_idx`. The README Testing section has no count (182). RESEARCH.md:9 says "Not yet coded", ROADMAP H1 says "awaiting publish", and the lockfile version is 0.1.0. The unqualified "0 B/op" lines (README:30/64/100/167/188/213/215/272/275/318-334, llms.txt:32/42/65/70/299, Sketch.d.ts:68/141/147/306/315) need "0 library bytes/op; a non-Smi argument boxes at a non-inlined boundary; use addFrom". | Text fixes. | Grep: no unqualified 0 B/op line, and the count is stated. |
 | F20 | Found by H2.1 qa, confirmed on HEAD (M): all 33 cold throwers build their message with `String(x)`, which runs caller code. Three consequences: (1) `add(Object.create(null))` on any member, and `new DDSketch(Object.create(null))`, throw an UNTAGGED `TypeError: Cannot convert object to primitive value`; (2) a `toString` that throws replaces the tagged error; (3) a `toString` that calls `h.addHashed(0,0)` changes the receiver during a rejection that must be byte-identical (reg[0] 0 -> 53, and the throw is still tagged). | One cold `_describe(x)` shared by every thrower: `typeof` first, primitives formatted directly (`String` is safe for number / string / boolean / bigint / symbol / undefined, plus null), and `'[object]'` / `'[function]'` for anything else, so no user code ever runs. Replace every `String(x)` in a throw path. | A null-proto object and a throwing / mutating `toString` give a TAGGED throw with byte-identical state in all four members and every ctor. Remove the `todo` in test/HyperLogLog.test.js (case 6) and make it a real test. |
-| F21 | Found by H2.2 qa, confirmed (L): every `merge` brand-checks with `instanceof`, which a forged `Object.create(X.prototype)` passes. DDSketch: a forged other with a matching `_gamma` merges silently and leaves `count` / `sum` = NaN on strict and non-strict sketches. CMS: a forged other throws an UNTAGGED TypeError. Present in 1.1.2. | A real brand check in every `merge`: a private-field brand (`#brand in other`) or a module-scope WeakSet filled by the ctor, so a forgery throws through the tagged `_badMerge` before any read. | A forged prototype instance throws a tagged error with byte-identical state in all four members. |
+| F21 | Found by H2.2 qa, confirmed (L): every `merge` brand-checks with `instanceof`, which a forged `Object.create(X.prototype)` passes. DDSketch: a forged other with a matching `_gamma` merges silently and leaves `count` / `sum` = NaN on strict and non-strict sketches. CMS: a forged other throws an UNTAGGED TypeError. Present in 1.1.2. | A real brand check in every `merge`: a private-field brand (`#brand in other`) or a module-scope WeakSet filled by the ctor, so a forgery throws through the tagged `_badMerge` before any read. | A forged prototype instance throws a tagged error with byte-identical state in all four members. H2.7 delta (done): shipped a class-private `#brand` on all four members (D1); `merge` and `_badMerge` test `typeof other === 'object' && other !== null && #brand in other` as the FIRST statement, before any read of `other`. A field copy and a `new Proxy(real, {})` now throw the tagged TypeError (a bare forgery gets the TypeError, not the shape RangeError -- CHANGELOG Changed); the DD `_gamma`-only NaN merge is closed; subclasses still merge. Docs in d.ts / llms / README / ADR 0002-0005; CHANGELOG Fixed + Changed. |
 
 **New gates (N)** (none exist today)
 
@@ -323,7 +323,7 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | N5 | Deopt-loop gate: a `--trace-deopt` child shows <= 3 `add` deopts per lane. | HLL 416-461 |
 | N6 | Headless Chrome lane (`--enable-precise-memory-info` + gc(), default and no-inline): addFrom 0, and `add` <= 12 B per non-Smi argument. Node cannot replace this lane: it never sees 31-bit-Smi boxes. | HLL 77, CMS 113, SS 170 B/op |
 | N7 | Driver rule: drivers pass `add` only Smi-range values; full-range keys go only through `addFrom`. | the SS evict / HLL addHashed drivers pass `v >>> 0` -- H2.6 delta (pending qa): torture `ahStep` / `chStep` and PerfGate `addHashedStream` move to `addHashedFrom`, and the PerfGate SS evict driver to `addFrom`; the F9 thresholds stay untouched (H2.8). |
-| N8 | Query lanes: SS.forEach with entries >= 2^31 and a non-inlined callback; the Into APIs at 0. | forEach 3130 B/call |
+| N8 | Query lanes: SS.forEach with entries >= 2^31 and a non-inlined callback; the Into APIs at 0. | forEach 3130 B/call -- H2.7 delta (done): the `query` lane type ships; `N8[df\|ni/ss.topKInto.n16\|n64/big]` and `N8[df\|ni/dd.quantilesInto.q4]` read 0 (gate <= 2), the `ss.forEach/small` regression guard 0 (gate <= 2), and the controls `Q-CTRL[ni/dd.quantile]` 24 and `FE-CTRL[ni/ss.forEach/big]` 73 (gate >= 12); the 6 Into gates FAIL `=ABSENT` on HEAD via `--lib`. |
 | N9 | Parity against `git show HEAD:Sketch.js` (the audit's `parity.mjs` shape): bit-identical estimates across all members, edges, and merges. | n/a (new) |
 
 **Settle calls -- SETTLED 2026-10-04** (binding for every H2 agent, decided after the second
@@ -396,8 +396,8 @@ grows until H2.8, which owns the 1.2.0 trinity. The order follows the dependenci
 | H2.4 (done) | F12 (S1) + the F2 Node part (int32 hash words, `Math.abs` sign split) at all six sites, N9 parity, N3 lanes. The F2 hand-inline moved to H2.6 (7.5 planner delta) | hash sites |
 | H2.5 (done) | F3 + F4: argument-free SpaceSaving and CMS helpers, N3 count lanes. SS home's F2 hand-inline landed here (`_homeAt`) | SS / CMS internals |
 | H2.6 (done) | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7, plus the F2 murmur hand-inline inside `_addAt` (moved from H2.4) and the CMS `estimate` per-row fmix inline (moved from H2.5) | public API (additive) |
-| **H2.7** | F7, F8, F18, F21: `topKInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
-| H2.8 | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
+| H2.7 (done) | F7, F8, F18, F21: `topKInto` + `quantilesInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
+| **H2.8** | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
 
 ### 7.2 H2.1 spec -- F1 + the lane harness  [DONE, committed 980e4fe]
 
@@ -1343,7 +1343,7 @@ Reviewer focus:
 RISK: the G2 / G4 margins are +1-2 over the caller-box floor, so a 3/3-high rep set false-FAILs about
 1% of runs. If that happens, classify the reps with `--trace-turbo-inlining`; never raise the limit.
 
-### 7.7 H2.6 spec -- the addFrom / addHashedFrom family (F5, F6) + the F2 hand-inline in _addAt + N1 + N7  [DONE 2026-10-04, awaiting maintainer commit]
+### 7.7 H2.6 spec -- the addFrom / addHashedFrom family (F5, F6) + the F2 hand-inline in _addAt + N1 + N7  [DONE, committed e7c70f7]
 
 Result: the reviewer REJECTED once (6 blockers), APPROVED after the fixes, and APPROVED a post-qa fix;
 qa found f1-f3 and f5-f7 PASS. The f4 and f8 "FAILs" are unmeasurable figures, not gate failures (below).
@@ -1577,3 +1577,319 @@ Reviewer focus:
 
 RISK: the N1 SS lanes read 0-2 against <= 2. If all three reps read 3, classify them with chunk.mjs /
 `--trace-turbo-inlining` (fresh-window tier-up); never raise the limit.
+
+### 7.8 H2.7 spec -- topKInto + quantilesInto (F7, F8), option bags / forEach / -0 (F18), the merge brand (F21) + N8  [DONE 2026-10-05, awaiting maintainer commit]
+
+Result: the reviewer REJECTED twice, APPROVED, then APPROVED a post-qa fix; qa found g1-g8 PASS.
+- **Rejection 1:**
+  - `'value' in d` read a polluted `Object.prototype.value`, so an accessor bag was accepted with the inherited
+    value (and a getter on it ran). Now an own check (`_hasOwn`, cached).
+  - `_f64Clash` compared buffer objects, so two SharedArrayBuffer objects aliasing one memory
+    (`structuredClone(sab)`) passed and the Into calls wrote garbage. Two DIFFERENT SAB objects now fail closed
+    (aliasing cannot be verified); detection is a cached `ArrayBuffer.prototype.byteLength` getter that throws
+    only on a SAB.
+  - The new module helpers renumbered module-context slot operands in 6 hot methods (opcodes and lengths
+    unchanged). They now live after the last class; every hot method is operand-identical to HEAD.
+- **Rejection 2:** the SAB probe always ran on the first buffer, so an ACCEPTED SAB-first mixed call threw
+  internally (~888 / ~1776 B/call). The plain buffer is probed first (the prototype picks only the order).
+  Torture `SAB-first` scavenge lanes gate it (pre-fix 1733 / 1713, now 0).
+- **Post-qa fixes (reviewed):** the DD ctor re-read `range[0]` / `range[1]` outside the try after validating
+  them (a two-faced getter stored 'pwned'; pre-existing in HEAD) -- each index is now read once. A root
+  prototype carrying a KNOWN key (`Object.create({__proto__:null, seed:5})`, a polluted cross-realm
+  Object.prototype) is rejected instead of silently dropping the value; this realm's Object.prototype keys
+  stay ignored.
+- **Numbers:**
+  - N8: topKInto n16 / n64 big and quantilesInto q4, df + ni, min 0 [0,0,0]; forEach small 0; Q-CTRL 24;
+    FE-CTRL 73. `--lib HEAD` FAILs exactly the 6 Into gates (ABSENT), exit 1. Lanes 50 s at N3_JOBS=4.
+  - Torture ok x3: scTk / scQs / SAB-first 0 B/op and 0 scavenges, major 0, maxMs 0.00, trackers 0.
+  - 358 tests (0 todo); perf 9/9; witness sha1 2ed81a8b; parity exit 0 vs HEAD and e805ac8 (H2.7 section
+    identical, 15 DOC-DIFF checks yes). DD add / addFrom 448 / 449; only cold methods differ (withAccuracy /
+    withError by one class-context slot from `#brand`, waived).
+  - qa mutants: 40 / 44 killed; the 3 `>=` heap-comparator survivors are equivalent (they compare two distinct
+    slots). qa's polluted `Object.prototype.range` test closed a real gap (`options.range` survived before).
+- **Known gaps (recorded, not fixed):**
+  - The operand-level bytecode identity, the `--lib HEAD` lane revert check and the mutant matrix are scratch
+    runs (`h27/review27/bcdiff.mjs`, `h27/qa27/`), not committed gates.
+  - topKInto rejects two zero-length views at the same offset of one buffer (fails closed; harmless).
+  - A bag whose PROTOTYPE is a Proxy runs the caller's own traps inside the try (accepted, own values only).
+
+Why now:
+- lite-hud M3 renders an SS top-N every frame. Its keys are >= 2^32 and its counts pass 2^31. `topK()` allocates
+  ~160 B/entry, and `forEach` boxes 3 doubles per entry in any non-inlined callback, so M3 has no 0-alloc render.
+- M2 already calls `quantile(0.5)` / `quantile(0.99)` every frame (Hud.js:1529-1530) at 16 B each. That meets
+  F8's own condition for an Into API.
+- F18 / F21 are the last fail-open doors: option bags, the `instanceof` brand, and H2.3's RISK.
+- Everything here is cold. The hot bodies tuned in H2.4-H2.6 do not move.
+
+Pre-measured (HEAD e7c70f7, Node 26.8.2; scratchpad `h27/facts.md`, `repro.mjs`, `alloc.mjs`, `ql.mjs`):
+- **F18 bags:** CMS / DD / SS accept `{toString:1}`, `{constructor:1}`, `{hasOwnProperty:1}`, JSON
+  `{"__proto__":1}`, Map, Date and /x/. Inherited values are read: `Object.create({seed:5})` gives seed 5
+  (CMS, SS), and `{conservative:false}` (CMS) and `{maxBins:8}` (DD) apply the same way. A revoked Proxy bag
+  throws the engine's untagged IsArray TypeError.
+- **F18 forEach:** `clear()` in the first callback visits 5 entries (4 ghosts). A mid-walk `merge` visits 1,3,2.
+- **F18 -0:**
+  - SS `add(-0)` returns -0 from topK / forEach / heavyHitters.
+  - DD `add(-0)` reads -0 from min / max; quantile(0) already reads +0.
+  - SS lookups already treat -0 === 0, and merge's Map already normalizes.
+- **F21:**
+  - A bare `Object.create(X.prototype)` throws a tagged RangeError (shape mismatch) in all four.
+  - A field-copy forgery merges silently in all four.
+  - A DD forgery carrying only `_gamma` leaves count / sum NaN.
+  - `new Proxy(real, {})` passes `instanceof` and merges.
+  - All four `_badMerge` also branch on `instanceof`, which runs a Proxy trap.
+- **Bytes per call** (alloc.mjs, k = 64 / 1024):
+
+  | call | k = 64 | k = 1024 |
+  | --- | --- | --- |
+  | `topK()` | ~10-11 KB | ~166 KB (~160 B/entry) |
+  | `topK(10)` | ~4-5 KB | ~40 KB |
+  | `heavyHitters(0)` | ~9-10 KB | ~137 KB |
+  | SS merge | ~19-29 KB | ~280-317 KB (~300 B/entry) |
+
+  - forEach: 0 for Smi entries; ~49 B/entry for entries >= 2^31 in a never-optimized callback.
+  - HLL / CMS / DD merge and clear: 0.
+- **Query lanes** (scavenges at 1.6M units, df / ni):
+  - hll.count: 0 / 0 (a Smi below 2^31 at realistic cardinality).
+  - dd.q50: 24 / 24 (every call boxes its return).
+  - ss.est with count >= 2^31: 0 / 49.
+  - ss.forEach: small 0 / 0, big 0 / 73.
+
+Planner decisions:
+- **D1 (F21 brand):** a class-private `#brand;` field in each class, tested with
+  `typeof other !== 'object' || other === null || !(#brand in other)`.
+  - `#x in o` runs no user code. It is false for a Proxy (private names are not forwarded), O(1), and adds no
+    module state.
+  - A module WeakSet was rejected: it adds ephemeron work to every major GC (the maxMajor / maxPauseMs budget).
+  - Subclasses pass, because `super()` installs the brand. Engines are node >= 18, and `#x in` needs 16.4.
+  - The typeof / null guard is required: `#b in 5` throws an untagged TypeError.
+- **D2 (F18 bags):**
+  - A bag is a non-null object whose prototype `p` is `null`, is this realm's `Object.prototype`, or has
+    `Object.getPrototypeOf(p) === null` AND carries no own KNOWN key (a prototype other than this realm's
+    `Object.prototype` must carry no own KNOWN key; a cross-realm `Object.prototype` polluted with a known key is
+    rejected). That covers a clean Object.prototype of ANY realm (vm / iframe stay legal) and null-proto bags.
+    Map / Date / RegExp / arrays / class instances / `Object.create(proto)` are not bags.
+  - Every own key (`Reflect.ownKeys`: symbols and non-enumerable keys included) must be in a null-proto KNOWN
+    set.
+  - Values are read only as own data descriptors. An own accessor makes the object not a bag, so no getter
+    runs.
+  - Every step that can hit a Proxy trap sits in one try. Any throw there (a revoked Proxy, a throwing trap)
+    becomes the tagged plain-object TypeError.
+  - No new message text: rejections reuse HEAD's plain-object / `_badOption` / `_badRange` texts. The KNOWN
+    key order is kept, so "known options: ..." is byte-identical.
+- **D3 (addFrom Proxy point):** documented, NOT changed. A trap-free buffer check costs bytes in 7 hot entries,
+  and DD addFrom is at 449 of the 460 cap. Every Proxy `instanceof` admits runs `get` traps on `buf[i]` anyway,
+  and H2.6's D1 already reads each slot once.
+- **D4 (F7):** `topKInto(outKeys, outCounts, outErrors, n?) -> number written`.
+  - Algorithm: an in-place bounded heap of slot ids in `outKeys`. O(size log w), 0 alloc.
+  - The oracle is EXACTLY `topK(n)`: count DESC, ties by ascending slot. A selection scan was rejected:
+    O(n*size) would hang at n = size = 2^16.
+  - Bad outs throw tagged, like addFrom: a wrong array type would silently truncate a key >= 2^32. A bad n never
+    throws, like topK.
+  - `w = min(n, size, three lengths)` is returned, not thrown.
+- **D5 (F8):** `quantilesInto(qs, out) -> number written`. Each q is read from a Float64Array and each value is
+  written to one, so neither crosses a call. One call serves p50/p90/p99/p999.
+  - `quantile` stays byte-identical. The walk is duplicated and the oracle gates it, because a shared helper
+    would return a double across a call.
+  - No `countInto`: hll.count reads 0 / 0. No `estimateInto`. Both return boxes become docs only.
+- **D6 (F18 -0):** normalized with `+ 0` at the OUTPUTS only: SS forEach / topK / heavyHitters / topKInto, and the
+  DD min / max getters. Storage is untouched, so no hot byte changes.
+- **D7 (F18 forEach):** the loop bound is the live `this._size`. Docs say "do not mutate the sketch inside fn":
+  there are no ghosts, but entries may be skipped or revisited.
+
+Hot body vs cold path:
+- **0 hot bytes change.** These are byte-identical to HEAD (scratch `--print-bytecode` diff):
+  - every add / addFrom / addHashed(From) / `_addAt`;
+  - estimate / estimateHashed / errorOf / `_estimateAt`;
+  - DD add (448) / addFrom (449) / `_addKey` / quantile;
+  - all SS map / forest helpers and the murmur helpers.
+- **Cold changes:**
+  - the three option blocks, plus DD range reads;
+  - 4 merges and 4 `_badMerge`;
+  - topK / heavyHitters (`+ 0`), the DD min / max getters, forEach (bound and `+ 0`);
+  - the new topKInto and quantilesInto;
+  - module helpers `_optScan` / `_optOwn` / `_f64Len` / `_f64Clash` and the cached TypedArray getters.
+- **Zero-box:**
+  - topKInto takes (objects, Smi) and returns a Smi. Slot ids are read `| 0`. Counts are compared in locals.
+    The sifts are inline loops with no helper call.
+  - quantilesInto reads q from `qs` and writes `out`; `Math.pow` is a builtin.
+  - forEach still passes doubles to fn. That is the documented cost.
+
+Out of scope: F9 thresholds, N4, N6 (Chrome), the F19 "0 B/op" sweep, the 1.2.0 trinity (all H2.8).
+- A preallocated SS merge scratch: F8 is settled by wording.
+- The topK / heavyHitters algorithms (only `+ 0` changes there).
+- The addFrom `instanceof` point (D3). The lite-hud adoption.
+
+**Tasks** (T1-T5 edit Sketch.js in order by one coder; T6-T8 come after; T9 is last)
+- **T1 (coder, Sketch.js, F21):**
+  - Add `#brand;` as the first member of HyperLogLog / CountMinSketch / DDSketch / SpaceSaving.
+  - In each `merge`, the brand predicate (D1) is the first statement, before ANY read of `other`, and returns
+    `this._badMerge(other)`. Then HEAD's shape test, minus `instanceof`, in HEAD order.
+  - In each `_badMerge`, the same predicate replaces `instanceof`. The texts stay byte-identical.
+  - Merge jsdoc x4: brand-checked; a Proxy over an instance or a field copy is not an X.
+- **T2 (coder, Sketch.js, F18 bags, D2):**
+  - KNOWN sets become `Object.freeze({ __proto__: null, ... })`, with the same key order.
+  - Cold `_optScan(o, known)` returns null for a valid bag, a module sentinel for a non-bag, or the first unknown
+    own key.
+  - `_optOwn(o, k)` returns the own data value, or undefined.
+  - Ctor flow:
+    - `typeof !== 'object' || null` -> HEAD's TypeError, unchanged;
+    - `try { scan; own reads } catch { non-bag }`;
+    - a non-bag -> the plain-object TypeError;
+    - an unknown key -> `this._badOption(key)`;
+    - value checks AFTER the try, verbatim from HEAD.
+  - DD: `Array.isArray(range)`, `.length`, `[0]` and `[1]` read inside a try whose catch calls `_badRange(range)`.
+- **T3 (coder, Sketch.js, F18 forEach + -0, D6 / D7):**
+  - forEach: `for (let i = 0; i < this._size; i++) fn(keys[i] + 0, counts[i], errors[i], this)`. The arrays stay
+    hoisted (never reallocated).
+  - `key: this._key[x] + 0` in topK and heavyHitters.
+  - DD getters: `this._min + 0` / `this._max + 0`.
+  - forEach jsdoc: live bound, no mutation, ~49 B/entry for non-Smi entries in a non-inlined fn; use topKInto.
+- **T4 (coder, Sketch.js, F7):**
+  - Module scope: cache the `Symbol.toStringTag` / `length` / `buffer` / `byteOffset` getters of
+    `Object.getPrototypeOf(Float64Array.prototype)`. These run no Proxy trap and no subclass override.
+  - `_f64Len(x)` is the length, or -1 unless a real Float64Array.
+  - `_f64Clash(a, b, sameOk)` is true when a and b share a buffer and their byte ranges intersect. Equal offsets
+    are allowed only if `sameOk`.
+  - Validation: any length -1, or any clashing pair (sameOk false), calls `_badOut(a, b, c)` before any write.
+    `_badOut` is a TypeError: `'[lite-sketch] SpaceSaving.topKInto(outKeys, outCounts, outErrors, n) needs three
+    non-overlapping Float64Arrays, got ' + _describe x3`.
+  - n follows topK's rule. `w = min(n, size, la, lb, lc)`.
+  - Heap: a min-heap whose root is the worst kept entry, where `worse(a,b) = c[a] < c[b] || (c[a] === c[b] &&
+    a > b)`.
+    - Walk slots 0..size-1, filling the heap, then replace the root and sift whenever a slot beats it.
+    - An in-place heapsort to best-first.
+    - Then for j < w: `sl = outKeys[j] | 0`; write `key + 0`, count and error.
+  - Returns w.
+- **T5 (coder, Sketch.js, F8):** `quantilesInto(qs, out)`.
+  - `_f64Len` x2 and `_f64Clash(qs, out, true)`, so in-place `qs === out` works. A failure calls
+    `_badQuantiles(qs, out)` (new tagged TypeError text) before any write.
+  - `m = min(lengths)`. For j < m, run quantile's body verbatim, with each `return X` becoming `out[j] = X`.
+  - Returns m and never throws on q values.
+- **T6 (coder, test/lanes/lane.mjs + test/lanes.mjs, N8):**
+  - A new laneType `query`:
+    - fixture SS(64) with 256 adds: big = key 2^31+(i%128), count 2^31+i; small = i%128, 1+i;
+    - DD(0.01) with 1e4 values;
+    - units = entries scanned (topKInto / forEach) or quantiles (qs = [.5, .9, .99, .999]);
+    - 1.6M units per lane; a missing method prints `{"absent":...}`.
+  - Gates, each min-of-3 with every rep printed:
+
+    | gate | limit |
+    | --- | --- |
+    | `N8[df\|ni/ss.topKInto.n16\|n64/big]` | <= 2 (4 gates) |
+    | `N8[df\|ni/dd.quantilesInto.q4]` | <= 2 (2 gates) |
+    | `N8[df\|ni/ss.forEach/small]` | <= 2 (regression guard, HEAD 0) |
+    | `Q-CTRL[ni/dd.quantile]` | >= 12 (24) |
+    | `FE-CTRL[ni/ss.forEach/big]` | >= 12 (73; the documented forEach cost) |
+
+  - That is 30 children, about +5-8 s at N3_JOBS=4 (qa records it).
+- **T7 (coder, tests, per-member files; HEAD literals cut from `git show HEAD:Sketch.js` BEFORE the edit):**
+  - **G-F21 (x4):**
+    - a field-copy forgery (`Object.assign(Object.create(X.prototype), real)`) and `new Proxy(real, traps)` both
+      give a TypeError with HEAD's text, a byte-identical snapshot, and trap calls === 0;
+    - a DD `_gamma`-only forgery leaves count / sum unchanged;
+    - `merge(5|null|undefined)` throws tagged (kills a dropped typeof guard);
+    - `class Sub extends X` merges.
+    - Old tests that used a bare forgery to reach the RangeError switch to a real mismatched instance (rewrite,
+      never delete).
+  - **G-F18o (CMS / DD / SS, + withAccuracy / withError):**
+    - `{toString:1}`, `{constructor:1}`, `{hasOwnProperty:1}`, JSON `__proto__` and `{[Symbol('x')]:1}` throw
+      `_badOption`.
+    - Map / Date / /x/ / [] / class instance / `Object.create({seed:5})` / an accessor bag (calls === 0) /
+      a revoked Proxy / a throwing-trap Proxy throw the HEAD plain-object text.
+    - DD range given as a revoked Proxy throws `_badRange`.
+    - Accepted: a literal, `{__proto__:null, seed:7}`, `vm.runInNewContext('({seed:7})')`, and a non-enumerable
+      own seed.
+    - With `Object.prototype.seed/conservative/maxBins` polluted (try/finally), the defaults hold.
+  - **G-F18f:** `clear()` in the first callback visits 1 entry.
+  - **G-F18z:** `Object.is(v, 0)` at SS forEach / topK / heavyHitters / topKInto and DD min / max after `add(-0)`.
+  - **G-F7:**
+    - Object.is equality with `topK(n)` over capacity 1/7/64/1000 and streams Zipf / all-equal / evicting, for
+      n in {0,1,3,size-1,size,size+5,undefined,-1,2.5};
+    - the return value equals w; short outs write their length;
+    - Float32Array / Array / Int32Array / `Proxy(F64)` (0 trap calls) / aliased / overlapping views throw with
+      the outs unchanged;
+    - disjoint views over one buffer are accepted, and so is a subclass with a `length` getter (0 getter calls);
+    - the sketch snapshot is unchanged.
+  - **G-F8:**
+    - Object.is equality with `quantile(q)` for q in {0, -0, 1e-9, .25, .5, .9, .99, .999, 1, NaN, -1e-300,
+      1+2^-52, +-Infinity};
+    - sketches: empty, zeros-only, 1e4 values, strict, maxBins 16 collapsed, merged;
+    - in-place works; an overlap throws.
+  - test/types: the two signatures, plus `@ts-expect-error` for a Float32Array out and a `number[]` qs.
+- **T8 (coder, test/torture.mjs, test/parity.mjs):**
+  - torture: measureAllocs lanes `scTk` (topKInto big n16) and `scQs` (quantilesInto q4) at 0 B/op, in
+    SCAV_CLEAN.
+  - parity: an "H2.7" section.
+    - Identity: valid bags build the same state; outputs without -0 are identical; quantile is identical.
+    - Oracles: topKInto == ref `topK(n)`; quantilesInto == ref `quantile` per q.
+    - Checked DOC-DIFF, new side: -0 outputs (6 sites); forEach under clear (5 -> 1); bag rejections; polluted
+      seed; forgery merges; revoked Proxy tagged.
+- **T9 (coder, docs; never VERSION):**
+  - Sketch.d.ts: the two methods; the bag rule; merge brand; forEach live bound and boxes; topK / heavyHitters /
+    SS merge bytes; the quantile / SS-CMS estimate return box (16 B in a non-inlined call); HLL count as a Smi
+    below 2^31; the addFrom Proxy note (D3).
+  - llms.txt: :86-87, :272, :340-349 ("bounded cold scratch" becomes ~300 B/entry), and the bag / merge lines.
+  - README: the API lines, :281-283 and :343, the allocation table rows, the quantile note.
+  - ADRs, each with a dated H2.7 amendment:
+    - 0002-0005: the brand;
+    - 0003-0005: the bag rule;
+    - 0004: quantilesInto and -0;
+    - 0005: topKInto's heap and tie order, forEach, -0, merge bytes;
+    - 0001: D3.
+  - Every byte figure cites a gate, or alloc.mjs as "approx".
+  - CHANGELOG `[Unreleased]`:
+    - **Added:** topKInto and quantilesInto, with the N8 numbers.
+    - **Fixed:** F18 (the examples above, ghosts 5 -> 1, -0) and F21 (DD NaN, field-copy, revoked Proxy
+      untagged -> tagged).
+    - **Changed:** non-root-prototype / accessor / symbol-key bags rejected; Proxy-wrapped instances rejected by
+      merge; a bare forgery now gets the TypeError instead of the RangeError; -0 outputs read +0.
+  - ROADMAP: the F7 / F8 / F18 / F21 / N8 row deltas and the 7.1 row.
+
+**Assertions (qa; g1-g4 and g6 also run against `git show HEAD:Sketch.js`, tests copied to the scratchpad, and
+must FAIL there)**
+- g1: G-F21 passes x4. On HEAD the forgeries merge, DD count is NaN, and Proxy trap calls are > 0.
+- g2: G-F18o passes. On HEAD `{toString:1}` is accepted, the inherited seed is 5, and the revoked Proxy throws
+  untagged.
+- g3: G-F18f visits 1 (HEAD 5). G-F18z gives +0 at all 6 sites (HEAD -0).
+- g4: G-F7 / G-F8 oracles show 0 diffs; every reject is tagged with the outs unchanged. On HEAD both methods are
+  absent and the tests FAIL.
+- g5: `node test/parity.mjs`: every prior section shows 0 diffs, and the H2.7 identity and oracles show 0 diffs.
+  The DOC-DIFF H2.7 checks all pass. The hot-method bytecode is byte-identical, with DD add / addFrom at
+  448 / 449.
+- g6: `npm run lanes`: every N8 Into gate min <= 2 (0 expected); forEach small <= 2; Q-CTRL >= 12; FE-CTRL >= 12.
+  `--lib HEAD` FAILs exactly the 6 Into gates as ABSENT, with exit 1 and both CTRLs live. All H2.1-H2.6 gates
+  are unchanged.
+- g7 (GC budget): torture `ok` x3.
+  - scTk / scQs at 0 B/op, SCAV_CLEAN 0.
+  - maxMajor 0, maxPauseMs <= 4.
+  - `tracker.size()` back to 0 over the build-fill-clear cycles (incl. branded instances and rejected merges).
+  - arrayBuffers delta <= 0.
+  - Perf 9/9, witness sha1 2ed81a8b, test:types green.
+  - ASCII-only, pack 7 files, VERSION '1.1.2'.
+  - `npm run verify` green with 301 + new tests, 0 todo.
+- g8 (teeth): each mutant FAILs >= 1 gate or test:
+  - `instanceof` brand (G-F21);
+  - a dropped typeof guard (G-F21 primitives);
+  - an Object.prototype KNOWN set, or `options.seed` reads (G-F18o);
+  - `p === Object.prototype` (the vm case);
+  - a dropped try (revoked Proxy);
+  - a hoisted forEach bound (G-F18f);
+  - each dropped `+ 0` (G-F18z);
+  - the tie comparator `a < b` / `>=` (G-F7);
+  - `instanceof` out checks (the Proxy trap count);
+  - a dropped `_f64Clash` (overlap);
+  - `Math.round` in quantilesInto (G-F8);
+  - `qs.slice()` (N8 / scQs).
+
+Reviewer focus:
+- Does the brand precede EVERY read of `other` in all 4 merges and `_badMerge`?
+- Can the try swallow a tagged value-check error? It must not: the checks run after it.
+- Do non-Proxy bags run any user code (a getter, toString)?
+- Is the heap's order exactly topK's? Does it write before validating?
+- Is quantilesInto's walk line-for-line quantile's?
+- Did any hot method's bytecode move?
+- Is any limit raised?
+
+RISK: D2 rejects option bags built on a custom prototype (`Object.create(defaults)`) that 1.1.2 accepted. That is
+intended, under CHANGELOG Changed. Orchestrator grep (2026-10-05): no suite consumer (LiteHud included) passes a
+custom-prototype bag; every in-repo call site passes a literal.

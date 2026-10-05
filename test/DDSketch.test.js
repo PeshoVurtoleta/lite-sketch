@@ -27,6 +27,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { runInNewContext } from 'node:vm';
 import { DDSketch, DD_ALPHA_MIN, VERSION } from '../Sketch.js';
 
 // Cold test helpers (NOT hot-path code): the adjacent double above/below x, via a
@@ -1051,7 +1052,7 @@ test('H2.2 an EMPTY non-strict sketch merged with a collapsed other becomes coll
 });
 
 test('H2.2 ADVERSARIAL: a rejected merge never carries collapsed (gamma mismatch), and the strict-collapsed ' +
-    'reject runs BEFORE the pre-scan (a forged collapsed instance with no bins still gets the tagged reject)', () => {
+    'reject runs BEFORE the pre-scan (a real collapsed other with matching gamma still gets the tagged reject)', () => {
     // A collapsed other with a DIFFERENT alpha must throw without flipping this.collapsed:
     // the carry sits past every throw.
     const otherAlpha = collapsedShard(0.02);
@@ -1061,18 +1062,20 @@ test('H2.2 ADVERSARIAL: a rejected merge never carries collapsed (gamma mismatch
     assert.throws(() => t.merge(otherAlpha), liteSketch, 'gamma mismatch throws');
     assertDeepUnchanged(before, t, 'gamma-mismatch reject');
     assert.equal(t.collapsed, false, 'a rejected merge must not carry collapsed');
-    // A prototype-forged instance (passes instanceof, matching gamma, collapsed, NO bins):
-    // if the strict pre-scan ran first it would read the missing _bins / _offset; the
-    // strict-collapsed check must fire first with the tagged RangeError.
-    const forged = Object.create(DDSketch.prototype);
-    forged._gamma = new DDSketch(0.01)._gamma;
-    forged._collapsed = true;
-    const strict = new DDSketch(0.01, { range: [1, 1000] });
+    // A REAL collapsed sketch with the SAME gamma (H2.7: the merge brand now rejects a
+    // prototype forgery before the gamma/collapsed checks, so the reject must be exercised with a
+    // genuine instance). It passes the brand, matches gamma, and is really collapsed: the
+    // strict-collapsed check must fire BEFORE the strict pre-scan, with the tagged RangeError.
+    // range [1, 100] (NOT [1, 1000]): the collapsed shard carries values 1..1000, so if the strict
+    // pre-scan ran BEFORE the strict-collapsed check it would hit a value > 100 and throw the RANGE
+    // error, not /collapsed/ -- the swap mutant then FAILs this assertion.
+    const realCollapsed = collapsedShard(0.01);
+    const strict = new DDSketch(0.01, { range: [1, 100] });
     strict.add(5);
     const sBefore = deepSnapshot(strict);
-    assert.throws(() => strict.merge(forged), (e) => liteSketch(e) && e instanceof RangeError && /collapsed/.test(e.message),
+    assert.throws(() => strict.merge(realCollapsed), (e) => liteSketch(e) && e instanceof RangeError && /collapsed/.test(e.message),
         'the strict-collapsed reject precedes the pre-scan');
-    assertDeepUnchanged(sBefore, strict, 'forged collapsed reject');
+    assertDeepUnchanged(sBefore, strict, 'collapsed-into-strict reject is a byte-identical no-op');
     // null / undefined others are the existing non-instance reject (still tagged).
     for (const o of [null, undefined]) assert.throws(() => strict.merge(o), liteSketch, 'merge(' + o + ') throws tagged');
     assertDeepUnchanged(sBefore, strict, 'null / undefined merge');
@@ -1180,4 +1183,409 @@ test('QA H2.3 (DD): self-merge at the count ceiling; _badTotal prints current co
     assert.throws(() => s.add(5, 2), (e) => e instanceof RangeError &&
         e.message.includes('current count ' + (2 ** 53 - 2) + ' + 2'));
     ddUnchanged(b, s, 'add count+1 reject');
+});
+
+// ===========================================================================
+// H2.7 G-F21 (merge brand), G-F18o (option bags, D2), G-F18z (-0 outputs), G-F8 (quantilesInto).
+// The brand is a class-private #brand installed by the ctor; `#brand in other` is the FIRST
+// statement of merge / _badMerge, before any read of `other`. The bag rule accepts only a
+// root-prototype (any realm) or null-proto object with own DATA keys from the KNOWN set; values
+// are OWN-read, so a polluted Object.prototype is ignored. See headrun/ for HEAD-failure evidence.
+// ===========================================================================
+
+function ddCountingProxy(real, counter) {
+    return new Proxy(real, {
+        get(t, k, r) { counter.n++; return Reflect.get(t, k, r); },
+        has(t, k) { counter.n++; return Reflect.has(t, k); },
+        getPrototypeOf(t) { counter.n++; return Reflect.getPrototypeOf(t); },
+    });
+}
+
+test('G-F21 (DD): merge rejects a field-copy forgery + a Proxy over a real instance, TAGGED, 0 traps', () => {
+    const base = new DDSketch(0.01);
+    for (let i = 1; i <= 500; i++) base.add(i);
+    const real = new DDSketch(0.01);
+    for (let i = 1; i <= 500; i++) real.add(i + 1000);
+    const snap = ddSnap(base);
+
+    const forged = Object.assign(Object.create(DDSketch.prototype), real);
+    assert.ok(forged instanceof DDSketch, 'the forgery passes instanceof');
+    assert.throws(() => base.merge(forged), (e) => e instanceof TypeError && liteSketch(e), 'field-copy forgery');
+    ddUnchanged(snap, base, 'field-copy reject');
+
+    const counter = { n: 0 };
+    const px = ddCountingProxy(real, counter);
+    assert.ok(px instanceof DDSketch);
+    counter.n = 0;
+    assert.throws(() => base.merge(px), (e) => e instanceof TypeError && liteSketch(e), 'Proxy merge');
+    assert.equal(counter.n, 0, 'the brand check ran NO proxy trap');
+    ddUnchanged(snap, base, 'Proxy reject');
+});
+
+test('G-F21 (DD): a _gamma-only forgery leaves count / sum unchanged (HEAD merges it to NaN)', () => {
+    const base = new DDSketch(0.01);
+    for (let i = 1; i <= 100; i++) base.add(i);
+    const cBefore = base.count, sBefore = base.sum;
+    const gOnly = Object.create(DDSketch.prototype);
+    gOnly._gamma = base._gamma;   // matches gamma; HEAD's instanceof+gamma check would pass
+    assert.throws(() => base.merge(gOnly), (e) => e instanceof TypeError && liteSketch(e), 'gamma-only forgery');
+    assert.equal(base.count, cBefore, 'count unchanged (not NaN)');
+    assert.equal(base.sum, sBefore, 'sum unchanged (not NaN)');
+    assert.ok(Number.isFinite(base.count) && Number.isFinite(base.sum), 'aggregates stay finite');
+});
+
+test('G-F21 (DD): merge(primitive / null / undefined) throws TAGGED; a subclass merges', () => {
+    const base = new DDSketch(0.01);
+    base.add(5);
+    const snap = ddSnap(base);
+    for (const o of [5, 0, 'x', true, Symbol('s'), null, undefined, NaN]) {
+        assert.throws(() => base.merge(o), liteSketch, 'merge(' + String(o) + ')');
+    }
+    ddUnchanged(snap, base, 'primitive / null rejects');
+    class SubDD extends DDSketch {}
+    const sub = new SubDD(0.01);
+    for (let i = 1; i <= 100; i++) sub.add(i + 2000);
+    assert.doesNotThrow(() => base.merge(sub), 'a subclass carries the brand and merges');
+});
+
+test('G-F18o (DD): unknown-key bags throw _badOption; non-bags throw the plain-object TypeError', () => {
+    const badOpt = (e) => e instanceof TypeError && /unknown option/.test(e.message) && liteSketch(e);
+    const plain = (e) => e instanceof TypeError && /must be a plain object/.test(e.message) && liteSketch(e);
+    for (const bag of [{ toString: 1 }, { constructor: 1 }, { hasOwnProperty: 1 }, JSON.parse('{"__proto__":1}'), { [Symbol('x')]: 1 }]) {
+        assert.throws(() => new DDSketch(0.01, bag), badOpt, 'unknown-key bag');
+    }
+    let accCalls = 0;
+    const accessorBag = {};
+    Object.defineProperty(accessorBag, 'maxBins', { enumerable: true, configurable: true, get() { accCalls++; return 8; } });
+    const { proxy, revoke } = Proxy.revocable({ maxBins: 8 }, {});
+    revoke();
+    const nonbags = [new Map(), new Date(), /x/, [], new (class {})(), Object.create({ maxBins: 8 }),
+        accessorBag, proxy, new Proxy({}, { getPrototypeOf() { throw new Error('boom'); } })];
+    for (const bag of nonbags) assert.throws(() => new DDSketch(0.01, bag), plain, 'non-bag');
+    assert.equal(accCalls, 0, 'an accessor bag never runs its getter');
+});
+
+test('G-F18o (DD): a revoked-Proxy range throws _badRange; accepts literal / null-proto / cross-realm / non-enum bags; pollution ignored', () => {
+    const badRange = (e) => e instanceof Error && /range must be \[min, max]/.test(e.message) && liteSketch(e);
+    const { proxy, revoke } = Proxy.revocable([1, 1000], {});
+    revoke();
+    assert.throws(() => new DDSketch(0.01, { range: proxy }), badRange, 'revoked-Proxy range -> tagged _badRange');
+
+    const neBag = {};
+    Object.defineProperty(neBag, 'maxBins', { value: 16, enumerable: false });
+    for (const bag of [{ maxBins: 16 }, { __proto__: null, maxBins: 16 }, runInNewContext('({ maxBins: 16 })'), neBag]) {
+        assert.equal(new DDSketch(0.01, bag).maxBins, 16, 'bag maxBins applied');
+    }
+    assert.doesNotThrow(() => new DDSketch(0.01, Object.create(null)), 'Object.create(null) is a legal empty bag');
+
+    const DEF = new DDSketch(0.01).maxBins;   // DD_MAX_BINS_DEFAULT
+    const orig = Object.getOwnPropertyDescriptor(Object.prototype, 'maxBins');
+    try {
+        Object.prototype.maxBins = 8;
+        assert.equal(new DDSketch(0.01, {}).maxBins, DEF, 'polluted maxBins ignored for {}');
+        assert.equal(new DDSketch(0.01).maxBins, DEF, 'polluted maxBins ignored for no-options');
+    } finally {
+        if (orig) Object.defineProperty(Object.prototype, 'maxBins', orig); else delete Object.prototype.maxBins;
+    }
+});
+
+test('G-F18o (DD): the strict range is read exactly once per index -- no TOCTOU re-read (F18)', () => {
+    const badRange = (e) => e instanceof Error && /range must be \[min, max]/.test(e.message) && liteSketch(e);
+    // A two-faced getter: index returns a valid number FIRST, then something else. The ctor must use
+    // the VALIDATED value, reading each index exactly once -- a re-read for rangeMin/rangeMax would
+    // store the second ("pwned") value or let a second-read throw escape untagged.
+    let c0 = 0, c1 = 0, n0 = 0, n1 = 0;
+    const tf = [];
+    Object.defineProperty(tf, '0', { enumerable: true, configurable: true, get() { c0++; return n0++ === 0 ? 1 : 'pwned'; } });
+    Object.defineProperty(tf, '1', { enumerable: true, configurable: true, get() { c1++; return n1++ === 0 ? 100 : 9e9; } });
+    tf.length = 2;
+    const d = new DDSketch(0.01, { range: tf });
+    assert.equal(c0, 1, 'range[0] read exactly once');
+    assert.equal(c1, 1, 'range[1] read exactly once');
+    assert.ok(Object.is(d.rangeMin, 1) && Object.is(d.rangeMax, 100), 'the VALIDATED numbers are stored, never a re-read');
+    // A getter that THROWS on the second read must NOT escape untagged (there is no second read).
+    const tt = []; let s0 = 0;
+    Object.defineProperty(tt, '0', { enumerable: true, configurable: true, get() { s0++; if (s0 > 1) throw new Error('second-read boom'); return 1; } });
+    Object.defineProperty(tt, '1', { enumerable: true, configurable: true, value: 100 });
+    tt.length = 2;
+    assert.doesNotThrow(() => { const x = new DDSketch(0.01, { range: tt }); assert.equal(x.rangeMin, 1); },
+        'a throw-on-second-read range never fires -- each index is read once');
+    assert.equal(s0, 1, 'index 0 read exactly once (no untagged escape)');
+    // Control: a getter range whose single read is INVALID still rejects tagged.
+    const bad = []; Object.defineProperty(bad, '0', { enumerable: true, configurable: true, get() { return -1; } });
+    Object.defineProperty(bad, '1', { enumerable: true, configurable: true, value: 100 });
+    bad.length = 2;
+    assert.throws(() => new DDSketch(0.01, { range: bad }), badRange, 'an invalid single read rejects tagged');
+});
+
+test('G-F18o (DD): a polluted Object.prototype.value cannot smuggle an accessor bag (own-value check)', () => {
+    // The descriptor data-vs-accessor test reads its OWN `value` (not the prototype chain), so a
+    // polluted `Object.prototype.value` (data or getter) cannot make an accessor bag look like a
+    // data descriptor: the bag stays a non-bag and no getter runs.
+    const plain = (e) => e instanceof TypeError && /must be a plain object/.test(e.message) && liteSketch(e);
+    const DEF = new DDSketch(0.01).maxBins;
+    let getterCalls = 0;
+    const orig = Object.getOwnPropertyDescriptor(Object.prototype, 'value');
+    try {
+        Object.prototype.value = 5;                       // (a) DATA pollution
+        assert.throws(() => new DDSketch(0.01, { get maxBins() { getterCalls++; return 9; } }), plain,
+            'accessor bag rejected with Object.prototype.value = 5 (pre-fix: accepted, maxBins 5)');
+        delete Object.prototype.value;
+        Object.defineProperty(Object.prototype, 'value', { configurable: true, get() { getterCalls++; return 3; } });   // (b) GETTER pollution
+        assert.throws(() => new DDSketch(0.01, { get maxBins() { getterCalls++; return 9; } }), plain,
+            'accessor bag rejected with an Object.prototype.value getter (pre-fix: ran user code)');
+    } finally {
+        if (orig) Object.defineProperty(Object.prototype, 'value', orig); else delete Object.prototype.value;
+    }
+    assert.equal(getterCalls, 0, 'neither the bag accessor nor the polluted-proto getter ever runs');
+    assert.equal(new DDSketch(0.01).maxBins, DEF, 'default maxBins intact after cleanup');
+});
+
+test('G-F18z (DD): add(-0) reads +0 from min and max (stored -0 normalized at the getter)', () => {
+    const d = new DDSketch(0.01);
+    d.add(-0);
+    assert.ok(Object.is(d.min, 0), 'min is +0, not -0');
+    assert.ok(Object.is(d.max, 0), 'max is +0, not -0');
+});
+
+test('G-F8 (DD): quantilesInto matches quantile(q) bit-for-bit over q x sketch shapes', () => {
+    const qlist = [0, -0, 1e-9, 0.25, 0.5, 0.9, 0.99, 0.999, 1, NaN, -1e-300, 1 + 2 ** -52, Infinity, -Infinity];
+    const shapes = {
+        empty: () => new DDSketch(0.01),
+        zeros: () => { const d = new DDSketch(0.01); for (let i = 0; i < 50; i++) d.add(0); return d; },
+        vals: () => { const d = new DDSketch(0.01); for (let i = 1; i <= 10000; i++) d.add(i * 0.5); return d; },
+        strict: () => { const d = new DDSketch(0.01, { range: [1, 1000] }); for (let i = 1; i <= 500; i++) d.add(i); return d; },
+        collapsed: () => collapsedShard(0.01),
+        merged: () => { const a = new DDSketch(0.01), b = new DDSketch(0.01); for (let i = 1; i <= 500; i++) { a.add(i); b.add(i + 500); } a.merge(b); return a; },
+    };
+    for (const [name, make] of Object.entries(shapes)) {
+        const d = make();
+        const qs = Float64Array.from(qlist);
+        const out = new Float64Array(qlist.length);
+        const w = d.quantilesInto(qs, out);
+        assert.equal(w, qlist.length, name + ': w == qs.length');
+        for (let j = 0; j < qlist.length; j++) {
+            const exp = d.quantile(qlist[j]);
+            assert.ok(Object.is(out[j], exp), name + ': q=' + qlist[j] + ' expected ' + exp + ' got ' + out[j]);
+        }
+    }
+});
+
+test('G-F8 (DD): quantilesInto is in-place-safe (qs === out) and rejects non-F64 / partial overlap TAGGED', () => {
+    const badQ = (e) => e instanceof TypeError && /needs two non-overlapping Float64Arrays/.test(e.message) && liteSketch(e);
+    const d = new DDSketch(0.01);
+    for (let i = 1; i <= 1000; i++) d.add(i);
+    const expd = [d.quantile(0.5), d.quantile(0.9), d.quantile(0.99)];
+    const a = Float64Array.from([0.5, 0.9, 0.99]);
+    const w = d.quantilesInto(a, a);   // in-place: each index read before written
+    assert.equal(w, 3);
+    for (let j = 0; j < 3; j++) assert.ok(Object.is(a[j], expd[j]), 'in-place q[' + j + ']');
+
+    const buf = new ArrayBuffer(4 * 8);
+    const v1 = new Float64Array(buf, 0, 3);
+    const v2 = new Float64Array(buf, 8, 3);   // partial overlap of distinct views
+    assert.throws(() => d.quantilesInto(v1, v2), badQ, 'partial overlap');
+    for (const bad of [new Float32Array(3), [0.5, 0.9, 0.99], null, undefined, { length: 3 }]) {
+        assert.throws(() => d.quantilesInto(bad, new Float64Array(3)), badQ, 'bad qs');
+        assert.throws(() => d.quantilesInto(new Float64Array(3), bad), badQ, 'bad out');
+    }
+});
+
+test('G-F8 (DD): quantilesInto fails closed on SharedArrayBuffer aliasing (distinct SAB objects)', () => {
+    if (typeof SharedArrayBuffer !== 'function') return;   // host without SAB
+    const badQ = (e) => e instanceof TypeError && /needs two non-overlapping Float64Arrays/.test(e.message) && liteSketch(e);
+    const d = new DDSketch(0.01);
+    for (let i = 1; i <= 1000; i++) d.add(i);
+    // Two DISTINCT SAB objects aliasing the same memory (structuredClone) -> reject, no write.
+    const sab = new SharedArrayBuffer(8 * 8);
+    let cl; try { cl = structuredClone(sab); } catch { cl = null; }
+    if (cl !== null && cl !== sab) {
+        const q = new Float64Array(sab, 0, 4); q.set([0.5, 0.9, 0.99, 0.999]);
+        const out = new Float64Array(cl, 8, 4);
+        const outBefore = Array.from(out);
+        assert.throws(() => d.quantilesInto(q, out), badQ, 'cross-SAB alias rejected (fail closed)');
+        assert.deepEqual(Array.from(out), outBefore, 'no write before the SAB-alias throw');
+    }
+    // Two distinct non-aliased SABs rejected (documented fail-closed cost).
+    assert.throws(() => d.quantilesInto(
+        new Float64Array(new SharedArrayBuffer(8 * 4), 0, 4),
+        new Float64Array(new SharedArrayBuffer(8 * 4), 0, 4)), badQ, 'distinct non-aliased SABs rejected');
+    // In-place on ONE SAB (qs === out) still works; disjoint views on one SAB work.
+    const one = new SharedArrayBuffer(8 * 8);
+    const io = new Float64Array(one, 0, 4); io.set([0.5, 0.9, 0.99, 0.999]);
+    const exp = [d.quantile(0.5), d.quantile(0.9), d.quantile(0.99), d.quantile(0.999)];
+    assert.equal(d.quantilesInto(io, io), 4, 'in-place on one SAB');
+    for (let j = 0; j < 4; j++) assert.ok(Object.is(io[j], exp[j]), 'in-place SAB q[' + j + ']');
+    const qs2 = new Float64Array(one, 0, 4); qs2.set([0.5, 0.9, 0.99, 0.999]);
+    assert.doesNotThrow(() => d.quantilesInto(qs2, new Float64Array(one, 8 * 4, 4)), 'disjoint views on one SAB');
+    // One SAB-backed arg + one plain arg: distinct objects, not both SAB -> accepted.
+    const qsP = new Float64Array(new SharedArrayBuffer(8 * 4), 0, 4); qsP.set([0.5, 0.9, 0.99, 0.999]);
+    assert.doesNotThrow(() => d.quantilesInto(qsP, new Float64Array(4)), 'one SAB + one plain accepted');
+});
+
+// ===========================================================================
+// H2.7 qa boundary suite -- quantilesInto / -0 / option bags / merge brand edges
+// ===========================================================================
+
+const qaBadQ = (e) => e instanceof TypeError && /needs two non-overlapping Float64Arrays/.test(e.message) && liteSketch(e);
+const qaDDPlain = (e) => e instanceof TypeError && /DDSketch options must be a plain object/.test(e.message) && liteSketch(e);
+function qaDD() {
+    const d = new DDSketch(0.01);
+    for (let i = 1; i <= 100; i++) d.add(i);
+    return d;
+}
+
+test('QA H2.7 (DD): quantilesInto empty qs / empty out return 0 and write nothing; a length mismatch writes min(lengths)', () => {
+    const d = qaDD();
+    const out = new Float64Array([7, 7, 7]);
+    assert.ok(Object.is(d.quantilesInto(new Float64Array(0), out), 0));
+    assert.deepEqual(Array.from(out), [7, 7, 7]);
+    assert.ok(Object.is(d.quantilesInto(Float64Array.of(0.5, 0.9), new Float64Array(0)), 0));
+    const short = new Float64Array([7]);
+    assert.equal(d.quantilesInto(Float64Array.of(0.5, 0.9, 0.99), short), 1, 'qs longer than out');
+    assert.ok(Object.is(short[0], d.quantile(0.5)));
+    const long = new Float64Array([7, 7, 7, 7]);
+    assert.equal(d.quantilesInto(Float64Array.of(0.25, 0.75), long), 2, 'out longer than qs');
+    assert.deepEqual(Array.from(long), [d.quantile(0.25), d.quantile(0.75), 7, 7], 'nothing past m');
+});
+
+test('QA H2.7 (DD): quantilesInto q edge values (NaN, -0, +-0 subnormal, +-Infinity, 1 +- ulp, MAX_VALUE) equal quantile(q) bit-for-bit, never throw', () => {
+    const qs = Float64Array.of(NaN, -0, 0, Number.MIN_VALUE, -Number.MIN_VALUE, Infinity, -Infinity,
+        1 - 2 ** -53, 1, 1 + 2 ** -52, Number.MAX_VALUE, -Number.MAX_VALUE, 0.5);
+    for (const d of [new DDSketch(0.01), qaDD(), (() => { const z = new DDSketch(0.02); z.add(0); z.add(-0); return z; })()]) {
+        const out = new Float64Array(qs.length).fill(-3);
+        assert.equal(d.quantilesInto(qs, out), qs.length);
+        for (let j = 0; j < qs.length; j++) {
+            assert.ok(Object.is(out[j], d.quantile(qs[j])), 'q=' + qs[j] + ' got ' + out[j] + ' want ' + d.quantile(qs[j]));
+        }
+    }
+});
+
+test('QA H2.7 (DD): quantilesInto in place (qs === out) and an identical-range subarray are allowed; a shifted subarray rejects TAGGED, untouched', () => {
+    const d = qaDD();
+    const x = Float64Array.of(0.5, 0.99, 0.1);
+    const want = [d.quantile(0.5), d.quantile(0.99), d.quantile(0.1)];
+    assert.equal(d.quantilesInto(x, x), 3);
+    assert.deepEqual(Array.from(x), want);
+    const y = Float64Array.of(0.5, 0.99, 0.1);
+    assert.equal(d.quantilesInto(y, y.subarray(0)), 3, 'a distinct view over the exact same bytes');
+    assert.deepEqual(Array.from(y), want);
+    const z = Float64Array.of(0.5, 0.99, 0.1);
+    assert.throws(() => d.quantilesInto(z.subarray(0, 2), z.subarray(1)), qaBadQ, 'shift by one');
+    assert.throws(() => d.quantilesInto(z.subarray(1), z.subarray(0, 2)), qaBadQ, 'shift by one, reversed');
+    assert.deepEqual(Array.from(z), [0.5, 0.99, 0.1], 'no write before the reject');
+    const buf = new ArrayBuffer(32);
+    const a = new Float64Array(buf, 0, 2), b = new Float64Array(buf, 16, 2);
+    a.set([0.5, 0.9]);
+    assert.equal(d.quantilesInto(a, b), 2, 'touching views accepted');
+    assert.deepEqual(Array.from(b), [d.quantile(0.5), d.quantile(0.9)]);
+});
+
+test('QA H2.7 (DD): quantilesInto detached / out-of-bounds views read length 0; a forged-tag Float32Array subclass and non-arrays reject with no user code', () => {
+    const d = qaDD();
+    const ab = new ArrayBuffer(32);
+    const det = new Float64Array(ab);
+    structuredClone(ab, { transfer: [ab] });
+    const out = new Float64Array([4, 4]);
+    assert.ok(Object.is(d.quantilesInto(det, out), 0));
+    assert.ok(Object.is(d.quantilesInto(Float64Array.of(0.5), det), 0));
+    assert.deepEqual(Array.from(out), [4, 4]);
+    let rab = null;
+    try { rab = new ArrayBuffer(32, { maxByteLength: 64 }); } catch { rab = null; }
+    if (rab !== null && typeof rab.resize === 'function') {
+        const fixed = new Float64Array(rab, 0, 4);
+        const track = new Float64Array(rab);
+        fixed.set([0.5, 0.9, 0.99, 0.999]);
+        assert.equal(d.quantilesInto(track, track), 4, 'tracking in place');
+        rab.resize(8);
+        assert.equal(fixed.length, 0, 'out of bounds');
+        assert.ok(Object.is(d.quantilesInto(fixed, out), 0));
+        track[0] = 0.5;
+        assert.equal(d.quantilesInto(track, out), 1, 'shrunk tracking view');
+        assert.ok(Object.is(out[0], d.quantile(0.5)));
+    }
+    let calls = 0;
+    class Fake extends Float32Array { get [Symbol.toStringTag]() { calls++; return 'Float64Array'; } get length() { calls++; return 2; } }
+    const o2 = new Float64Array([4, 4]);
+    for (const bad of [new Fake(2), [0.5], { length: 1, 0: 0.5 }, null, undefined, 0.5, new Proxy(new Float64Array(1), {})]) {
+        assert.throws(() => d.quantilesInto(bad, o2), qaBadQ);
+        assert.throws(() => d.quantilesInto(Float64Array.of(0.5), bad), qaBadQ);
+    }
+    assert.equal(calls, 0, 'no user getter ran');
+    assert.deepEqual(Array.from(o2), [4, 4]);
+});
+
+test('QA H2.7 (DD): -0 only, -0 then +0, and +0 then -0 all read +0 from min / max / quantile(0) / quantilesInto', () => {
+    const seqs = [[-0], [-0, 0], [0, -0], [-0, -0, 5]];
+    for (const seq of seqs) {
+        const d = new DDSketch(0.01);
+        for (const v of seq) d.add(v);
+        assert.ok(Object.is(d.min, 0), 'min ' + seq);
+        if (seq.length < 3) assert.ok(Object.is(d.max, 0), 'max ' + seq);
+        assert.ok(Object.is(d.quantile(0), 0));
+        const o = new Float64Array(1);
+        d.quantilesInto(Float64Array.of(-0), o);
+        assert.ok(Object.is(o[0], 0), 'quantilesInto(-0)');
+    }
+});
+
+test('QA H2.7 (DD): option bags -- frozen bag + frozen range accepted; Symbol / computed __proto__ / getter maxBins rejected TAGGED with no user code', () => {
+    const d = new DDSketch(0.01, Object.freeze({ maxBins: 64, range: Object.freeze([1, 1000]) }));
+    assert.equal(d.rangeMin, 1);
+    assert.equal(d.rangeMax, 1000);
+    assert.equal(new DDSketch(0.01, Object.seal({ maxBins: 8 }))._maxBins, 8, 'sealed');
+    assert.throws(() => new DDSketch(0.01, { [Symbol('qa')]: 1 }), (e) => e instanceof TypeError && /unknown option "Symbol\(qa\)"/.test(e.message) && liteSketch(e));
+    assert.throws(() => new DDSketch(0.01, { ['__proto__']: { maxBins: 8 } }), (e) => /unknown option "__proto__"/.test(e.message) && liteSketch(e));
+    let g = 0;
+    assert.throws(() => new DDSketch(0.01, { get maxBins() { g++; return 8; } }), qaDDPlain);
+    // A bag whose prototype (null-proto) carries an own KNOWN key fails closed (would smuggle a
+    // dropped option); getOwnPropertyDescriptor reads the descriptor, so the getter never runs.
+    assert.throws(() => new DDSketch(0.01, Object.create(Object.defineProperty(Object.create(null), 'maxBins', { get() { g++; return 8; } }))),
+        qaDDPlain, 'a prototype carrying a known key fails closed');
+    assert.throws(() => new DDSketch(0.01, runInNewContext('Object.prototype.maxBins = 8; ({})')),
+        qaDDPlain, 'cross-realm polluted Object.prototype rejected');
+    assert.equal(g, 0, 'no getter ran');
+});
+
+test('QA H2.7 (DD): merge brand -- a second module instance is rejected TAGGED; an overriding subclass merges through super', async () => {
+    const M2 = await import(new URL('../Sketch.js', import.meta.url).href + '?qa-second-instance-dd');
+    const a = qaDD(), b = new M2.DDSketch(0.01);
+    b.add(3);
+    const before = ddSnap(a);
+    assert.throws(() => a.merge(b), (e) => e instanceof TypeError && /merge expects a DDSketch/.test(e.message) && liteSketch(e));
+    ddUnchanged(before, a, 'second-instance reject');
+    let over = 0;
+    class Sub extends DDSketch { merge(o) { over++; return super.merge(o); } }
+    const x = new Sub(0.01);
+    x.add(2);
+    x.merge(qaDD());
+    assert.equal(over, 1);
+    assert.equal(x.count, 101);
+    const y = qaDD();
+    y.merge(x);
+    assert.equal(y.count, 201);
+});
+
+test('QA H2.7 (DD): a polluted Object.prototype.range / maxBins (data AND getter) never reaches a literal bag -- the sketch stays non-strict, default bins', () => {
+    const had = Object.prototype.hasOwnProperty.call(Object.prototype, 'range');
+    let calls = 0;
+    try {
+        Object.prototype.range = [1, 2];
+        const a = new DDSketch(0.01, {});
+        assert.equal(a.strict, false, 'inherited data range ignored');
+        assert.ok(Number.isNaN(a.rangeMin));
+        a.add(1e6);   // outside [1, 2]: a strict sketch would throw
+        assert.equal(a.count, 1);
+        delete Object.prototype.range;
+        Object.defineProperty(Object.prototype, 'range', { get() { calls++; return [1, 2]; }, configurable: true });
+        Object.defineProperty(Object.prototype, 'maxBins', { get() { calls++; return 4; }, configurable: true });
+        const b = new DDSketch(0.01, { maxBins: 64 });
+        assert.equal(b.strict, false, 'inherited getter range ignored');
+        assert.equal(b.maxBins, 64);
+    } finally {
+        delete Object.prototype.range;
+        delete Object.prototype.maxBins;
+        assert.equal(had, false);
+    }
+    assert.equal(calls, 0, 'no inherited getter ran');
 });

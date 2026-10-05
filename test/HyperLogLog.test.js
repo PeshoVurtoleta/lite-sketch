@@ -927,3 +927,86 @@ test('QA H2.6 (HLL): duplicate clear() then addFrom / addHashedFrom == a fresh s
     }
     h26Eq(x, xs, 'interleaved x != solo'); h26Eq(y, ys, 'interleaved y != solo');
 });
+
+// ===========================================================================
+// H2.7 G-F21: merge is BRAND-checked, not instanceof. A class-private `#brand` is installed by
+// the ctor on every REAL instance; `#brand in other` runs no user code, is false for a Proxy
+// over an instance and for a field-copy forgery, and the brand predicate is the FIRST statement
+// of merge / _badMerge (before any read of `other`). On HEAD (`instanceof`) both forgeries pass
+// and merge silently; see headrun/ in the scratchpad for the HEAD-failure evidence.
+// ===========================================================================
+
+function countingProxy(real, counter) {
+    return new Proxy(real, {
+        get(t, k, r) { counter.n++; return Reflect.get(t, k, r); },
+        has(t, k) { counter.n++; return Reflect.has(t, k); },
+        getPrototypeOf(t) { counter.n++; return Reflect.getPrototypeOf(t); },
+    });
+}
+
+test('G-F21 (HLL): merge rejects a field-copy forgery + a Proxy over a real instance, TAGGED, 0 traps', () => {
+    const base = new HyperLogLog(12, 7);
+    for (let i = 0; i < 500; i++) base.add(i);
+    const real = new HyperLogLog(12, 7);
+    for (let i = 0; i < 500; i++) real.add(i + 100000);
+    const snap = base._reg.slice();
+
+    // Field-copy forgery: X.prototype + every own field, but NOT the private #brand.
+    const forged = Object.assign(Object.create(HyperLogLog.prototype), real);
+    assert.ok(forged instanceof HyperLogLog, 'the forgery passes instanceof (what HEAD trusted)');
+    assert.throws(() => base.merge(forged), (e) => e instanceof TypeError && liteSketch(e), 'field-copy forgery');
+    assert.deepEqual(base._reg, snap, 'field-copy reject is a byte-identical no-op');
+
+    // Proxy over a real instance: instanceof passes, the brand does not; 0 traps fire in merge.
+    const counter = { n: 0 };
+    const px = countingProxy(real, counter);
+    assert.ok(px instanceof HyperLogLog, 'the Proxy passes instanceof');
+    counter.n = 0;   // discard the instanceof getPrototypeOf trap; measure only the merge
+    assert.throws(() => base.merge(px), (e) => e instanceof TypeError && liteSketch(e), 'Proxy merge');
+    assert.equal(counter.n, 0, 'the brand check ran NO proxy trap (no read of other)');
+    assert.deepEqual(base._reg, snap, 'Proxy reject is a byte-identical no-op');
+});
+
+test('G-F21 (HLL): merge(primitive / null / undefined) throws TAGGED (the typeof / null guard)', () => {
+    const base = new HyperLogLog(12, 7);
+    base.add(1);
+    const snap = base._reg.slice();
+    for (const o of [5, 0, 'x', true, Symbol('s'), null, undefined, NaN]) {
+        assert.throws(() => base.merge(o), liteSketch, 'merge(' + String(o) + ') throws tagged');
+    }
+    assert.deepEqual(base._reg, snap, 'primitive / null rejects are no-ops');
+});
+
+test('G-F21 (HLL): a subclass instance merges (super() installs the brand)', () => {
+    class SubHLL extends HyperLogLog {}
+    const base = new HyperLogLog(12, 7);
+    const sub = new SubHLL(12, 7);
+    for (let i = 0; i < 300; i++) { base.add(i); sub.add(i + 500000); }
+    assert.doesNotThrow(() => base.merge(sub), 'a subclass carries the brand and merges');
+    assert.ok(base.count() > 0);
+});
+
+// ===========================================================================
+// H2.7 qa boundary suite -- merge brand edges
+// ===========================================================================
+
+test('QA H2.7 (HLL): merge brand -- a second module instance rejected TAGGED, no-op; overriding subclass via super; self-merge stays legal', async () => {
+    const M2 = await import(new URL('../Sketch.js', import.meta.url).href + '?qa-second-instance-hll');
+    const a = new HyperLogLog(10), b = new M2.HyperLogLog(10);
+    for (let i = 0; i < 100; i++) { a.add(i); b.add(i + 1000); }
+    const before = Array.from(a._reg);
+    assert.throws(() => a.merge(b), (e) => e instanceof TypeError && /merge expects a HyperLogLog/.test(e.message) && liteSketch(e));
+    assert.throws(() => b.merge(a), (e) => e instanceof TypeError && /merge expects a HyperLogLog/.test(e.message));
+    assert.deepEqual(Array.from(a._reg), before);
+    let over = 0;
+    class Sub extends HyperLogLog { merge(o) { over++; return super.merge(o); } }
+    const x = new Sub(10);
+    x.merge(a);
+    assert.equal(over, 1);
+    assert.deepEqual(Array.from(x._reg), before);
+    a.merge(a);
+    assert.deepEqual(Array.from(a._reg), before, 'self-merge is idempotent');
+    // A real instance of a SIBLING class is not a HyperLogLog (each class has its own brand).
+    const { CountMinSketch } = await import('../Sketch.js');
+    assert.throws(() => a.merge(new CountMinSketch(4, 64)), (e) => e instanceof TypeError && /merge expects a HyperLogLog/.test(e.message));
+});

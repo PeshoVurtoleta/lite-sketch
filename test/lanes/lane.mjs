@@ -214,6 +214,90 @@ async function main() {
         console.log(JSON.stringify({ scav, sink: sink & 1 }));
         return;
     }
+    if (laneType === 'query') {
+        // query <kind> [--n N]  -- the COLD-READ zero-box lanes (N8, H2.7). One SS(64) / DD(0.01)
+        //   fixture built once, then 1.6M UNITS stepped (units = entries written / scanned, or
+        //   quantiles) so the lane scale matches the add lanes. A method absent on the --lib build
+        //   prints {"absent": name} and exits 0 (the parent FAILs the gate valued ABSENT). kinds:
+        //     ss.topKInto.big     topKInto(ok,oc,oe,n) over the big fixture; per = w (entries written)
+        //     ss.forEach.small    forEach over the small (Smi) fixture; per = size (scanned) -> 0
+        //     ss.forEach.big      FE-CTRL: forEach over big; a non-inlined fn boxes 3 doubles/entry
+        //     dd.quantilesInto.q4 quantilesInto([.5,.9,.99,.999], out); per = 4 (q read / written via F64)
+        //     dd.quantile         Q-CTRL: quantile(.5) read into a sink; per = 1 (the return box)
+        // The big fixture's keys (>= 2^31) and counts (>= 2^31) are non-Smi doubles, so forEach boxes
+        // them crossing the callback; topKInto writes them into Float64Arrays (no box). ASCII-only.
+        const kind = argv[1];
+        const nOpt = flag('--n', null);
+        const M = await import(MODULE);
+        const SINK = new Float64Array(4);
+        let sink = 0;
+        let step = null, per = 1, absent = null;
+        if (kind === 'ss.topKInto.big' || kind === 'ss.forEach.small' || kind === 'ss.forEach.big') {
+            const big = kind !== 'ss.forEach.small';
+            const ss = new M.SpaceSaving(64);
+            for (let i = 0; i < 256; i++) {
+                if (big) ss.add(2 ** 31 + (i % 128), 2 ** 31 + i);   // non-Smi key + count
+                else ss.add(i % 128, 1 + i);                          // Smi key + count
+            }
+            if (kind === 'ss.topKInto.big') {
+                if (typeof ss.topKInto !== 'function') absent = 'topKInto';
+                else {
+                    const n = nOpt !== null ? Number(nOpt) : 64;
+                    const ok = new Float64Array(64), oc = new Float64Array(64), oe = new Float64Array(64);
+                    per = n < 64 ? n : 64;                            // entries written per call
+                    step = () => { sink = (sink + ss.topKInto(ok, oc, oe, n)) | 0; };
+                }
+            } else {
+                per = 64;                                             // forEach scans all 64 entries
+                // The callback reads all three args: a non-inlined fn (ni mode) boxes each >= 2^31
+                // double crossing the call (3/entry for big; 0 for small Smi -- the regression guard).
+                const fn = (k, c, e) => { sink = (sink + (k > 0 ? 1 : 0) + (c > 0 ? 1 : 0) + (e > 0 ? 1 : 0)) | 0; };
+                step = () => { ss.forEach(fn); };
+            }
+        } else if (kind === 'dd.quantilesInto.q4' || kind === 'dd.quantile') {
+            const d = new M.DDSketch(0.01);
+            for (let i = 1; i <= 10000; i++) d.add(1e6 + i * 1.37);
+            if (kind === 'dd.quantilesInto.q4') {
+                if (typeof d.quantilesInto !== 'function') absent = 'quantilesInto';
+                else {
+                    const qs = new Float64Array([0.5, 0.9, 0.99, 0.999]);
+                    const out = new Float64Array(4);
+                    per = 4;                                          // quantiles written per call
+                    step = () => { sink = (sink + d.quantilesInto(qs, out)) | 0; };
+                }
+            } else {
+                // Q-CTRL: quantile returns a fractional double across a non-inlined call -> a 16 B box
+                // per call. Stored into a Float64Array AFTER the box already crossed the call boundary.
+                per = 1;
+                step = () => { SINK[0] = d.quantile(0.5); };
+            }
+        }
+        if (absent) { console.log(JSON.stringify({ absent })); return; }
+        if (step === null) { console.error('lane.mjs: unknown query kind ' + JSON.stringify(kind)); process.exitCode = 2; return; }
+        // 1.6M units: iters = OPS / per step-calls. Warm the step closure (capped) so df tiers up,
+        // then gc() and count scavenges over the window (one 16 B box/op reads ~24 at 4 MB semi-space).
+        const iters = Math.max(1, Math.floor(OPS / per));
+        const warm = Math.min(iters >> 3, 50000);
+        for (let i = 0; i < warm; i++) step();
+        let minor = 0;
+        const obs = new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) {
+                const k = e.detail ? e.detail.kind : e.kind;
+                if (k === constants.NODE_PERFORMANCE_GC_MINOR) minor++;
+            }
+        });
+        if (globalThis.gc) globalThis.gc();
+        obs.observe({ entryTypes: ['gc'] });
+        for (let i = 0; i < iters; i++) step();
+        await new Promise((r) => setTimeout(r, 50));
+        obs.takeRecords().forEach((e) => {
+            const k = e.detail ? e.detail.kind : e.kind;
+            if (k === constants.NODE_PERFORMANCE_GC_MINOR) minor++;
+        });
+        obs.disconnect();
+        console.log(JSON.stringify({ scav: minor, sink: (sink + (SINK[0] > 0 ? 1 : 0)) & 1 }));
+        return;
+    }
     if (laneType === 'deopt') {
         // The audit shape: 3 instances at p 4/12/18, driven 1.6M ops each through a
         // non-inlined closure, keys read from a Float64Array in [0, 2^31). The parent

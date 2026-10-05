@@ -269,6 +269,8 @@ function hllTau(x) {
  * `count` / getters / a valid `merge` never throw. null is not zero.
  */
 export class HyperLogLog {
+    /** @private Brand (F21): installed by the ctor on every real instance; `#brand in x` runs no user code, is false for a Proxy / field-copy forgery, and adds no module state. */
+    #brand;
     /**
      * @param {number} [p=14]   precision; an integer in [4, 18]. m = 1 << p.
      * @param {number} [seed]   uint32 hash seed (any integer, coerced with >>> 0).
@@ -480,11 +482,14 @@ export class HyperLogLog {
      * `[lite-sketch]` if `other` is not a HyperLogLog or differs in m / seed (a
      * differently-seeded HLL hashes the same key to a different register, so a
      * register-wise max would silently combine to garbage).
+     * A Proxy over an instance or a field copy is NOT a HyperLogLog (the brand is checked, not
+     * `instanceof`): the brand predicate is the first statement, before any read of `other`.
      * @param {HyperLogLog} other
      * @returns {HyperLogLog} this
      */
     merge(other) {
-        if (!(other instanceof HyperLogLog) || other._m !== this._m || other._seed !== this._seed) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) return this._badMerge(other);
+        if (other._m !== this._m || other._seed !== this._seed) {
             return this._badMerge(other);
         }
         const a = this._reg;
@@ -528,7 +533,7 @@ export class HyperLogLog {
 
     /** @private Cold thrower for an incompatible merge (non-instance vs m/seed mismatch). */
     _badMerge(other) {
-        if (!(other instanceof HyperLogLog)) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) {
             throw new TypeError('[lite-sketch] HyperLogLog.merge expects a HyperLogLog');
         }
         if (other._m !== this._m) {
@@ -556,7 +561,7 @@ const CMS_MAX_COUNT = 0xffffffff;
 /** Default per-instance seed (shared with HyperLogLog so both members hash identically). */
 const CMS_DEFAULT_SEED = HLL_DEFAULT_SEED;
 /** Frozen marker of the known option keys -- an unknown key is a throw with a did-you-mean. */
-const CMS_KNOWN_OPTS = Object.freeze({ seed: true, conservative: true });
+const CMS_KNOWN_OPTS = Object.freeze({ __proto__: null, seed: true, conservative: true });
 
 /**
  * CountMinSketch -- POINT-QUERY FREQUENCY estimation over an unbounded stream in
@@ -600,6 +605,8 @@ const CMS_KNOWN_OPTS = Object.freeze({ seed: true, conservative: true });
  * an incompatible merge throws). null is not zero.
  */
 export class CountMinSketch {
+    /** @private Brand (F21): installed by the ctor on every real instance; `#brand in x` runs no user code, is false for a Proxy / field-copy forgery, and adds no module state. */
+    #brand;
     /**
      * @param {number} d depth (hash rows); an integer in [1, 32].
      * @param {number} w width (columns/row); an integer in [1, 2^25], rounded UP to a power of two.
@@ -632,23 +639,37 @@ export class CountMinSketch {
         let seed = CMS_DEFAULT_SEED;
         let conservative = true;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+            if (typeof options !== 'object' || options === null) {
                 throw new TypeError(
                     '[lite-sketch] CountMinSketch options must be a plain object, got ' + _describe(options));
             }
-            const keys = Object.keys(options);
-            for (let i = 0; i < keys.length; i++) {
-                if (!(keys[i] in CMS_KNOWN_OPTS)) this._badOption(keys[i]);
+            // F18: classify the bag and read its own data values inside ONE try, so a revoked /
+            // throwing-trap Proxy becomes the plain-object TypeError (not an untagged engine throw).
+            let bad, seedOwn, consOwn;
+            try {
+                bad = _optScan(options, CMS_KNOWN_OPTS);
+                if (bad === null) {
+                    seedOwn = _optOwn(options, 'seed');
+                    consOwn = _optOwn(options, 'conservative');
+                }
+            } catch (e) {
+                bad = _NOT_BAG;
             }
-            if (options.seed !== undefined) {
-                seed = options.seed;
+            if (bad === _NOT_BAG) {
+                throw new TypeError(
+                    '[lite-sketch] CountMinSketch options must be a plain object, got ' + _describe(options));
+            }
+            if (bad !== null) this._badOption(bad);
+            // Value checks AFTER the try (never swallowed by it), verbatim from HEAD.
+            if (seedOwn !== undefined) {
+                seed = seedOwn;
                 if (typeof seed !== 'number' || !Number.isInteger(seed)) {
                     throw new RangeError(
                         '[lite-sketch] CountMinSketch seed must be an integer, got ' + _describe(seed));
                 }
             }
-            if (options.conservative !== undefined) {
-                conservative = options.conservative;
+            if (consOwn !== undefined) {
+                conservative = consOwn;
                 if (typeof conservative !== 'boolean') {
                     throw new TypeError(
                         '[lite-sketch] CountMinSketch conservative must be a boolean, got ' + _describe(conservative));
@@ -1024,12 +1045,14 @@ export class CountMinSketch {
      * plain). `saturated` is carried from either side, and any clamp during the merge sets
      * it. Fails closed `[lite-sketch]` if `other` is not a CountMinSketch, differs in
      * d / w / seed, or would push the running `total` past 2^53-1 (F15/S5, byte-identical).
+     * A Proxy over an instance or a field copy is NOT a CountMinSketch (the brand is checked, not
+     * `instanceof`): the brand predicate is the first statement, before any read of `other`.
      * @param {CountMinSketch} other
      * @returns {CountMinSketch} this
      */
     merge(other) {
-        if (!(other instanceof CountMinSketch) ||
-            other._d !== this._d || other._w !== this._w || other._seed !== this._seed) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) return this._badMerge(other);
+        if (other._d !== this._d || other._w !== this._w || other._seed !== this._seed) {
             return this._badMerge(other);
         }
         // Total guard BEFORE the first write (F15): a merged total past 2^53-1 is no longer exact.
@@ -1100,7 +1123,7 @@ export class CountMinSketch {
 
     /** @private Cold thrower for an incompatible merge (non-instance vs d/w/seed mismatch). */
     _badMerge(other) {
-        if (!(other instanceof CountMinSketch)) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) {
             throw new TypeError('[lite-sketch] CountMinSketch.merge expects a CountMinSketch');
         }
         throw new RangeError(
@@ -1126,7 +1149,7 @@ const DD_MAX_BINS_DEFAULT = 2048;
 /** Hard ceiling on the bin array so a strict range can never request an unbounded alloc. */
 const DD_MAX_BINS_CAP = 1 << 20;
 /** Frozen marker of the known option keys -- an unknown key is a throw with a did-you-mean. */
-const DD_KNOWN_OPTS = Object.freeze({ maxBins: true, range: true });
+const DD_KNOWN_OPTS = Object.freeze({ __proto__: null, maxBins: true, range: true });
 /**
  * Smallest supported DDSketch `alpha`. At the 2^20-bin cap a single filled window spans
  * only about 8x of value range at this alpha, so it is the practical floor; a smaller
@@ -1187,6 +1210,8 @@ export const DD_ALPHA_MIN = 1e-6;
  * / getters / a valid `merge` never throw (`quantile` of an empty sketch is NaN). null is not zero.
  */
 export class DDSketch {
+    /** @private Brand (F21): installed by the ctor on every real instance; `#brand in x` runs no user code, is false for a Proxy / field-copy forgery, and adds no module state. */
+    #brand;
     /**
      * @param {number} alpha relative-error target; a number in `[DD_ALPHA_MIN, 1)` =
      *   `[1e-6, 1)`. A smaller alpha throws `[lite-sketch]` at the ctor door.
@@ -1205,16 +1230,30 @@ export class DDSketch {
         let maxBins = DD_MAX_BINS_DEFAULT;
         let range;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+            if (typeof options !== 'object' || options === null) {
                 throw new TypeError(
                     '[lite-sketch] DDSketch options must be a plain object, got ' + _describe(options));
             }
-            const keys = Object.keys(options);
-            for (let i = 0; i < keys.length; i++) {
-                if (!(keys[i] in DD_KNOWN_OPTS)) this._badOption(keys[i]);
+            // F18: classify the bag and read its own data values inside ONE try, so a revoked /
+            // throwing-trap Proxy becomes the plain-object TypeError (not an untagged engine throw).
+            let bad, maxBinsOwn, rangeOwn;
+            try {
+                bad = _optScan(options, DD_KNOWN_OPTS);
+                if (bad === null) {
+                    maxBinsOwn = _optOwn(options, 'maxBins');
+                    rangeOwn = _optOwn(options, 'range');
+                }
+            } catch (e) {
+                bad = _NOT_BAG;
             }
-            if (options.maxBins !== undefined) {
-                maxBins = options.maxBins;
+            if (bad === _NOT_BAG) {
+                throw new TypeError(
+                    '[lite-sketch] DDSketch options must be a plain object, got ' + _describe(options));
+            }
+            if (bad !== null) this._badOption(bad);
+            // Value checks AFTER the try (never swallowed by it), verbatim from HEAD.
+            if (maxBinsOwn !== undefined) {
+                maxBins = maxBinsOwn;
                 if (typeof maxBins !== 'number' || (maxBins | 0) !== maxBins ||
                     maxBins < 1 || maxBins > DD_MAX_BINS_CAP) {
                     throw new RangeError(
@@ -1222,7 +1261,7 @@ export class DDSketch {
                         DD_MAX_BINS_CAP + '], got ' + _describe(maxBins));
                 }
             }
-            if (options.range !== undefined) range = options.range;
+            if (rangeOwn !== undefined) range = rangeOwn;
         }
         const gamma = (1 + alpha) / (1 - alpha);
         const multiplier = 1 / Math.log(gamma);
@@ -1321,9 +1360,21 @@ export class DDSketch {
         }
         let strict = false;
         let minKey = 0, maxKeyStrict = 0, nb = 0;
+        let rangeMinVal = NaN, rangeMaxVal = NaN;   // the VALIDATED range ends, read exactly once per index (F18 TOCTOU)
         if (range !== undefined) {
-            if (!Array.isArray(range) || range.length !== 2) this._badRange(range);
-            const rmin = range[0], rmax = range[1];
+            // F18: the container reads (isArray / length / [0] / [1]) run inside ONE try, so a
+            // revoked / throwing-trap Proxy range becomes the tagged _badRange, not an engine throw.
+            let rmin, rmax, okr = false;
+            try {
+                if (Array.isArray(range) && range.length === 2) {
+                    rmin = range[0];
+                    rmax = range[1];
+                    okr = true;
+                }
+            } catch (e) {
+                okr = false;
+            }
+            if (!okr) this._badRange(range);
             // min must be > 0 (the log domain); zeros always route to _zeroCount regardless.
             if (typeof rmin !== 'number' || typeof rmax !== 'number' ||
                 !Number.isFinite(rmin) || !Number.isFinite(rmax) ||
@@ -1331,6 +1382,8 @@ export class DDSketch {
                 this._badRange(range);
             }
             strict = true;
+            rangeMinVal = rmin;   // keep the VALIDATED numbers; never re-read range[0] / range[1]
+            rangeMaxVal = rmax;
             minKey = Math.ceil(Math.log(rmin) * multiplier);
             maxKeyStrict = Math.ceil(Math.log(rmax) * multiplier);
             // A declared range whose ends can't be represented is invalid (fail closed).
@@ -1357,8 +1410,8 @@ export class DDSketch {
         // always): the floor is the last REJECTED double, the ceiling the last ACCEPTED one.
         this._minIndexable = minIndexable;  // EXCLUSIVE floor: add accepts x > this
         this._maxIndexable = maxIndexable;  // INCLUSIVE ceiling: add accepts x <= this
-        this._rangeMin = strict ? range[0] : NaN;                   // configured strict range (NaN if not strict)
-        this._rangeMax = strict ? range[1] : NaN;
+        this._rangeMin = rangeMinVal;   // the VALIDATED range ends (NaN if not strict); never re-read range[i]
+        this._rangeMax = rangeMaxVal;
         this._bins = new Float64Array(strict ? nb : maxBins);
         this._maxBins = this._bins.length;
         // physical index of key K is K - _offset; the array spans keys [_offset, _offset+maxBins-1].
@@ -1379,10 +1432,10 @@ export class DDSketch {
     get count() { return this._count; }
     /** Exact running sum of every added value. O(1). */
     get sum() { return this._sum; }
-    /** EXACT minimum value seen (NaN if empty). O(1). */
-    get min() { return this._count ? this._min : NaN; }
-    /** EXACT maximum value seen (NaN if empty). O(1). */
-    get max() { return this._count ? this._max : NaN; }
+    /** EXACT minimum value seen (NaN if empty). `+ 0` normalizes a stored -0 to +0 (F18). O(1). */
+    get min() { return this._count ? this._min + 0 : NaN; }
+    /** EXACT maximum value seen (NaN if empty). `+ 0` normalizes a stored -0 to +0 (F18). O(1). */
+    get max() { return this._count ? this._max + 0 : NaN; }
     /** How many exact zeros were added. O(1). */
     get zeroCount() { return this._zeroCount; }
     /** Bin-array length (the space cap on the log-scale window). O(1). */
@@ -1633,6 +1686,54 @@ export class DDSketch {
     }
 
     /**
+     * Estimate several quantiles at once into a caller-owned Float64Array, 0 ALLOC (F8) -- the
+     * zero-alloc render for p50/p90/p99/p999. `out[j]` receives `quantile(qs[j])` BIT-FOR-BIT
+     * (the walk below is quantile's own body, duplicated per q; a shared helper would box the
+     * returned double at the call boundary -- the cost `quantile(q)` itself pays, 16 B in a
+     * non-inlined call). `q` is read from `qs` and the value written to `out`, so neither crosses
+     * a call. The number written is `m = min(qs.length, out.length)`, returned; a bad `q` value
+     * (NaN / out of [0,1] / empty sketch) writes NaN and NEVER throws. In-place `qs === out` is
+     * allowed (each index is read before it is written). An arg that is not a Float64Array, or a
+     * PARTIAL overlap of distinct views, throws a tagged TypeError BEFORE any write.
+     * @param {Float64Array} qs quantiles in [0, 1]
+     * @param {Float64Array} out destination (may be `qs`)
+     * @returns {number} the number of quantiles written
+     */
+    quantilesInto(qs, out) {
+        const lq = _f64Len(qs), lo = _f64Len(out);
+        if (lq < 0 || lo < 0 || _f64Clash(qs, out, true)) return this._badQuantiles(qs, out);
+        const m = lq < lo ? lq : lo;
+        for (let j = 0; j < m; j++) {
+            const q = qs[j];
+            // --- quantile(q)'s body verbatim; each `return X` becomes `out[j] = X; break qrun` ---
+            qrun: {
+                if (typeof q !== 'number' || q !== q || q < 0 || q > 1 || this._count === 0) { out[j] = NaN; break qrun; }
+                const rank = Math.floor(q * (this._count - 1));  // 0-indexed target rank
+                let cum = this._zeroCount;
+                if (rank < cum) { out[j] = 0; break qrun; }       // the target falls in the zero bucket
+                const bins = this._bins;
+                const offset = this._offset;
+                const gamma = this._gamma;
+                const top = this._binCount === 0 ? -1 : this._maxKeyPop - offset;
+                for (let i = 0; i <= top; i++) {
+                    cum += bins[i];
+                    if (cum > rank) {
+                        const K = i + offset;
+                        out[j] = 2 * Math.pow(gamma, K) / (gamma + 1);
+                        break qrun;
+                    }
+                }
+                if (top >= 0) {                                   // rounding at q=1: highest populated bucket
+                    out[j] = 2 * Math.pow(gamma, this._maxKeyPop) / (gamma + 1);
+                    break qrun;
+                }
+                out[j] = NaN;
+            }
+        }
+        return m;
+    }
+
+    /**
      * Merge `other` into this: add the running aggregates and fold every populated bin of
      * `other` through the same collapse logic as `add` (so the collapsed floor stays
      * consistent). O(other bins), NEVER allocates. Fails closed `[lite-sketch]` if `other`
@@ -1643,11 +1744,14 @@ export class DDSketch {
      * `this` carries `other._collapsed` forward (merging collapsed mass makes `this` collapsed).
      * A merge that would push the running `count` past 2^53-1 throws tagged (F15/S5), as a
      * byte-identical no-op.
+     * A Proxy over an instance or a field copy is NOT a DDSketch (the brand is checked, not
+     * `instanceof`): the brand predicate is the first statement, before any read of `other`.
      * @param {DDSketch} other
      * @returns {DDSketch} this
      */
     merge(other) {
-        if (!(other instanceof DDSketch) || other._gamma !== this._gamma) return this._badMerge(other);
+        if (typeof other !== 'object' || other === null || !(#brand in other)) return this._badMerge(other);
+        if (other._gamma !== this._gamma) return this._badMerge(other);
         // A strict sketch cannot absorb a collapsed other (S3): reject AFTER the gamma check and
         // BEFORE the strict pre-scan, as a byte-identical no-op (no write has happened yet).
         if (this._strict && other._collapsed) return this._badMergeCollapsed();
@@ -1741,6 +1845,13 @@ export class DDSketch {
             '[lite-sketch] DDSketch range must be [min, max] with finite 0 < min < max, got ' + _describe(range));
     }
 
+    /** @private Cold thrower for bad quantilesInto arrays (not two non-overlapping Float64Arrays). */
+    _badQuantiles(qs, out) {
+        throw new TypeError(
+            '[lite-sketch] DDSketch.quantilesInto(qs, out) needs two non-overlapping Float64Arrays, got ' +
+            _describe(qs) + ', ' + _describe(out));
+    }
+
     /** @private Cold thrower: a strict sketch cannot absorb a collapsed sketch's low-end mass (S3). */
     _badMergeCollapsed() {
         throw new RangeError(
@@ -1750,7 +1861,7 @@ export class DDSketch {
 
     /** @private Cold thrower for an incompatible merge (non-instance vs unequal gamma/alpha). */
     _badMerge(other) {
-        if (!(other instanceof DDSketch)) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) {
             throw new TypeError('[lite-sketch] DDSketch.merge expects a DDSketch');
         }
         throw new RangeError(
@@ -1771,7 +1882,7 @@ export class DDSketch {
 /** Highest legal counter capacity k. A TYPE bound (k typed arrays + a 2k map), not a size any host materializes. */
 const SS_CAP_MAX = 1 << 24;
 /** Frozen marker of the known option keys -- an unknown key is a throw with a did-you-mean. */
-const SS_KNOWN_OPTS = Object.freeze({ seed: true });
+const SS_KNOWN_OPTS = Object.freeze({ __proto__: null, seed: true });
 /** Default per-instance seed (shared with the other members so a default-seeded SpaceSaving hashes identically). */
 const SS_DEFAULT_SEED = HLL_DEFAULT_SEED;
 
@@ -1852,6 +1963,8 @@ const SS_DEFAULT_SEED = HLL_DEFAULT_SEED;
  * not zero.
  */
 export class SpaceSaving {
+    /** @private Brand (F21): installed by the ctor on every real instance; `#brand in x` runs no user code, is false for a Proxy / field-copy forgery, and adds no module state. */
+    #brand;
     /**
      * @param {number} capacity  counter count k; an integer in [1, 2^24]. epsilon = 1 / k.
      * @param {{seed?: number}} [options]  seed: uint32 hash seed (any integer, coerced with `| 0`).
@@ -1865,16 +1978,27 @@ export class SpaceSaving {
         }
         let seed = SS_DEFAULT_SEED;
         if (options !== undefined) {
-            if (typeof options !== 'object' || options === null || Array.isArray(options)) {
+            if (typeof options !== 'object' || options === null) {
                 throw new TypeError(
                     '[lite-sketch] SpaceSaving options must be a plain object, got ' + _describe(options));
             }
-            const keys = Object.keys(options);
-            for (let i = 0; i < keys.length; i++) {
-                if (!(keys[i] in SS_KNOWN_OPTS)) this._badOption(keys[i]);
+            // F18: classify the bag and read its own data values inside ONE try, so a revoked /
+            // throwing-trap Proxy becomes the plain-object TypeError (not an untagged engine throw).
+            let bad, seedOwn;
+            try {
+                bad = _optScan(options, SS_KNOWN_OPTS);
+                if (bad === null) seedOwn = _optOwn(options, 'seed');
+            } catch (e) {
+                bad = _NOT_BAG;
             }
-            if (options.seed !== undefined) {
-                seed = options.seed;
+            if (bad === _NOT_BAG) {
+                throw new TypeError(
+                    '[lite-sketch] SpaceSaving options must be a plain object, got ' + _describe(options));
+            }
+            if (bad !== null) this._badOption(bad);
+            // Value checks AFTER the try (never swallowed by it), verbatim from HEAD.
+            if (seedOwn !== undefined) {
+                seed = seedOwn;
                 if (typeof seed !== 'number' || !Number.isInteger(seed)) {
                     throw new RangeError(
                         '[lite-sketch] SpaceSaving seed must be an integer, got ' + _describe(seed));
@@ -2097,13 +2221,16 @@ export class SpaceSaving {
     /**
      * Iterate the monitored entries in STORAGE order (NOT sorted), alloc-free, calling
      * `fn(key, count, error, this)`. O(size). A HOISTED callback keeps this a 0-alloc scan.
+     * The loop bound is the LIVE `this._size` (F18): do NOT mutate the sketch inside `fn` -- a
+     * mutation never produces ghosts, but entries may be skipped or revisited. `key` is `+ 0`
+     * (a -0 reads +0). NOTE: a non-inlined `fn` boxes ~49 B/entry for entries >= 2^31 (a key /
+     * count / error >= 2^31 crosses the call as a boxed double); `topKInto` renders those 0-alloc.
      * @param {(key:number, count:number, error:number, ss:SpaceSaving)=>void} fn
      * @returns {void}
      */
     forEach(fn) {
-        const n = this._size;
         const keys = this._key, counts = this._count, errors = this._error;
-        for (let i = 0; i < n; i++) fn(keys[i], counts[i], errors[i], this);
+        for (let i = 0; i < this._size; i++) fn(keys[i] + 0, counts[i], errors[i], this);
     }
 
     /**
@@ -2124,7 +2251,7 @@ export class SpaceSaving {
         const out = [];
         for (let i = 0; i < take; i++) {
             const sl = idx[i];
-            out.push({ key: this._key[sl], count: this._count[sl], error: this._error[sl] });
+            out.push({ key: this._key[sl] + 0, count: this._count[sl], error: this._error[sl] });
         }
         return out;
     }
@@ -2148,11 +2275,119 @@ export class SpaceSaving {
         const size = this._size;
         for (let i = 0; i < size; i++) {
             if (this._count[i] > cut) {            // upper bound -> SUPERSET, no false negatives
-                out.push({ key: this._key[i], count: this._count[i], error: this._error[i] });
+                out.push({ key: this._key[i] + 0, count: this._count[i], error: this._error[i] });
             }
         }
         out.sort((a, b) => b.count - a.count);
         return out;
+    }
+
+    /**
+     * Write the top-n monitored entries by count into three caller-owned Float64Arrays, 0 ALLOC
+     * (F7) -- the zero-alloc top-N render `topK()` is not (it allocates ~160 B/entry). `outKeys[j]`,
+     * `outCounts[j]`, `outErrors[j]` receive entry j, best-first, in EXACTLY `topK(n)`'s order:
+     * count DESCENDING, ties by ASCENDING slot. `n` follows topK's rule (defaults to / clamps to
+     * `size`; a non-integer / negative n is treated as `size`, never throws). The number written is
+     * `w = min(n, size, outKeys.length, outCounts.length, outErrors.length)`; it is returned, and a
+     * too-short out simply receives its own length. Keys are `+ 0` (a -0 reads +0). An out that is
+     * not a Float64Array, or three that overlap in memory, throws a tagged TypeError BEFORE any
+     * write (like addFrom: a wrong array type would silently truncate a key >= 2^32). Disjoint
+     * views over one buffer are fine. O(size log w), monomorphic, no boxing.
+     * @param {Float64Array} outKeys
+     * @param {Float64Array} outCounts
+     * @param {Float64Array} outErrors
+     * @param {number} [n=size]
+     * @returns {number} the number of entries written
+     */
+    topKInto(outKeys, outCounts, outErrors, n) {
+        const la = _f64Len(outKeys), lb = _f64Len(outCounts), lc = _f64Len(outErrors);
+        if (la < 0 || lb < 0 || lc < 0 ||
+            _f64Clash(outKeys, outCounts, false) ||
+            _f64Clash(outKeys, outErrors, false) ||
+            _f64Clash(outCounts, outErrors, false)) {
+            return this._badOut(outKeys, outCounts, outErrors);
+        }
+        const size = this._size;
+        if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) n = size;
+        let w = n < size ? n : size;
+        if (w > la) w = la;
+        if (w > lb) w = lb;
+        if (w > lc) w = lc;
+        if (w === 0) return 0;
+        const counts = this._count;
+        // Bounded MIN-heap of slot ids in outKeys[0..w-1], root = the WORST kept entry:
+        // worse(a,b) = counts[a] < counts[b] || (counts[a] === counts[b] && a > b).
+        // Seed with slots 0..w-1, heapify, then replace the root with any later slot that beats it.
+        for (let i = 0; i < w; i++) outKeys[i] = i;
+        for (let p = (w >> 1) - 1; p >= 0; p--) {
+            let i = p;
+            const sv = outKeys[i] | 0;
+            const sc = counts[sv];
+            for (;;) {
+                let c = 2 * i + 1;
+                if (c >= w) break;
+                let cj = outKeys[c] | 0, cc = counts[cj];
+                const r = c + 1;
+                if (r < w) {
+                    const rj = outKeys[r] | 0, rc = counts[rj];
+                    if (rc < cc || (rc === cc && rj > cj)) { c = r; cj = rj; cc = rc; }
+                }
+                if (cc < sc || (cc === sc && cj > sv)) { outKeys[i] = cj; i = c; } else break;
+            }
+            outKeys[i] = sv;
+        }
+        for (let s = w; s < size; s++) {
+            const rootSlot = outKeys[0] | 0;
+            const rc0 = counts[rootSlot];
+            const sc = counts[s];
+            // s beats the worst kept entry (root)?  i.e. worse(root, s).
+            if (rc0 < sc || (rc0 === sc && rootSlot > s)) {
+                let i = 0;
+                const sv = s;
+                for (;;) {
+                    let c = 2 * i + 1;
+                    if (c >= w) break;
+                    let cj = outKeys[c] | 0, cc = counts[cj];
+                    const r = c + 1;
+                    if (r < w) {
+                        const rj = outKeys[r] | 0, rc = counts[rj];
+                        if (rc < cc || (rc === cc && rj > cj)) { c = r; cj = rj; cc = rc; }
+                    }
+                    if (cc < sc || (cc === sc && cj > sv)) { outKeys[i] = cj; i = c; } else break;
+                }
+                outKeys[i] = sv;
+            }
+        }
+        // In-place heapsort to best-first: repeatedly move the root (worst) past the live region.
+        for (let end = w - 1; end > 0; end--) {
+            const tmp = outKeys[0];
+            outKeys[0] = outKeys[end];
+            outKeys[end] = tmp;
+            let i = 0;
+            const sv = outKeys[0] | 0;
+            const sc = counts[sv];
+            for (;;) {
+                let c = 2 * i + 1;
+                if (c >= end) break;
+                let cj = outKeys[c] | 0, cc = counts[cj];
+                const r = c + 1;
+                if (r < end) {
+                    const rj = outKeys[r] | 0, rc = counts[rj];
+                    if (rc < cc || (rc === cc && rj > cj)) { c = r; cj = rj; cc = rc; }
+                }
+                if (cc < sc || (cc === sc && cj > sv)) { outKeys[i] = cj; i = c; } else break;
+            }
+            outKeys[i] = sv;
+        }
+        // outKeys[0..w-1] now holds slot ids best-first; materialize into the three outs.
+        const keyArr = this._key, errArr = this._error;
+        for (let j = 0; j < w; j++) {
+            const sl = outKeys[j] | 0;
+            outKeys[j] = keyArr[sl] + 0;
+            outCounts[j] = counts[sl];
+            outErrors[j] = errArr[sl];
+        }
+        return w;
     }
 
     /**
@@ -2164,12 +2399,14 @@ export class SpaceSaving {
      * COLD, with a bounded scratch allocation (disclosed). Fails closed `[lite-sketch]` if
      * `other` is not a SpaceSaving, differs in capacity / seed, or would push the running
      * `total` past 2^53-1 (F15/S5, byte-identical no-op).
+     * A Proxy over an instance or a field copy is NOT a SpaceSaving (the brand is checked, not
+     * `instanceof`): the brand predicate is the first statement, before any read of `other`.
      * @param {SpaceSaving} other
      * @returns {SpaceSaving} this
      */
     merge(other) {
-        if (!(other instanceof SpaceSaving) ||
-            other._capacity !== this._capacity || other._seed !== this._seed) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) return this._badMerge(other);
+        if (other._capacity !== this._capacity || other._seed !== this._seed) {
             return this._badMerge(other);
         }
         // Total guard BEFORE the first write (F15): a merged total past 2^53-1 is no longer exact.
@@ -2462,9 +2699,16 @@ export class SpaceSaving {
             '], got ' + _describe(capacity));
     }
 
+    /** @private Cold thrower for bad topKInto out arrays (not three non-overlapping Float64Arrays). */
+    _badOut(a, b, c) {
+        throw new TypeError(
+            '[lite-sketch] SpaceSaving.topKInto(outKeys, outCounts, outErrors, n) needs three ' +
+            'non-overlapping Float64Arrays, got ' + _describe(a) + ', ' + _describe(b) + ', ' + _describe(c));
+    }
+
     /** @private Cold thrower for an incompatible merge (non-instance vs capacity/seed mismatch). */
     _badMerge(other) {
-        if (!(other instanceof SpaceSaving)) {
+        if (typeof other !== 'object' || other === null || !(#brand in other)) {
             throw new TypeError('[lite-sketch] SpaceSaving.merge expects a SpaceSaving');
         }
         throw new RangeError(
@@ -2479,4 +2723,167 @@ export class SpaceSaving {
             '[lite-sketch] SpaceSaving unknown option "' + _describe(key) +
             '"; known options: ' + Object.keys(SS_KNOWN_OPTS).join(', '));
     }
+}
+
+// ===========================================================================
+// Cold module helpers -- placed AFTER every class so they take the LAST module
+// context slots and never shift the slot operands of the hot class methods (the
+// bytecode of add / addHashed(From) / _addAt / _apply* / count / ... is byte- AND
+// operand-identical to HEAD). They are only ever called at method-call time, after
+// module evaluation completes, so trailing position raises no TDZ issue.
+// ===========================================================================
+
+// --- Option-bag validation (F18), all COLD (ctor door only) ---------------
+
+/**
+ * @private Module sentinel returned by `_optScan` for a NON-bag option argument (wrong
+ * prototype, or an own accessor). A unique object, so it can never collide with a string /
+ * symbol "unknown key" result nor with `null` (a valid bag). Frozen, null-proto.
+ */
+const _NOT_BAG = Object.freeze({ __proto__: null });
+
+/**
+ * @private `Object.hasOwn`, captured at module evaluation BEFORE any user code can monkeypatch
+ * it. Used for the descriptor OWN-`value` test: a plain `'value' in d` walks d's prototype
+ * chain, so `Object.prototype.value = 5` (data or getter) would make an own-accessor bag look
+ * like a data descriptor and read / run the inherited value. `_hasOwn(d, 'value')` is own-only.
+ */
+const _hasOwn = Object.hasOwn;
+
+/** @private This realm's `Object.prototype`, captured at module eval (a non-configurable intrinsic). */
+const _OBJ_PROTO = Object.prototype;
+
+/**
+ * @private Classify an option argument against a null-proto KNOWN set (F18). A valid bag is a
+ * non-null object whose prototype `p` is one of:
+ *   - `null`;
+ *   - THIS realm's `Object.prototype` (its keys are ignored -- a polluted `Object.prototype.seed`
+ *     still yields the default, not a smuggled value);
+ *   - any OTHER root prototype (`Object.getPrototypeOf(p) === null`, e.g. a cross-realm vm / iframe
+ *     `Object.prototype`, or a bare null-proto object) ONLY IF `p` carries NO own property named by
+ *     a KNOWN key -- otherwise an inherited option would be silently dropped, so it fails closed.
+ * Map / Date / RegExp / arrays / class instances / `Object.create(proto)` are not bags. Every own
+ * key of `o` (`Reflect.ownKeys`: symbols and non-enumerable keys included) must be a string present
+ * in `known`, and every own property must be a DATA descriptor (an OWN `value`, via `_hasOwn` --
+ * never the prototype chain) -- an own accessor makes the object a non-bag, so no getter ever runs.
+ * The Proxy-trap-bearing steps (getPrototypeOf, ownKeys, getOwnPropertyDescriptor) run inside the
+ * caller's one try; `getOwnPropertyDescriptor` reads a descriptor, so no getter on `p` is run either.
+ * @param {object} o the option argument (already known to be a non-null object)
+ * @param {object} known a null-proto frozen set of legal keys
+ * @returns {null|object|string|symbol} null for a valid bag, `_NOT_BAG` for a non-bag, else the first unknown own key
+ */
+function _optScan(o, known) {
+    const p = Object.getPrototypeOf(o);
+    if (p !== null && p !== _OBJ_PROTO) {
+        if (Object.getPrototypeOf(p) !== null) return _NOT_BAG;
+        // A non-(this realm) root prototype must carry NO own KNOWN key (else it smuggles a dropped option).
+        const kk = Reflect.ownKeys(known);
+        for (let i = 0; i < kk.length; i++) {
+            if (Object.getOwnPropertyDescriptor(p, kk[i]) !== undefined) return _NOT_BAG;
+        }
+    }
+    const keys = Reflect.ownKeys(o);
+    for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        const d = Object.getOwnPropertyDescriptor(o, k);
+        if (d === undefined || !_hasOwn(d, 'value')) return _NOT_BAG;   // an own accessor -> not a bag
+        if (!(typeof k === 'string' && k in known)) return k;          // unknown own key (string or symbol)
+    }
+    return null;
+}
+
+/**
+ * @private The own DATA value of key `k` on a validated bag `o`, or undefined (missing or an
+ * accessor -- though `_optScan` has already rejected any accessor). Reads the descriptor's OWN
+ * `value` (via `_hasOwn`), never `[[Get]]` and never the prototype chain, so no inherited value
+ * and no getter. Cold.
+ * @param {object} o a bag already passed by `_optScan`
+ * @param {string} k a known option key
+ * @returns {*} the own data value, or undefined
+ */
+function _optOwn(o, k) {
+    const d = Object.getOwnPropertyDescriptor(o, k);
+    return d !== undefined && _hasOwn(d, 'value') ? d.value : undefined;
+}
+
+// --- Float64Array out-array validation (F7 / F8), COLD (into-method door) --
+// Cached %TypedArray%.prototype getters: they run NO Proxy trap (a Proxy has no TypedArray
+// internal slots, so the @@toStringTag getter returns undefined and length / buffer / byteOffset
+// throw, never forwarding to a trap) and NO subclass override.
+
+const _TA_PROTO = Object.getPrototypeOf(Float64Array.prototype);
+const _taTag = Object.getOwnPropertyDescriptor(_TA_PROTO, Symbol.toStringTag).get;
+const _taLen = Object.getOwnPropertyDescriptor(_TA_PROTO, 'length').get;
+const _taBuf = Object.getOwnPropertyDescriptor(_TA_PROTO, 'buffer').get;
+const _taOff = Object.getOwnPropertyDescriptor(_TA_PROTO, 'byteOffset').get;
+// The ArrayBuffer.prototype byteLength getter tells a SAB from a plain ArrayBuffer with no user
+// code (an internal-slot check, no Proxy trap): it returns a number for a plain ArrayBuffer and
+// THROWS for a SharedArrayBuffer. Used by `_isSAB` this way round so the COMMON case (plain
+// ArrayBuffer out arrays) never throws -- zero allocation -- and only a genuine SAB pays the throw.
+// Two DISTINCT SAB objects can alias the same memory (structuredClone / a worker round-trip), which
+// a buffer-identity test cannot see, so a cross-SAB pair fails closed.
+const _hasSAB = typeof SharedArrayBuffer === 'function';
+const _abByteLen = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
+const _AB_PROTO = ArrayBuffer.prototype;   // probe-order hint for _f64Clash (never the answer)
+
+/**
+ * @private The element length of `x` if it is a REAL Float64Array, else -1. The @@toStringTag
+ * getter is 'Float64Array' only for a genuine Float64Array (not a Float32Array, not an Array,
+ * not a Proxy over one, not a subclass tagged otherwise); length is then read with no trap.
+ * @param {*} x
+ * @returns {number} length, or -1
+ */
+function _f64Len(x) {
+    if (typeof x !== 'object' || x === null) return -1;
+    if (_taTag.call(x) !== 'Float64Array') return -1;
+    return _taLen.call(x);
+}
+
+/**
+ * @private True when `buf` is a SharedArrayBuffer, decided with NO user code: the cached
+ * ArrayBuffer byteLength getter reads an internal slot and throws ONLY on a SharedArrayBuffer
+ * (returning a number for a plain ArrayBuffer). `buf` here is always a real buffer from a real
+ * Float64Array's `.buffer`, so "the AB getter throws" means exactly "is a SAB". The common
+ * plain-ArrayBuffer path returns `false` with no throw, hence 0 allocation. False on a host
+ * without SharedArrayBuffer (no buffer can be shared).
+ * @param {ArrayBufferLike} buf
+ * @returns {boolean}
+ */
+function _isSAB(buf) {
+    if (!_hasSAB) return false;
+    try { _abByteLen.call(buf); return false; } catch (e) { return true; }
+}
+
+/**
+ * @private True when `a` and `b` could write the same memory. SAME buffer object: the byte
+ * ranges intersect (equal offsets allowed only if `sameOk` -- the exact in-place view
+ * quantilesInto reads-then-writes index by index). DIFFERENT buffer objects that are BOTH
+ * SharedArrayBuffers: fail closed (`true`) -- two distinct SAB objects can alias one block of
+ * memory and that cannot be verified. Different objects otherwise (plain ArrayBuffers, or one
+ * SAB and one plain buffer) cannot alias: no clash. The plain buffer is probed first so an
+ * accepted mixed pair never triggers the SAB internal throw (0 alloc). Both args are already real
+ * Float64Arrays.
+ * @param {Float64Array} a
+ * @param {Float64Array} b
+ * @param {boolean} sameOk allow equal offsets (same-view in-place)
+ * @returns {boolean}
+ */
+function _f64Clash(a, b, sameOk) {
+    const ba = _taBuf.call(a), bb = _taBuf.call(b);
+    if (ba === bb) {
+        const ao = _taOff.call(a);
+        const bo = _taOff.call(b);
+        if (ao === bo) return !sameOk;
+        const ae = ao + _taLen.call(a) * 8;
+        const be = bo + _taLen.call(b) * 8;
+        return ao < be && bo < ae;
+    }
+    // Distinct buffer objects clash only if BOTH are SharedArrayBuffers. Probe a PLAIN ArrayBuffer
+    // FIRST: `_isSAB` on a plain AB returns false with no throw, so an ACCEPTED mixed pair (one SAB,
+    // one plain -- the SAB-to-worker case) short-circuits before ever probing the SAB, 0 alloc. The
+    // prototype only picks the probe ORDER, never the answer (the getter reads internal slots), so a
+    // SAB with a swapped-to-AB prototype is still probed and still rejected; only a two-SAB pair,
+    // which is rejected anyway, pays the internal throw.
+    if (Object.getPrototypeOf(bb) === _AB_PROTO) return _isSAB(bb) && _isSAB(ba);
+    return _isSAB(ba) && _isSAB(bb);
 }

@@ -252,6 +252,60 @@ async function main() {
     const ssBBytes = Math.max(0, Math.round(ssBBpc));
     const ssBOk = ssBBytes === 0;
 
+    // ---- phase 2a-query (H2.7, F7/F8): 0 B/op on the cold-read Into methods ----------------
+    // topKInto / quantilesInto are the zero-alloc query renders (topK / quantile allocate / box).
+    // The big SS fixture has keys AND counts >= 2^31 (non-Smi doubles) that topKInto writes into
+    // caller-owned Float64Arrays without a box; quantilesInto reads each q from, and writes each
+    // value to, a Float64Array slot, so neither crosses a call. Both are measured at 0 B/op AND
+    // gated at the clean scavenge floor below.
+    const tkSS = new SpaceSaving(64, { seed: 0x9e3779b1 });
+    for (let i = 0; i < 256; i++) tkSS.add(2 ** 31 + (i % 128), 2 ** 31 + i);   // non-Smi key + count
+    const tkK = new Float64Array(64), tkC = new Float64Array(64), tkE = new Float64Array(64);
+    let tkSink = 0;
+    const tkStep = () => { tkSink = (tkSink + tkSS.topKInto(tkK, tkC, tkE, 16)) | 0; };   // top-16
+    const tkRes = measureAllocs(tkStep, { iterations: 100000, batches: 8 });
+    const tkBpc = tkRes.bytesPerCall === null ? 0 : tkRes.bytesPerCall;
+    const tkBytes = Math.max(0, Math.round(tkBpc));
+    const tkOk = tkBytes === 0;
+
+    const qsDD = new DDSketch(0.01);
+    for (let i = 1; i <= 10000; i++) qsDD.add(1e6 + i * 1.37);
+    const qsQ = new Float64Array([0.5, 0.9, 0.99, 0.999]);
+    const qsOut = new Float64Array(4);
+    let qsSink = 0;
+    const qsStep = () => { qsSink = (qsSink + qsDD.quantilesInto(qsQ, qsOut)) | 0; };
+    const qsRes = measureAllocs(qsStep, { iterations: 100000, batches: 8 });
+    const qsBpc = qsRes.bytesPerCall === null ? 0 : qsRes.bytesPerCall;
+    const qsBytes = Math.max(0, Math.round(qsBpc));
+    const qsOk = qsBytes === 0;
+
+    // SAB-first mixed outs: qs / keys on a SharedArrayBuffer, outs plain (the SAB-to-worker case).
+    // The overlap check must probe the PLAIN out FIRST, so an ACCEPTED mixed pair never triggers the
+    // SAB internal throw; a prior version probed the SAB first and threw+caught a TypeError per call
+    // (~1200 / ~1900 B/call here). These lanes are 0 B/op AND gated at the clean scavenge floor below.
+    // Fail closed: a host without SharedArrayBuffer cannot measure these lanes, so it must not pass them.
+    if (typeof SharedArrayBuffer !== 'function') {
+        throw new Error('[lite-sketch torture] SharedArrayBuffer is missing: the SAB-first lanes cannot be measured');
+    }
+    const sqQ = new Float64Array(new SharedArrayBuffer(8 * 4));
+    sqQ.set([0.5, 0.9, 0.99, 0.999]);
+    const sqOut = new Float64Array(4);
+    let sqSink = 0;
+    const sqStep = () => { sqSink = (sqSink + qsDD.quantilesInto(sqQ, sqOut)) | 0; };
+    const sqRes = measureAllocs(sqStep, { iterations: 100000, batches: 8 });
+    const sqBpc = sqRes.bytesPerCall === null ? 0 : sqRes.bytesPerCall;
+    const sqBytes = Math.max(0, Math.round(sqBpc));
+    const sqOk = sqBytes === 0;
+
+    const stK = new Float64Array(new SharedArrayBuffer(8 * 64));
+    const stC = new Float64Array(64), stE = new Float64Array(64);
+    let stSink = 0;
+    const stStep = () => { stSink = (stSink + tkSS.topKInto(stK, stC, stE, 16)) | 0; };
+    const stRes = measureAllocs(stStep, { iterations: 100000, batches: 8 });
+    const stBpc = stRes.bytesPerCall === null ? 0 : stRes.bytesPerCall;
+    const stBytes = Math.max(0, Math.round(stBpc));
+    const stOk = stBytes === 0;
+
     // ---- phase 2b: GC budget over a long hot run ----
     const gc = new GcProfiler().start();
     const HOT = 2000000;
@@ -351,6 +405,11 @@ async function main() {
     const scDd = await scavLane(ddStep);
     const scSsE = await scavLane(ssEStep);
     const scSsB = await scavLane(ssBStep);
+    const scTk = await scavLane(tkStep);   // H2.7: topKInto big n16 stays at the clean floor
+    const scQs = await scavLane(qsStep);   // H2.7: quantilesInto q4 stays at the clean floor
+    const scSq = await scavLane(sqStep);   // H2.7: quantilesInto(sabQs, plainOut) -- plain-probed-first, 0
+    const scSt = await scavLane(stStep);   // H2.7: topKInto(sabKeys, plainCounts, plainErrors) -- 0
+    SINK = (SINK + tkSink + qsSink + sqSink + stSink) | 0;
 
     // ---- N7: FRACTIONAL-input lane -- DDSketch.addFrom(buf, i) vs add(value) ------
     // WHY addFrom exists: a FRACTIONAL double passed as an ARGUMENT to add(value) is boxed
@@ -389,17 +448,20 @@ async function main() {
         scAh <= SCAV_BOX && scCh <= SCAV_BOX &&                                 // addHashed caller-boxed lanes (F6)
         scAdd <= SCAV_CLEAN && scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&
         scDd <= SCAV_CLEAN && scSsE <= SCAV_CLEAN && scSsB <= SCAV_CLEAN &&
+        scTk <= SCAV_CLEAN && scQs <= SCAV_CLEAN &&  // H2.7: topKInto / quantilesInto at the clean floor
+        scSq <= SCAV_CLEAN && scSt <= SCAV_CLEAN &&  // H2.7: SAB-first mixed outs probe plain first -> no per-call throw
         scDdFrom <= SCAV_CLEAN &&  // N7: addFrom on FRACTIONAL input stays at the clean floor (the delta-0 proof)
         scDdAdd <= SCAV_ADD_INLINE;  // N7: add(value) stays INLINED (bytecode < V8 cap); teeth: the pre-fix 483-byte shape read 15
 
     // ---- verdict + GATE line ----
     const cmsAllocOk = ccOk && cpOk && chOk && ceOk;
     const ssAllocOk = ssEOk && ssBOk;
+    const queryAllocOk = tkOk && qsOk && sqOk && stOk;   // H2.7: topKInto / quantilesInto (incl. SAB-first mixed) at 0 B/op
     const ok = trackedOk && live === 0 && findings.length === 0 &&
         cmsTrackedOk && cmsLive === 0 && cmsFindings.length === 0 &&
         ddTrackedOk && ddLive === 0 && ddFindings.length === 0 &&
         ssTrackedOk && ssLive === 0 && ssFindings.length === 0 &&
-        addOk && ahOk && cmsAllocOk && ddOk && ssAllocOk && report.ok && abOk && scavOk;
+        addOk && ahOk && cmsAllocOk && ddOk && ssAllocOk && queryAllocOk && report.ok && abOk && scavOk;
     const gateLive = live + cmsLive + ddLive + ssLive;
     const gateFindings = findings.length + cmsFindings.length + ddFindings.length + ssFindings.length;
     console.log(
@@ -409,7 +471,9 @@ async function main() {
         ccBytes + ' B/op (CountMinSketch add cons) ' + cpBytes + ' B/op (CountMinSketch add plain) ' +
         chBytes + ' B/op (CountMinSketch addHashedFrom) ' + ceBytes + ' B/op (CountMinSketch estimate) ' +
         ddBytes + ' B/op (DDSketch add) ' +
-        ssEBytes + ' B/op (SpaceSaving add evict) ' + ssBBytes + ' B/op (SpaceSaving add bump)' +
+        ssEBytes + ' B/op (SpaceSaving add evict) ' + ssBBytes + ' B/op (SpaceSaving add bump) ' +
+        tkBytes + ' B/op (SpaceSaving topKInto) ' + qsBytes + ' B/op (DDSketch quantilesInto) ' +
+        sqBytes + ' B/op (quantilesInto SAB-first) ' + stBytes + ' B/op (topKInto SAB-first)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + '/' + cmsTrackedMid + '/' + ddTrackedMid + '/' + ssTrackedMid +
         ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
@@ -418,6 +482,8 @@ async function main() {
         'HLL add=' + scAdd + ' HLL addHashedFrom=' + scAh + ' | ' +
         'CMS add cons=' + scCc + ' plain=' + scCp + ' addHashedFrom=' + scCh + ' estimate=' + scCe + ' | ' +
         'DD add=' + scDd + ' | SS evict=' + scSsE + ' bump=' + scSsB +
+        ' | SS topKInto=' + scTk + ' DD quantilesInto=' + scQs +
+        ' | SAB-first quantilesInto=' + scSq + ' topKInto=' + scSt +
         ' | ' + (scavOk ? 'ok' : 'FAIL'));
     console.log(
         'N7 DDSketch fractional lane (add(value) boxes at a non-inlined boundary; addFrom reads unboxed): ' +
@@ -446,6 +512,14 @@ async function main() {
         if (!ddOk) console.error('  alloc ' + ddBytes + ' B/op DDSketch add (raw ' + ddBpc + ')');
         if (!ssEOk) console.error('  alloc ' + ssEBytes + ' B/op SpaceSaving add evict (raw ' + ssEBpc + ')');
         if (!ssBOk) console.error('  alloc ' + ssBBytes + ' B/op SpaceSaving add bump (raw ' + ssBBpc + ')');
+        if (!tkOk) console.error('  alloc ' + tkBytes + ' B/op SpaceSaving topKInto (raw ' + tkBpc + ')');
+        if (!qsOk) console.error('  alloc ' + qsBytes + ' B/op DDSketch quantilesInto (raw ' + qsBpc + ')');
+        if (!sqOk) console.error('  alloc ' + sqBytes + ' B/op DDSketch quantilesInto SAB-first (raw ' + sqBpc + ')');
+        if (!stOk) console.error('  alloc ' + stBytes + ' B/op SpaceSaving topKInto SAB-first (raw ' + stBpc + ')');
+        if (scTk > SCAV_CLEAN) console.error('  scavenge SS topKInto=' + scTk + ' (clean<=' + SCAV_CLEAN + ')');
+        if (scQs > SCAV_CLEAN) console.error('  scavenge DD quantilesInto=' + scQs + ' (clean<=' + SCAV_CLEAN + ')');
+        if (scSq > SCAV_CLEAN) console.error('  scavenge DD quantilesInto SAB-first=' + scSq + ' (clean<=' + SCAV_CLEAN + ')');
+        if (scSt > SCAV_CLEAN) console.error('  scavenge SS topKInto SAB-first=' + scSt + ' (clean<=' + SCAV_CLEAN + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         if (!scavOk) console.error('  scavenge floor exceeded (clean<=' + SCAV_CLEAN + ' box<=' + SCAV_BOX +
