@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>lite-sketch Chrome B/op lane</title>
+</head>
+<body>
+<p>lite-sketch headless B/op harness -- see test/chrome/run.mjs</p>
+<script type="module">
+// @zakkster/lite-sketch -- the Chrome B/op lane page (repo-only; loaded by test/chrome/run.mjs).
+//
+// One page per Chrome launch. The launch pins --js-flags=--expose-gc
+// --min-semi-space-size=64 --max-semi-space-size=64 (and, in ni mode,
+// --max-inlined-bytecode-size=0) + --enable-precise-memory-info, so the MODE is a
+// launch property; this page runs identically in df and ni and only labels itself
+// from ?mode=. It imports the module under test from /lib.js (the server serves
+// --lib <path> or the repo Sketch.js) and measures per-op heap growth:
+// gc();gc(), then performance.memory.usedJSHeapSize delta over 200k ops / units.
+// The gate (min of 3 windows vs a per-group limit) lives in run.mjs; this page only
+// reports raw windows + each lane's structural box facts, from which run.mjs derives
+// the per-mode box count k. A key / count >= 2^30 is a non-Smi in Chrome (31-bit Smi).
+//
+// Box facts reported per lane (run.mjs turns them into k per mode):
+//   inlines   -- df eliminates the arg box (the add/estimate WRAPPER inlines and stages
+//                the key in _buf). true for HLL/CMS/SS add+estimate; false for DD add,
+//                whose value box survives both modes.
+//   boxKey    -- the key / value arg is a non-Smi read fresh per op (b30/n31/safe/hud,
+//                or a fractional DD value).
+//   boxCount  -- the count arg is a non-Smi VARIABLE read fresh per op (v31). A constant
+//                count (c1 Smi, c30 hoisted non-Smi) does NOT box per op.
+// ASCII-only; no deps.
+const params = new URLSearchParams(location.search);
+const MODE = params.get('mode') || 'df';
+const OPS = 200000;
+const SIZE = 65536;
+const MASK = SIZE - 1;
+const C30 = 2 ** 30;
+
+function post(body) { return fetch('/result', { method: 'POST', body: JSON.stringify(body) }); }
+
+// Fail closed: no gc / no precise-memory API is UNVERIFIED (run.mjs exits 1). A
+// PRESENT but imprecise performance.memory (the --enable-precise-memory-info flag
+// dropped) is NOT caught here -- it reads 0 B/op and trips the CTRL gate instead.
+if (typeof gc !== 'function') { await post({ error: 'no-gc', mode: MODE }); }
+else if (typeof performance.memory === 'undefined' || typeof performance.memory.usedJSHeapSize !== 'number') {
+  await post({ error: 'no-precise-memory', mode: MODE });
+} else {
+  let M;
+  try { M = await import('/lib.js'); }
+  catch (e) { await post({ error: 'import: ' + (e && e.message), mode: MODE }); throw e; }
+
+  // Key-class ring (65536 doubles). small is a 31-bit Smi; b30 / safe / hud are
+  // positive non-Smi; n31 is negative non-Smi. hud = ch*2^32 + tag (lite-hud shape).
+  function keys(kc) {
+    const K = new Float64Array(SIZE);
+    for (let i = 0; i < SIZE; i++) {
+      switch (kc) {
+        case 'small': K[i] = i; break;
+        case 'b30': K[i] = C30 + i; break;
+        case 'n31': K[i] = -(2 ** 31) - i; break;
+        case 'safe': K[i] = 2 ** 53 - 1 - i; break;
+        case 'hud': K[i] = (i & 1023) * 2 ** 32 + (i & 1023); break;
+        default: K[i] = i;
+      }
+    }
+    return K;
+  }
+  // v31: a cumulative microsecond-weight series that ACCUMULATES past 2^31 (probe82's
+  // shape). Each slot is a running total above 2^31, so the count arg crosses as a
+  // non-Smi double every op. The lane gates the UNBOXED read (addFrom reads the count
+  // from the buffer), for which CMS 2^32-1 cell saturation is immaterial -- the read
+  // happens before the clamp. Stays below 2^32 so it is a valid count.
+  function countsV31() {
+    const CS = new Float64Array(SIZE);
+    let acc = 2 ** 31;                             // already past 2^31
+    for (let i = 0; i < SIZE; i++) { acc += 1500; CS[i] = acc; }   // accumulate; max ~2^31 + 98M < 2^32
+    return CS;
+  }
+
+  // Build a lane's step closure + fixture (by kind). Returns { step } or { absent }.
+  function build(spec) {
+    const { kind, kc, count } = spec;
+    const F = new Float64Array(2);
+    if (kind === 'hll.add') {
+      const K = keys(kc), sk = new M.HyperLogLog(14);
+      return { step: (i) => { sk.add(K[i & MASK]); } };
+    }
+    if (kind === 'hll.addFrom') {
+      const K = keys(kc), sk = new M.HyperLogLog(14);
+      if (typeof sk.addFrom !== 'function') return { absent: 'HyperLogLog.addFrom' };
+      return { step: (i) => { F[0] = K[i & MASK]; sk.addFrom(F, 0); } };
+    }
+    if (kind === 'hll.addHashedFrom') {
+      const sk = new M.HyperLogLog(14);
+      if (typeof sk.addHashedFrom !== 'function') return { absent: 'HyperLogLog.addHashedFrom' };
+      const U = new Uint32Array(SIZE * 2);
+      for (let j = 0; j < SIZE; j++) { const hi = (2 ** 31 + j) >>> 0; U[j * 2] = hi; U[j * 2 + 1] = (hi ^ 0x5bd1e995) >>> 0; }
+      return { step: (i) => { sk.addHashedFrom(U, (i & MASK) * 2); } };
+    }
+    if (kind === 'cms.add') {
+      const K = keys(kc), sk = new M.CountMinSketch(5, 16384);
+      if (count === 'v31') { const CS = countsV31(); return { step: (i) => { sk.add(K[i & MASK], CS[i & MASK]); } }; }
+      const c = count === 'c30' ? C30 : 1;
+      return { step: (i) => { sk.add(K[i & MASK], c); } };
+    }
+    if (kind === 'cms.addFrom') {
+      const K = keys(kc), sk = new M.CountMinSketch(5, 16384);
+      if (typeof sk.addFrom !== 'function') return { absent: 'CountMinSketch.addFrom' };
+      if (count === 'v31') { const CS = countsV31(); return { step: (i) => { F[0] = K[i & MASK]; F[1] = CS[i & MASK]; sk.addFrom(F, 0); } }; }
+      const c = count === 'c30' ? C30 : 1;
+      return { step: (i) => { F[0] = K[i & MASK]; F[1] = c; sk.addFrom(F, 0); } };
+    }
+    if (kind === 'cms.addHashedFrom') {
+      const sk = new M.CountMinSketch(5, 16384);
+      if (typeof sk.addHashedFrom !== 'function') return { absent: 'CountMinSketch.addHashedFrom' };
+      const U = new Uint32Array(SIZE * 3);
+      for (let j = 0; j < SIZE; j++) { const hi = (2 ** 31 + j) >>> 0; U[j * 3] = hi; U[j * 3 + 1] = (hi ^ 0x5bd1e995) >>> 0; U[j * 3 + 2] = 1; }
+      return { step: (i) => { sk.addHashedFrom(U, (i & MASK) * 3); } };
+    }
+    if (kind === 'cms.est') {
+      const K = keys(kc), sk = new M.CountMinSketch(5, 16384);
+      for (let i = 0; i < SIZE; i++) sk.add(K[i], 1);
+      let sink = 0;
+      return { step: (i) => { sink = (sink + (sk.estimate(K[i & MASK]) > 0 ? 1 : 0)) | 0; }, sinkOf: () => sink };
+    }
+    if (kind === 'ss.add') {
+      const K = keys(kc), sk = new M.SpaceSaving(1024);
+      if (count === 'v31') { const CS = countsV31(); return { step: (i) => { sk.add(K[i & MASK], CS[i & MASK]); } }; }
+      const c = count === 'c30' ? C30 : 1;
+      return { step: (i) => { sk.add(K[i & MASK], c); } };
+    }
+    if (kind === 'ss.addFrom') {
+      const K = keys(kc), sk = new M.SpaceSaving(1024);
+      if (typeof sk.addFrom !== 'function') return { absent: 'SpaceSaving.addFrom' };
+      if (count === 'v31') { const CS = countsV31(); return { step: (i) => { F[0] = K[i & MASK]; F[1] = CS[i & MASK]; sk.addFrom(F, 0); } }; }
+      const c = count === 'c30' ? C30 : 1;
+      return { step: (i) => { F[0] = K[i & MASK]; F[1] = c; sk.addFrom(F, 0); } };
+    }
+    if (kind === 'ss.est') {
+      const K = keys(kc), sk = new M.SpaceSaving(1024);
+      for (let i = 0; i < SIZE; i++) sk.add(K[i], 1);
+      let sink = 0;
+      return { step: (i) => { sink = (sink + (sk.estimate(K[i & MASK]) > 0 ? 1 : 0)) | 0; }, sinkOf: () => sink };
+    }
+    if (kind === 'dd.add') {
+      const sk = new M.DDSketch(0.01);
+      const frac = count === 'frac';
+      for (let k = 1; k <= 20000; k++) sk.add(frac ? k + 0.5 : k);   // prime a stable window
+      return { step: (i) => { const v = 1 + (i & 65535); sk.add(frac ? v + 0.5 : v); } };
+    }
+    if (kind === 'dd.addFrom') {
+      const sk = new M.DDSketch(0.01);
+      if (typeof sk.addFrom !== 'function') return { absent: 'DDSketch.addFrom' };
+      for (let k = 1; k <= 20000; k++) sk.add(k + 0.5);
+      return { step: (i) => { F[0] = 1 + (i & 65535) + 0.5; sk.addFrom(F, 0); } };
+    }
+    if (kind === 'ss.topKInto') {
+      const sk = new M.SpaceSaving(64);
+      for (let i = 0; i < 256; i++) sk.add(2 ** 31 + (i % 128), 2 ** 31 + i);   // non-Smi key + count fixture
+      if (typeof sk.topKInto !== 'function') return { absent: 'SpaceSaving.topKInto' };
+      const ok = new Float64Array(64), oc = new Float64Array(64), oe = new Float64Array(64);
+      let sink = 0;
+      return { step: () => { sink = (sink + sk.topKInto(ok, oc, oe, 16)) | 0; }, sinkOf: () => sink };
+    }
+    if (kind === 'dd.quantilesInto') {
+      const sk = new M.DDSketch(0.01);
+      for (let i = 1; i <= 10000; i++) sk.add(1e6 + i * 1.37);
+      if (typeof sk.quantilesInto !== 'function') return { absent: 'DDSketch.quantilesInto' };
+      const qs = new Float64Array([0.5, 0.9, 0.99, 0.999]), out = new Float64Array(4);
+      let sink = 0;
+      return { step: () => { sink = (sink + sk.quantilesInto(qs, out)) | 0; }, sinkOf: () => sink };
+    }
+    if (kind === 'ctrl') {
+      // One fresh HeapNumber per op: a PACKED_ELEMENTS Array(64) (seeded null) stays
+      // tagged, so storing a double boxes it. The lane's non-library teeth (>= 8 B/op).
+      const ring = new Array(64).fill(null);
+      const FR = new Float64Array(1024);
+      for (let i = 0; i < 1024; i++) FR[i] = C30 + i + 0.5;
+      return { step: (i) => { ring[i & 63] = FR[i & 1023] * 1.5; } };
+    }
+    return { absent: 'unknown-kind:' + kind };
+  }
+
+  // 49 lanes per mode. Each add lane declares inlines / boxKey / boxCount (run.mjs
+  // derives k = (inlines && df) ? 0 : boxKey + boxCount; limit = 12k + 0.5).
+  const LANES = [];
+  const NONSMI = { small: false, b30: true, n31: true, safe: true, hud: true };
+  // from (<=0.5): HLL addFrom x 5 kc.
+  for (const kc of ['small', 'b30', 'n31', 'safe', 'hud']) LANES.push({ name: 'HLL addFrom ' + kc, kind: 'hll.addFrom', kc, group: 'from' });
+  // from: CMS / SS addFrom x 5 kc x {c30, v31}.
+  for (const member of ['CMS', 'SS']) for (const count of ['c30', 'v31']) for (const kc of ['small', 'b30', 'n31', 'safe', 'hud'])
+    LANES.push({ name: member + ' addFrom ' + count + ' ' + kc, kind: (member === 'CMS' ? 'cms' : 'ss') + '.addFrom', kc, count, group: 'from' });
+  // from: HLL / CMS addHashedFrom (uint32 lanes >= 2^31, read unboxed).
+  LANES.push({ name: 'HLL addHashedFrom', kind: 'hll.addHashedFrom', group: 'from' });
+  LANES.push({ name: 'CMS addHashedFrom', kind: 'cms.addHashedFrom', group: 'from' });
+  // from: DD addFrom (fractional value read unboxed).
+  LANES.push({ name: 'DD addFrom frac', kind: 'dd.addFrom', group: 'from' });
+
+  // add (<=12k+0.5): HLL add {small, b30, n31, safe}. inlines in df.
+  for (const kc of ['small', 'b30', 'n31', 'safe'])
+    LANES.push({ name: 'HLL add ' + kc, kind: 'hll.add', kc, group: 'add', inlines: true, boxKey: NONSMI[kc], boxCount: false });
+  // add: CMS / SS {c1, c30} x {small, b30}. c1 Smi + c30 hoisted const -> boxCount false.
+  for (const member of ['CMS', 'SS']) {
+    const kind = (member === 'CMS' ? 'cms' : 'ss') + '.add';
+    for (const count of ['c1', 'c30']) for (const kc of ['small', 'b30'])
+      LANES.push({ name: member + ' add ' + count + ' ' + kc, kind, kc, count, group: 'add', inlines: true, boxKey: NONSMI[kc], boxCount: false });
+  }
+  // add: CMS / SS estimate {small, b30}. inlines in df; the key boxes in ni when non-Smi.
+  for (const member of ['CMS', 'SS']) for (const kc of ['small', 'b30'])
+    LANES.push({ name: member + ' est ' + kc, kind: (member === 'CMS' ? 'cms' : 'ss') + '.est', kc, group: 'add', inlines: true, boxKey: NONSMI[kc], boxCount: false });
+  // add: DD add {int, frac}. DD add does NOT inline its value box -> inlines false (the
+  // fractional value boxes in BOTH modes; that box is exactly what DD addFrom removes).
+  LANES.push({ name: 'DD add int', kind: 'dd.add', count: 'int', group: 'add', inlines: false, boxKey: false, boxCount: false });
+  LANES.push({ name: 'DD add frac', kind: 'dd.add', count: 'frac', group: 'add', inlines: false, boxKey: true, boxCount: false });
+
+  // into (<=1 B/call): topKInto n16 big, quantilesInto q4.
+  LANES.push({ name: 'SS topKInto n16 big', kind: 'ss.topKInto', group: 'into' });
+  LANES.push({ name: 'DD quantilesInto q4', kind: 'dd.quantilesInto', group: 'into' });
+
+  // ctrl (>=8): one boxed HeapNumber per op.
+  LANES.push({ name: 'CTRL box', kind: 'ctrl', group: 'ctrl' });
+
+  const results = [];
+  for (const spec of LANES) {
+    const b = build(spec);
+    const base = { name: spec.name, group: spec.group, inlines: !!spec.inlines, boxKey: !!spec.boxKey, boxCount: !!spec.boxCount };
+    if (b.absent) { results.push(Object.assign(base, { absent: b.absent })); continue; }
+    const step = b.step;
+    let guard = 0;
+    for (let w = 0; w < 3 * OPS; w++) { step(w); }   // warm 3 x 200k
+    const windows = [];
+    for (let win = 0; win < 3; win++) {
+      gc(); gc();
+      const m0 = performance.memory.usedJSHeapSize;
+      for (let i = 0; i < OPS; i++) step(i);
+      const m1 = performance.memory.usedJSHeapSize;
+      windows.push((m1 - m0) / OPS);
+    }
+    if (b.sinkOf) guard = b.sinkOf() | 0;             // defeat DCE on query lanes
+    results.push(Object.assign(base, { windows, guard: guard & 1 }));
+  }
+  await post({ mode: MODE, lanes: results });
+}
+</script>
+</body>
+</html>

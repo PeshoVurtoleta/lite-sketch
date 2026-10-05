@@ -193,3 +193,18 @@ Cold paths only; `add` (448) / `addFrom` (449) / `_addKey` / `quantile` are byte
 No negative values (deferred); no rank-error mode (relative-error is the point); no top-k /
 heavy-hitters (that is SpaceSaving, M4); no serialization format in the zero-GC core. SpaceSaving
 (0.4.0) closes the roster at four members to a stable 1.0.0.
+
+## Amendment 2026-10-05 (H2.8): collapse is bounded by the folded mass, not by q (D8), and "0 library B/op" (D7)
+
+The note at point 3 above ("degraded only for the smallest values ... p50/p90/p99") overclaimed.
+Once `collapsed`, a quantile is within `alpha` only if its rank lies above the mass folded into the
+floor bucket; a rank below that reads the floor representative. Which quantiles survive depends on
+the value span vs `maxBins` (the window spans about `gamma^maxBins`), NOT on `q` -- a probe of 1001
+copies of 147 then 999 log-spaced values in `[1e3, 1e6]` at `maxBins 64` collapses so far that
+`quantile(0.5)` and `quantile(0.9)` both read `282199` (true `147` / `~251600`). Strict `range`
+rejects a value whose BUCKET KEY falls outside the range's key span: at `alpha 0.01`, `range [1, 100]`
+still accepts `0.99` and `101`, because `key(0.99) = key(1) = 0` and `key(101) = key(100) = 231`.
+
+"`add` is a true 0 B/op even after collapse" is restated as "**0 library B/op**": the library
+allocates nothing, but a FRACTIONAL value boxes ~16 B at a non-inlined caller, which `addFrom` reads
+UNBOXED (the 1.1.0 precedent). Gated by `test/docs.test.js` (the banned-phrase scan) and the D8 probe.

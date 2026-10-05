@@ -2,9 +2,11 @@
 //   node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs).
 //
 // The zero-GC allocation gate as a test: each hot scenario must run N + 8N ops with 0
-// scavenges / 0 old-gen GC / 0 arrayBuffer growth (the register bank is fixed at
-// construction, so the `grows` counter -- its ArrayBuffer byte length -- must show a 0
-// delta). A `mustFail` control that allocates per op MUST trip the gate, proving teeth.
+// scavenges (gated at <= 2, the suite's lane convention) / 0 old-gen GC / 0 arrayBuffer
+// growth (the register bank is fixed at construction, so the `grows` counter -- its
+// ArrayBuffer byte length -- must show a 0 delta). Two `mustFail` controls that allocate
+// per op MUST trip the gate, proving teeth: a fresh escaping Array, and a single boxed
+// double per op (oneBoxCtl).
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
 import { HyperLogLog, CountMinSketch, DDSketch, SpaceSaving } from '../../Sketch.js';
@@ -216,23 +218,38 @@ const mustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
-// maxScavenges: the AUTHORITATIVE 0-B/op proof is test/torture.mjs (measureAllocs = 0 B/op on add
-// AND addHashed, gc major 0). This perf gate proves the other invariants strictly -- NO old-gen GC,
-// NO arrayBuffer growth (grows delta 0: the register bank never resizes), flat throughput, and the
-// mustFail teeth catch a real allocator -- and allows a SMALL scavenge floor. That floor DISCLOSED a
-// V8 artifact of the old addHashed CALLER contract: a uint32 hash lane >= 2^31 is a boxed double, and
-// passing those lanes as addHashed args across a not-yet-inlined call registered a few young-gen
-// scavenges that netted to 0 B/op (torture) and never reached old gen. Since H2.6 this scenario drives
-// addHashedFrom (and ssEvict drives addFrom), reading the lanes / key UNBOXED from a caller buffer
-// (F6 / F5), so it no longer rides the floor; maxScavenges 64 is retained unchanged and recalibrated
-// in H2.8. HLL add USED to add to this floor; that was NOT the suffix widening but a Maglev deopt loop on
-// `hiSuf = (h << p) >>> 0` ("not int32"), fixed in H2.1 by `h << p` (clz32 reads the same bits), so
-// HLL add is now 0 scavenges. It is NOT a per-op heap allocation (that would be thousands of
-// scavenges + a tripped teeth, as the mustFail control shows). The value 64 is recalibrated in H2.8.
+/**
+ * N4 one-box control (the perf2 shape, verbatim): read a FRACTIONAL double from a Float64Array,
+ * multiply, and store the result into a PACKED (`new Array(64).fill(null)`, PACKED_ELEMENTS) ring.
+ * Each store is one ~16 B HeapNumber, so scavenges scale with n and it MUST trip at maxScavenges 2.
+ * This is the tooth that BINDS the threshold: at the old 64 it does NOT trip (8N reads 12-25 < 64),
+ * so putting 64 back turns the suite red.
+ */
+const oneBoxCtl = {
+    name: 'N4 one-box control: Float64Array -> fractional value -> ring store (MUST trip at maxScavenges 2)',
+    setup() { const F = new Float64Array(1024); for (let i = 0; i < 1024; i++) F[i] = i + 0.5; const ring = new Array(64).fill(null); return { F, ring, sink: 0 }; },
+    hot(s, n) { const F = s.F, ring = s.ring; for (let i = 0; i < n; i++) ring[i & 63] = F[i & 1023] * 1.5; s.sink = ring.length; },
+    statsOf() { return { grows: 0 }; },
+};
+
+// maxScavenges is 2 -- the suite's lane `<= 2` convention. The AUTHORITATIVE 0-B/op proof is
+// test/torture.mjs (measureAllocs = 0 B/op on add AND addHashed, gc major 0). This perf gate
+// proves the other invariants strictly -- NO old-gen GC, NO arrayBuffer growth (grows delta 0:
+// the register bank never resizes), flat throughput -- and both mustFail controls catch a real
+// per-op box. Every hot scenario reads 0 scavenges at N and 8N today; the earlier 64 floor is
+// gone because its two true causes are both fixed:
+//   (1) H2.1 F1: a Maglev deopt loop on `hiSuf = (h << p) >>> 0` ("not int32") in HLL add, fixed
+//       by `h << p` (clz32 reads the same bits); HLL add is now 0 scavenges.
+//   (2) H2.6 F5 / F6 + N7: the DRIVER passed keys and uint32 hash lanes >= 2^31 as ARGUMENTS to a
+//       not-yet-inlined add / addHashed -- the caller's own box, netting 0 B/op (torture) and never
+//       reaching old gen. Since H2.6 this scenario drives addHashedFrom and ssEvict drives addFrom,
+//       reading the lanes / key UNBOXED from a caller buffer (F6 / F5), so the floor is gone.
+// Neither was ever a per-op heap allocation (that is thousands of scavenges + tripped teeth, as the
+// mustFailAlloc and oneBoxCtl controls show). The value is LOWERED to 2 in H2.8 (was 64).
 zgcSuite({
     N: 200000,
     k: 8,
-    maxScavenges: 64,
+    maxScavenges: 2,
     maxOldGen: 0,
     maxArrayBuffersKB: 0,
     counters: { grows: 0 },
@@ -243,5 +260,5 @@ zgcSuite({
     // counters) is the leak invariant, not the retained-KB headline.
     maxRetainedKB: 2048,
     scenarios: [addStream, addHashedStream, cmsAddConsStream, cmsAddPlainStream, cmsEstimateStream, ddAddStream, ssEvictStream],
-    mustFail: [mustFailAlloc],
+    mustFail: [mustFailAlloc, oneBoxCtl],
 });

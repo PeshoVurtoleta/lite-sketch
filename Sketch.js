@@ -2,8 +2,9 @@
  * @zakkster/lite-sketch -- a zero-GC, zero-runtime-dependency, single-file ESM
  * family of APPROXIMATE, sublinear-space streaming SUMMARIES that witness their
  * ACCURACY against the paper's theoretical bound (the lite-filter honesty move,
- * one axis over: measured error vs the theoretical error), while allocating ZERO
- * bytes on every hot op (the lite-o1 zero-GC discipline).
+ * one axis over: measured error vs the theoretical error), while the LIBRARY allocates
+ * ZERO bytes on every hot op (the lite-o1 zero-GC discipline; a non-Smi argument boxes at
+ * the caller, which the addFrom / addHashedFrom family reads UNBOXED).
  *
  * v1.1.2 ships the STABLE FOUR-member API (frozen at 1.0.0; 1.1.0 added DDSketch addFrom + getters; 1.1.1-1.1.2 = packaging metadata only) -- HyperLogLog (cardinality / distinct-count over an
  * unbounded stream in fixed space, via a dense Uint8Array register bank),
@@ -251,7 +252,7 @@ function hllTau(x) {
  * two-sided; STATISTICAL (1.04/sqrt(m) is a standard error, gated at ~3 sigma, not a
  * hard per-query bound). Mergeable: register-wise max combines shard sketches losslessly.
  *
- * Hot path (`add` / `addHashed`, 0 B/op): the top p bits of the 64-bit hash pick a
+ * Hot path (`add` / `addHashed`, 0 library B/op): the top p bits of the 64-bit hash pick a
  * register j; rho is the leftmost-1 position of the remaining 64 - p bits; a single
  * `reg[j] = max(reg[j], rho)`. `add` mixes the numeric key; `addHashed` takes two
  * caller-supplied uint32 lanes and skips the mix (the pre-hashed fast path). `addFrom(buf,
@@ -309,7 +310,7 @@ export class HyperLogLog {
     get seed() { return this._seed >>> 0; }
 
     /**
-     * Add a SAFE-INTEGER key. HOT, 0 B/op. A thin typeof wrapper: it rejects a non-number
+     * Add a SAFE-INTEGER key. HOT, 0 library B/op. A thin typeof wrapper: it rejects a non-number
      * FIRST (a byte-identical `[lite-sketch]` no-op), writes the key into the per-instance
      * `_buf` scratch, and defers the hash + register update to `_addAt(_buf, 0)` -- so the
      * key never crosses an inner call boundary as a (boxable) argument. The accepted domain
@@ -329,7 +330,7 @@ export class HyperLogLog {
 
     /**
      * Add the SAFE-INTEGER key at `buf[i]` of a caller-owned `Float64Array` -- the ZERO-BOX
-     * entry point for a hot-path key >= 2^31. HOT, 0 B/op. Identical validation, throws,
+     * entry point for a hot-path key >= 2^31. HOT, 0 B/op, reading `buf[i]` UNBOXED. Identical validation, throws,
      * byte-identical-no-op-on-reject, and register update as `add(key)`; it differs ONLY in
      * how the key crosses the call boundary: `add(bigKey)` boxes its tagged argument into a
      * ~16 B HeapNumber per call when V8 does not inline the call, whereas `addFrom` crosses
@@ -396,7 +397,7 @@ export class HyperLogLog {
 
     /**
      * Add a PRE-HASHED key -- the fast path: the caller supplies two uint32 lanes
-     * (their own good 64-bit hash), skipping mix64. HOT, 0 B/op. Same index + rho +
+     * (their own good 64-bit hash), skipping mix64. HOT, 0 library B/op. Same index + rho +
      * store as `add`. Fails closed: a non-uint32 lane throws `[lite-sketch]`.
      * @param {number} hi high lane (uint32)
      * @param {number} lo low lane (uint32)
@@ -418,7 +419,7 @@ export class HyperLogLog {
     /**
      * Add a PRE-HASHED key from two uint32 lanes read UNBOXED at `buf[i]`, `buf[i+1]` of a
      * caller-owned `Uint32Array` or `Int32Array` -- the zero-box sibling of `addHashed`.
-     * HOT, 0 B/op. Same register index + rho + store as `addHashed`; lanes are read as int32
+     * HOT, 0 B/op, lanes read UNBOXED. Same register index + rho + store as `addHashed`; lanes are read as int32
      * (`buf[i] | 0`), so an Int32Array lane is reinterpreted bit-for-bit as the uint32 lane.
      * Fails closed BEFORE any write: a non-Uint32Array/Int32Array `buf`, or a non-integer /
      * out-of-bounds `i` (needs `i` and `i+1` in range), throws a tagged TypeError; a lane that is
@@ -586,7 +587,7 @@ const CMS_KNOWN_OPTS = Object.freeze({ __proto__: null, seed: true, conservative
  * for `merge`-based distribution, where conservative update is not linearly mergeable
  * -- merge is exact for plain sketches and a valid upper bound otherwise).
  *
- * Hot path (`add` / `addHashed` / `estimate`, 0 B/op): the two-lane murmur is INLINED
+ * Hot path (`add` / `addHashed` / `estimate`, 0 library B/op): the two-lane murmur is INLINED
  * into int32 LOCALS exactly like `HyperLogLog.add` -- it NEVER writes the module
  * HASH_HI / HASH_LO slots, so a uint32 >= 2^31 lane never boxes a HeapNumber. The d
  * row hashes derive from one base lane `(hi ^ lo)` via `mix(base ^ i*ODD_CONST)`
@@ -755,7 +756,7 @@ export class CountMinSketch {
     get delta() { return Math.exp(-this._d); }
 
     /**
-     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 B/op. A thin
+     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 library B/op. A thin
      * typeof wrapper: it rejects a non-number key OR count FIRST (via `_badArgs`, which replays
      * add's exact guard order so the thrown class + message are byte-identical), writes key and
      * count into the per-instance `_buf` scratch, and defers to `_addAt(_buf, 0)` -- so neither
@@ -780,7 +781,7 @@ export class CountMinSketch {
     /**
      * Add the key at `buf[i]` with the count at `buf[i+1]`, both read UNBOXED from a
      * caller-owned `Float64Array` -- the ZERO-BOX entry point for a key or count >= 2^31.
-     * HOT, 0 B/op. Identical validation, throws, byte-identical-no-op-on-reject, and cell
+     * HOT, 0 B/op, both slots read UNBOXED. Identical validation, throws, byte-identical-no-op-on-reject, and cell
      * update as `add(key, count)`; it differs ONLY in how the values cross the call boundary:
      * `add(bigKey, bigCount)` boxes each tagged argument into a ~16 B HeapNumber per call when
      * V8 does not inline the call, whereas `addFrom` crosses as (object, Smi) and reads both
@@ -843,7 +844,7 @@ export class CountMinSketch {
 
     /**
      * Add a PRE-HASHED key -- the fast path: two caller-supplied uint32 lanes, skipping
-     * the mix. HOT, 0 B/op. Same base + row increment as `add`. Fails closed: a
+     * the mix. HOT, 0 library B/op. Same base + row increment as `add`. Fails closed: a
      * non-uint32 lane or bad count throws `[lite-sketch]`.
      * @param {number} hi high lane (uint32)
      * @param {number} lo low lane (uint32)
@@ -866,7 +867,7 @@ export class CountMinSketch {
     /**
      * Add a PRE-HASHED key from three slots read UNBOXED at `buf[i]`, `buf[i+1]`, `buf[i+2]`
      * of a caller-owned `Uint32Array` or `Int32Array` -- hi, lo and count -- the zero-box
-     * sibling of `addHashed(hi, lo, count)`. HOT, 0 B/op. Same base + row increment as
+     * sibling of `addHashed(hi, lo, count)`. HOT, 0 B/op, all three slots read UNBOXED. Same base + row increment as
      * `addHashed`; a fixed count of 1 would push a counted stream's count back across the call,
      * so count rides the third slot. NOTE: an Int32Array caps count at 2^31 - 1 (a larger count
      * needs a Uint32Array). Fails closed BEFORE any write: a non-Uint32Array/Int32Array `buf`,
@@ -901,7 +902,7 @@ export class CountMinSketch {
     }
 
     /**
-     * @private Conservative update (Estan-Varghese), 0 B/op, monomorphic. Stage each
+     * @private Conservative update (Estan-Varghese), 0 library B/op, monomorphic. Stage each
      * row's flat index in `_idx`, find the current min across the d cells, then raise
      * only the cells below `min + count` up to it (saturating at CMS_MAX_COUNT). Two
      * passes over d rows, no allocation.
@@ -936,7 +937,7 @@ export class CountMinSketch {
     }
 
     /**
-     * @private Plain update (classic Count-Min), 0 B/op. Add `count` to one cell per
+     * @private Plain update (classic Count-Min), 0 library B/op. Add `count` to one cell per
      * row (saturating at CMS_MAX_COUNT). Linearly mergeable.
      *
      * ARGUMENT-FREE (F4): `base` and `count` are read from the `_base` / `_cnt` slots the
@@ -960,7 +961,7 @@ export class CountMinSketch {
 
     /**
      * Estimate a key's frequency: the MINIMUM over its d cells (the tightest one-sided
-     * over-estimate). HOT, 0 B/op. NEVER throws -- a key that `add` would REJECT (a
+     * over-estimate). HOT, 0 library B/op. NEVER throws -- a key that `add` would REJECT (a
      * non-number / NaN / +-Infinity / non-integer / out-of-safe-range key) returns 0
      * (fail-closed: an un-addable key has frequency 0, and never aliases a real key).
      * A typeof wrapper: it writes the key into `_buf[0]`, runs `_estimateAt(_buf, 0)` (which
@@ -1017,7 +1018,7 @@ export class CountMinSketch {
     }
 
     /**
-     * Estimate from a PRE-HASHED key (two uint32 lanes). HOT, 0 B/op. NEVER throws --
+     * Estimate from a PRE-HASHED key (two uint32 lanes). HOT, 0 library B/op. NEVER throws --
      * a non-uint32 lane returns 0.
      * @param {number} hi high lane (uint32)
      * @param {number} lo low lane (uint32)
@@ -1184,7 +1185,7 @@ export const DD_ALPHA_MIN = 1e-6;
  *     `[key(min), key(max)]`; a positive value whose key falls outside THROWS
  *     `[lite-sketch]` -- it never silently collapses. `min` must be > 0 (the log domain).
  *
- * Hot path (`add`, 0 B/op): typeof-guard value + count FIRST, update running stats,
+ * Hot path (`add`, 0 library B/op): typeof-guard value + count FIRST, update running stats,
  * route zeros / negatives, compute the bucket key (a transient double -- no BigInt, no
  * box), and in the common steady state increment ONE `Float64Array` cell in the live
  * window and return. The window math (first value, slide + collapse, strict range
@@ -1457,13 +1458,13 @@ export class DDSketch {
      * `add` accepts a finite x with `minIndexable < x <= maxIndexable`, plus exact 0).
      * Below it the bucket representative would fall denormal and lose the alpha guarantee.
      * The exact runtime answer to the "low indexable bound" -- roughly 2.2e-308 at alpha=0.01,
-     * narrowing as alpha shrinks. O(1), 0 B/op, never throws. `null` is not zero.
+     * narrowing as alpha shrinks. O(1), 0 library B/op, never throws. `null` is not zero.
      */
     get minIndexable() { return this._minIndexable; }
     /**
      * The largest x that `add` accepts at this alpha (INCLUSIVE): `add` accepts a finite x
      * with `minIndexable < x <= maxIndexable`. Above it the representative would overflow to
-     * Infinity. Roughly 8.9e307 at alpha=0.01. O(1), 0 B/op, never throws.
+     * Infinity. Roughly 8.9e307 at alpha=0.01. O(1), 0 library B/op, never throws.
      */
     get maxIndexable() { return this._maxIndexable; }
     /** STRICT mode: the configured range minimum passed at construction (NaN if not strict). O(1). */
@@ -1472,14 +1473,14 @@ export class DDSketch {
     get rangeMax() { return this._rangeMax; }
 
     /**
-     * Add a value with a positive integer `count` (default 1). HOT, 0 B/op. Updates the
+     * Add a value with a positive integer `count` (default 1). HOT, 0 library B/op. Updates the
      * exact running stats, routes zeros to `_zeroCount`, fails closed on negatives, then
      * bins the value on the log scale: in the steady state it increments ONE cell of the
      * live window and returns. Everything else (first value, window slide + collapse,
      * strict range check) is the cold `_addKey` tail-call.
      *
      * `Math.log` and the bucket key are transient DOUBLES kept in locals -- no BigInt, no
-     * object, no boxed slot -- so the in-window path is a true 0 B/op.
+     * object, no boxed slot -- so the in-window path is a true 0 library B/op.
      *
      * Fails closed: a non-number / NaN / +-Infinity value throws, a negative value throws
      * (positive+zero domain), a count outside [1, 2^32-1] throws, and an add that would push
@@ -1529,7 +1530,7 @@ export class DDSketch {
     }
 
     /**
-     * Add the value at `buf[i]` of a caller-owned `Float64Array` (count = 1). HOT, 0 B/op --
+     * Add the value at `buf[i]` of a caller-owned `Float64Array` (count = 1). HOT, 0 B/op, reading `buf[i]` UNBOXED --
      * the ZERO-BOX entry point for a FRACTIONAL hot-path value. Identical validation, throws,
      * byte-identical-no-op-on-reject, and binning as `add(value)`; it differs ONLY in how the
      * value crosses the call boundary: `add(fractionalDouble)` boxes its tagged argument into a
@@ -1922,7 +1923,7 @@ const SS_DEFAULT_SEED = HLL_DEFAULT_SEED;
  *     the key from a buffer so a key >= 2^31 never boxes a HeapNumber crossing a call). An identity
  *     test pins `_homeAt(_key, sl) === (_hash(_key[sl]) & _mask)` for every slot.
  *
- * Hot path (`add` / `addFrom`, 0 B/op amortized): `add` is a typeof wrapper that stages key +
+ * Hot path (`add` / `addFrom`, 0 library B/op amortized): `add` is a typeof wrapper that stages key +
  * count in the `_buf` scratch and runs `_addAt(_buf, 0)`; `addFrom(buf, i)` copies them from a
  * caller-owned Float64Array into `_buf` (D1: a Proxy / shared view could change value between the
  * three reads) and runs `_addAt(_buf, 0)` -- the ZERO-BOX entry for a key or count >= 2^31. `_addAt`
@@ -2074,7 +2075,7 @@ export class SpaceSaving {
     }
 
     /**
-     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 B/op amortized.
+     * Add a SAFE-INTEGER key with a positive integer `count` (default 1). HOT, 0 library B/op amortized.
      * A thin typeof wrapper: it rejects a non-number key OR count FIRST (via `_badArgs`, which
      * replays add's exact guard order so the thrown class + message are byte-identical), writes
      * key and count into the per-instance `_buf` scratch, and defers to `_addAt(_buf, 0)` -- so
@@ -2097,8 +2098,8 @@ export class SpaceSaving {
 
     /**
      * Add the key at `buf[i]` with the count at `buf[i+1]`, both read from a caller-owned
-     * `Float64Array` -- the ZERO-BOX entry point for a key or count >= 2^31. HOT, 0 B/op
-     * amortized. Identical validation, throws, byte-identical-no-op-on-reject, and dispatch
+     * `Float64Array` -- the ZERO-BOX entry point for a key or count >= 2^31, both slots read
+     * UNBOXED. HOT, 0 B/op amortized. Identical validation, throws, byte-identical-no-op-on-reject, and dispatch
      * (bump / insert / evict) as `add(key, count)`; it differs ONLY in how the values cross the
      * call boundary: `add(bigKey, bigCount)` boxes each tagged argument into a ~16 B HeapNumber
      * per call when V8 does not inline the call, whereas `addFrom` reads both slots UNBOXED.
@@ -2192,7 +2193,7 @@ export class SpaceSaving {
 
     /**
      * The estimated (upper-bound) count of a key: `_count[slot]` if monitored, else 0. HOT,
-     * 0 B/op. NEVER throws -- an un-addable key is not monitored, so its estimate is 0.
+     * 0 library B/op. NEVER throws -- an un-addable key is not monitored, so its estimate is 0.
      * @param {number} key
      * @returns {number}
      */
@@ -2206,7 +2207,7 @@ export class SpaceSaving {
 
     /**
      * The over-estimation error of a key: `_error[slot]` if monitored, else 0. The true count
-     * is in `[estimate(key) - errorOf(key), estimate(key)]`. HOT, 0 B/op. NEVER throws.
+     * is in `[estimate(key) - errorOf(key), estimate(key)]`. HOT, 0 library B/op. NEVER throws.
      * @param {number} key
      * @returns {number}
      */

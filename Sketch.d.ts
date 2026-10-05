@@ -5,6 +5,11 @@
  * version sync (package.json / Sketch.js VERSION / llms.txt) is enforced in review;
  * this file only declares that `VERSION` exists. ASCII-only.
  *
+ * "0 library B/op" below means the LIBRARY allocates nothing on that path; a non-Smi
+ * argument (a key or count `>= 2^31` on Node, `>= 2^30` in Chrome, or a fractional
+ * DDSketch value) still boxes ~16 B (12 B in Chrome) at a call V8 does not inline --
+ * the `addFrom` / `addHashedFrom` family reads it UNBOXED, so it stays at 0 B/op.
+ *
  * @license MIT
  */
 
@@ -47,7 +52,7 @@ export function saltRow(h: number, i: number): number;
 /**
  * HyperLogLog -- a zero-GC distinct-count (cardinality) sketch over a dense
  * `Uint8Array(m)` of one-byte registers, `m = 2^p`, `p in [4, 18]`. `add` records one
- * register per element (0 B/op); `count()` estimates the distinct total via Ertl's
+ * register per element (0 library B/op); `count()` estimates the distinct total via Ertl's
  * improved estimator with standard error `1.04/sqrt(m)`. Mergeable (register-wise max,
  * equal m AND seed). Dense-only; no crypto hashing.
  */
@@ -67,10 +72,10 @@ export class HyperLogLog {
     /** The uint32 hash seed. O(1). */
     readonly seed: number;
 
-    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and record its register (running max of rho). HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key (a byte-identical no-op). */
+    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and record its register (running max of rho). HOT, O(1), 0 library B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key (a byte-identical no-op). */
     add(key: number): this;
 
-    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(1), 0 B/op. Throws [lite-sketch] on a non-uint32 lane. */
+    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(1), 0 library B/op (a lane >= 2^31 boxes at a non-inlined call -> addHashedFrom). Throws [lite-sketch] on a non-uint32 lane. */
     addHashed(hi: number, lo: number): this;
 
     /** Add the key at `buf[i]` of a caller-owned Float64Array -- the ZERO-BOX entry point for a key >= 2^31 (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws / no-op-on-reject as `add`. The buffer check stays `instanceof` (D3): a `Proxy` over a typed array passes it and its get traps run, but `buf[i]` is read exactly once, so no value changes mid-add. */
@@ -112,7 +117,7 @@ export interface CountMinSketchOptions {
  * CountMinSketch -- a zero-GC point-query FREQUENCY sketch over a dense
  * `Uint32Array(d * w)` counter matrix, `d` hash rows x `w` columns (`w` a power of
  * two). `add(key, count?)` increments one cell per row (conservative or plain per the
- * ctor flag), 0 B/op; `estimate(key)` returns the minimum of its `d` cells -- a
+ * ctor flag), 0 library B/op; `estimate(key)` returns the minimum of its `d` cells -- a
  * ONE-SIDED over-estimate while `!saturated`: `f_hat >= f_true`, with `f_hat - f_true <=
  * epsilon * total` w.p. `>= 1 - delta` (`epsilon = e/w`, `delta = e^-d`) -- one-sided
  * while `!saturated` (once a counter saturates at 2^32-1 the `saturated` getter is set
@@ -165,10 +170,10 @@ export class CountMinSketch {
     /** The theoretical failure probability, e^-d. O(1). */
     readonly delta: number;
 
-    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and increment its row cells by `count` (default 1, domain [1, 2^32-1]). HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key, an out-of-range count, or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
+    /** Hash a SAFE-INTEGER key (|key| <= 2^53 - 1; the hot body distinguishes low word + high word + sign) and increment its row cells by `count` (default 1, domain [1, 2^32-1]). HOT, O(d), 0 library B/op. Throws [lite-sketch] on a non-number / NaN / +-Infinity / non-integer / out-of-safe-range key, an out-of-range count, or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
     add(key: number, count?: number): this;
 
-    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 B/op. Throws [lite-sketch] on a non-uint32 lane, an out-of-range count, or a running `total` past 2^53-1. */
+    /** The pre-hashed fast path: two uint32 lanes hashed by the caller; skips the internal mix. HOT, O(d), 0 library B/op (a lane or count >= 2^31 boxes at a non-inlined call -> addHashedFrom). Throws [lite-sketch] on a non-uint32 lane, an out-of-range count, or a running `total` past 2^53-1. */
     addHashed(hi: number, lo: number, count?: number): this;
 
     /** Add the key at `buf[i]` with count at `buf[i+1]` of a caller-owned Float64Array -- the ZERO-BOX entry point for a key or count >= 2^31 (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call). Same validation / throws / no-op-on-reject as `add`. The buffer check stays `instanceof` (D3): a `Proxy` over a typed array passes it and its get traps run, but each slot is read exactly once. */
@@ -177,10 +182,10 @@ export class CountMinSketch {
     /** Add a pre-hashed key from three slots [hi, lo, count] read UNBOXED at `buf[i..i+2]` (Uint32Array or Int32Array; an Int32Array caps count at 2^31-1). The zero-box sibling of `addHashed`. Throws [lite-sketch] on a bad buffer / index / count, and with addHashed's lane error on a lane read that is neither uint32 nor int32 (e.g. through a Proxy), before any write. */
     addHashedFrom(buf: Uint32Array | Int32Array, i: number): this;
 
-    /** The minimum over the key's d cells -- the tightest one-sided over-estimate. HOT, O(d), 0 B/op. Never throws: a key `add` would reject (non-integer / non-finite / out-of-safe-range) estimates 0 and never aliases a real key (F13). The returned count is a Smi below 2^31 (Node); a cell value >= 2^31 boxes a ~16 B HeapNumber on the non-inlined return (documented, not fixed: there is deliberately no `estimateInto`). */
+    /** The minimum over the key's d cells -- the tightest one-sided over-estimate. HOT, O(d), 0 library B/op. Never throws: a key `add` would reject (non-integer / non-finite / out-of-safe-range) estimates 0 and never aliases a real key (F13). The returned count is a Smi below 2^31 (Node); a cell value >= 2^31 boxes a ~16 B HeapNumber on the non-inlined return (documented, not fixed: there is deliberately no `estimateInto`). */
     estimate(key: number): number;
 
-    /** Estimate from a pre-hashed key (two uint32 lanes). HOT, O(d), 0 B/op. Never throws (a bad lane estimates 0). */
+    /** Estimate from a pre-hashed key (two uint32 lanes). HOT, O(d), 0 library B/op. Never throws (a bad lane estimates 0). */
     estimateHashed(hi: number, lo: number): number;
 
     /** Element-wise saturating add of `other` into this. Exact for plain sketches; a valid but looser upper bound for conservative ones; a cross-`conservative` merge is allowed (S7, `this` keeps its flag). Carries `other.saturated` and any merge-time clamp into `this.saturated`. Throws [lite-sketch] on a non-CountMinSketch, a d / w / seed mismatch, or a running `total` past 2^53-1 (byte-identical). Brand-checked (a private `#brand`, not `instanceof`): a `Proxy` over an instance or a field-copy forgery is NOT a CountMinSketch and throws tagged before any read of `other`. */
@@ -205,7 +210,7 @@ export class CountMinSketch {
 export interface DDSketchOptions {
     /** Bin-array length, an integer in [1, 2^20] (default 2048). Ignored in strict mode (derived from `range`). */
     maxBins?: number;
-    /** `[min, max]` with finite `0 < min < max` -> STRICT mode (fail-closed, no collapse). */
+    /** `[min, max]` with finite `0 < min < max` -> STRICT mode (fail-closed, no collapse): a value whose BUCKET KEY falls outside the range's key span throws (at alpha 0.01, `[1, 100]` accepts 0.99 and 101 -- key(0.99)=key(1)=0, key(101)=key(100)=231). */
     range?: [number, number];
 }
 
@@ -223,10 +228,12 @@ export const DD_ALPHA_MIN: number;
  * scale, `key(x) = ceil(ln(x) * multiplier)` with `gamma = (1+alpha)/(1-alpha)`.
  * `quantile(q)` returns `v` with `|v - v_true| <= alpha * v_true`. Zeros route to
  * a dedicated exact `zeroCount`; negatives fail closed. Default mode collapses the
- * LOWEST bins under a fixed `maxBins` window (disclosed via `collapsed`); `range`
- * switches to a STRICT fixed window that throws on an out-of-range value instead
- * of collapsing. `count` / `sum` / `min` / `max` / `zeroCount` are EXACT running
- * aggregates; `quantile` is the alpha-approximate member.
+ * LOWEST bins under a fixed `maxBins` window (disclosed via `collapsed`): once collapsed,
+ * a quantile is within `alpha` only if its rank lies above the mass folded into the floor
+ * bucket, and which quantiles survive depends on the value span vs `maxBins`, not on `q`.
+ * `range` switches to a STRICT fixed window that throws on a value whose BUCKET KEY falls
+ * outside the range's key span instead of collapsing. `count` / `sum` / `min` / `max` /
+ * `zeroCount` are EXACT running aggregates; `quantile` is the alpha-approximate member.
  */
 export class DDSketch {
     /**
@@ -267,10 +274,10 @@ export class DDSketch {
     /** Whether this is a STRICT fixed-range sketch (a `range` was given at construction; no collapse). O(1). */
     readonly strict: boolean;
 
-    /** The smallest x > 0 `add` accepts at this alpha, the EXACT bisected edge of `add`'s own key expression (EXCLUSIVE floor: `add` accepts finite `minIndexable < x <= maxIndexable`, plus exact 0). ~2.2e-308 at alpha=0.01. O(1), 0 B/op. */
+    /** The smallest x > 0 `add` accepts at this alpha, the EXACT bisected edge of `add`'s own key expression (EXCLUSIVE floor: `add` accepts finite `minIndexable < x <= maxIndexable`, plus exact 0). ~2.2e-308 at alpha=0.01. O(1), 0 library B/op. */
     readonly minIndexable: number;
 
-    /** The largest x `add` accepts at this alpha, the EXACT bisected edge of `add`'s own key expression (INCLUSIVE ceiling: `add` accepts finite `minIndexable < x <= maxIndexable`; always below `Number.MAX_VALUE`, whose representative would overflow). ~8.9e307 at alpha=0.01. O(1), 0 B/op. */
+    /** The largest x `add` accepts at this alpha, the EXACT bisected edge of `add`'s own key expression (INCLUSIVE ceiling: `add` accepts finite `minIndexable < x <= maxIndexable`; always below `Number.MAX_VALUE`, whose representative would overflow). ~8.9e307 at alpha=0.01. O(1), 0 library B/op. */
     readonly maxIndexable: number;
 
     /** STRICT mode: the configured range minimum passed at construction (NaN if not strict). O(1). */
@@ -279,7 +286,7 @@ export class DDSketch {
     /** STRICT mode: the configured range maximum passed at construction (NaN if not strict). O(1). */
     readonly rangeMax: number;
 
-    /** Add a value with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-finite / negative value, a count outside [1, 2^32-1], an add that would push the running `count` past 2^53-1 (F15/S5), or (strict mode) a value outside the fixed range -- each a byte-identical no-op. A doubly-invalid add (negative value + over-cap count) names the count (the count check precedes the negative-value check; a non-finite value is still caught first). */
+    /** Add a value with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 library B/op. Throws [lite-sketch] on a non-finite / negative value, a count outside [1, 2^32-1], an add that would push the running `count` past 2^53-1 (F15/S5), or (strict mode) a value outside the fixed range -- each a byte-identical no-op. A doubly-invalid add (negative value + over-cap count) names the count (the count check precedes the negative-value check; a non-finite value is still caught first). */
     add(value: number, count?: number): this;
 
     /** Add the value at `buf[i]` (count = 1) -- the ZERO-BOX entry point for a FRACTIONAL hot-path value: `add(fractionalDouble)` boxes its argument (~16 B/call) when not inlined, whereas `addFrom` reads `buf[i]` unboxed. Same validation / throws / binning as `add`. HOT, O(1) amortized, 0 B/op. Throws [lite-sketch] on a non-Float64Array `buf`, an out-of-bounds / non-integer `i`, or a value `add` would reject. The buffer check stays `instanceof` (D3): a `Proxy` over a typed array passes it and its get traps run, but `buf[i]` is read exactly once. */
@@ -384,7 +391,7 @@ export class SpaceSaving {
     /** The uint32 hash seed. O(1). */
     readonly seed: number;
 
-    /** Add a safe-integer `key` with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 B/op. Increments, inserts, or evicts the min. Throws [lite-sketch] on a non-safe-integer key, a count outside [1, 2^32-1], or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
+    /** Add a safe-integer `key` with a positive integer `count` (default 1, domain [1, 2^32-1]). HOT, O(1) amortized, 0 library B/op. Increments, inserts, or evicts the min. Throws [lite-sketch] on a non-safe-integer key, a count outside [1, 2^32-1], or an add that would push the running `total` past 2^53-1 (F15/S5) -- a byte-identical no-op. */
     add(key: number, count?: number): this;
 
     /** Add the key at `buf[i]` with count at `buf[i+1]` of a caller-owned Float64Array -- the ZERO-BOX entry point for a key or count >= 2^31 (0 library B/op; `add` boxes a non-Smi argument (~16 B) at a non-inlined call). Snapshots both slots before use (D1). Same validation / throws / no-op-on-reject as `add`. */
@@ -399,10 +406,10 @@ export class SpaceSaving {
     /** Iterate the monitored entries alloc-free (storage order, NOT sorted): `fn(key, count, error, this)`. NEVER throws. The loop bound is the LIVE `size` (F18): do NOT mutate the sketch inside `fn` -- a mutation never produces ghosts, but entries may be skipped or revisited. `key` is normalized (a stored -0 reads +0). NOTE the per-entry cost: a NON-inlined `fn` boxes ~49 B/entry for entries with a key / count / error >= 2^31 (three doubles cross the call; the `ni/ss.forEach/big` lane reads 73 scavenges over 1.6M entries). Use `topKInto` for a 0-alloc render of large-keyed entries. */
     forEach(fn: (key: number, count: number, error: number, ss: SpaceSaving) => void): void;
 
-    /** The top `n` monitored keys by count, DESCENDING, ties by ASCENDING slot (default n = size). COLD; ALLOCATES the result array (~160 B/entry, approx per alloc.mjs); each `key` is normalized (a stored -0 reads +0). NEVER throws. Use `topKInto` for a 0-alloc render. */
+    /** The top `n` monitored keys by count, DESCENDING, ties by ASCENDING slot (default n = size). COLD; ALLOCATES the result array (~160 B/entry, approx, v8 total_allocated_bytes; not gated); each `key` is normalized (a stored -0 reads +0). NEVER throws. Use `topKInto` for a 0-alloc render. */
     topK(n?: number): SpaceSavingEntry[];
 
-    /** Every monitored key with `count > threshold * total` -- a SUPERSET with NO false negatives (every true heavy hitter is included; a few false positives may be too). Filter the result by `(count - error) > threshold * total` for the guaranteed-frequent subset. COLD; ALLOCATES (~135 B/entry, approx per alloc.mjs); each `key` is normalized (a stored -0 reads +0). NEVER throws. */
+    /** Every monitored key with `count > threshold * total` -- a SUPERSET with NO false negatives (every true heavy hitter is included; a few false positives may be too). Filter the result by `(count - error) > threshold * total` for the guaranteed-frequent subset. COLD; ALLOCATES (~135 B/entry, approx, v8 total_allocated_bytes; not gated); each `key` is normalized (a stored -0 reads +0). NEVER throws. */
     heavyHitters(threshold: number): SpaceSavingEntry[];
 
     /**
@@ -428,7 +435,7 @@ export class SpaceSaving {
      */
     topKInto(outKeys: Float64Array, outCounts: Float64Array, outErrors: Float64Array, n?: number): number;
 
-    /** Merge `other` into this (min-imputation for absent keys, keep the top-k). O(k), with a bounded cold scratch allocation (~300 B/entry, approx per alloc.mjs). Throws [lite-sketch] on a non-SpaceSaving, an unequal capacity/seed, or a running `total` past 2^53-1 (F15/S5, byte-identical). Brand-checked (a private `#brand`, not `instanceof`): a `Proxy` over an instance or a field-copy forgery is NOT a SpaceSaving and throws tagged before any read of `other`. */
+    /** Merge `other` into this (min-imputation for absent keys, keep the top-k). O(k), with a bounded cold scratch allocation (~300 B/entry, approx, v8 total_allocated_bytes; not gated). Throws [lite-sketch] on a non-SpaceSaving, an unequal capacity/seed, or a running `total` past 2^53-1 (F15/S5, byte-identical). Brand-checked (a private `#brand`, not `instanceof`): a `Proxy` over an instance or a field-copy forgery is NOT a SpaceSaving and throws tagged before any read of `other`. */
     merge(other: SpaceSaving): this;
 
     /** Reset the summary to empty. O(capacity). */

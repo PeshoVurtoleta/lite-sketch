@@ -177,3 +177,10 @@ Cold paths only; the hot bodies are byte-identical.
 No range / heavy-hitter queries (that is SpaceSaving, M4, and DDSketch, M3); no serialization
 format in the zero-GC core; no automatic sizing beyond `withAccuracy`. DDSketch (quantiles) and
 SpaceSaving (top-k) are M3-M4 to a stable 1.0.0.
+
+## Amendment 2026-10-05 (H2.8): "0 library B/op" (D7)
+
+Point 2 above ("Hot `add` / `addHashed` are 0 B/op") is restated as "**0 library B/op**": the library
+allocates nothing (the murmur hand-inlines into int32 locals, F2 / F4), but a key or count `>= 2^31`
+on Node (`>= 2^30` in Chrome) boxes ~16 B at a call V8 does not inline, which `addFrom` /
+`addHashedFrom` read UNBOXED. Gated by the chrome N6 lane and `test/docs.test.js`.

@@ -160,7 +160,7 @@ Cold paths only; `add` / `addFrom` / `_addAt` / `_homeAt` and the map / forest h
 byte-identical.
 
 1. **`topKInto(outKeys, outCounts, outErrors, n?)` (F7, D4).** `topK` allocates ~160 B/entry (an array
-   of `{ key, count, error }` objects) and `heavyHitters` ~135 B/entry (approx, `alloc.mjs`); lite-hud
+   of `{ key, count, error }` objects) and `heavyHitters` ~135 B/entry (approx, v8 `total_allocated_bytes`, not gated); lite-hud
    M3 renders an SS top-N every frame with keys `>= 2^32` and counts past `2^31`, so `forEach` boxes
    three doubles per entry (~49 B/entry, the `ni/ss.forEach/big` lane's 73 scavenges). `topKInto` writes
    the top-`n` into three caller-owned `Float64Array`s with ZERO allocation and no boxing (it takes
@@ -212,7 +212,7 @@ byte-identical.
    'object' && other !== null && #brand in other` first, before any read of `other` (closing the H2.3
    RISK via the `_total` guards). A forgery throws the tagged `[lite-sketch]` TypeError as a byte-
    identical no-op; the capacity / seed shape test follows, minus `instanceof`. `merge`'s cold scratch
-   is still ~300 B/entry (approx, `alloc.mjs`; the former llms.txt "bounded cold scratch" wording now
+   is still ~300 B/entry (approx, v8 `total_allocated_bytes`, not gated; the former llms.txt "bounded cold scratch" wording now
    carries the measured figure) -- F8 is settled by wording, not a preallocated scratch.
 
 ## Non-goals
@@ -221,3 +221,11 @@ No sliding-window / decay variant (a future member); no serialization format in 
 zero-GC core. This CLOSES the roster at four members; 1.0.0 is a docs/version
 milestone declaring the count / frequency / quantile / top-k API stable (the
 lite-filter reference+3 cadence).
+
+## Amendment 2026-10-05 (H2.8): "0 library B/op" (D7)
+
+The "0 B/op" `add` / eviction claim is restated as "**0 library B/op**": the library allocates
+nothing even on the eviction path (the bump / map backshift / forest re-file are argument-free,
+F3 / F5), but a key or count `>= 2^31` on Node (`>= 2^30` in Chrome) boxes ~16 B at a call V8 does
+not inline, which `addFrom` reads UNBOXED (there is no `addHashedFrom` -- SpaceSaving retains key
+identity). Gated by the chrome N6 lane and `test/docs.test.js`.

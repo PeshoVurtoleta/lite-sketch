@@ -6,8 +6,174 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`SpaceSaving.topKInto(outKeys, outCounts, outErrors, n?)` -- a 0-alloc top-N render (F7).**
+  Writes the top-`n` monitored entries best-first into three caller-owned `Float64Array`s in EXACTLY
+  `topK(n)`'s order (count DESCENDING, ties by ASCENDING slot), via an in-place bounded min-heap of
+  slot ids and an in-place heapsort -- allocation-free where `topK(n)` allocates ~160 B/entry. `n`
+  follows `topK`'s rule (a non-integer / negative `n` is treated as `size`, never throws); the count
+  written `w = min(n, size, the three lengths)` is returned; a too-short out receives its own length;
+  each key is normalized (a stored -0 reads +0). An out that is not a `Float64Array`, two of the
+  three overlapping in memory, or two backed by DIFFERENT `SharedArrayBuffer` objects (aliasing
+  cannot be verified), throws a tagged `[lite-sketch]` TypeError BEFORE any write (a wrong
+  array type would silently truncate a key `>= 2^32`); disjoint views over one buffer are allowed.
+  Monomorphic, no boxing: the `ni/ss.topKInto.n16|n64/big` lanes read **0** young-gen scavenges over
+  1.6M entries (N8 gate `<= 2`). The lite-hud M3 render (keys `>= 2^32`, counts past `2^31`).
+- **`DDSketch.quantilesInto(qs, out)` -- a 0-alloc multi-quantile render (F8).** Estimates several
+  quantiles at once: for each `j`, `out[j]` receives `quantile(qs[j])` BIT-FOR-BIT (quantile's walk is
+  duplicated per `q`, so no double crosses a call boundary), and the count written
+  `min(qs.length, out.length)` is returned. A bad `q` value (NaN / outside `[0, 1]` / empty sketch)
+  writes NaN and NEVER throws, exactly like `quantile`; in-place `qs === out` is allowed (each index
+  is read before it is written). A `qs` / `out` that is not a `Float64Array`, two distinct views
+  that PARTIALLY overlap, or two backed by DIFFERENT `SharedArrayBuffer` objects (aliasing cannot be
+  verified), throws a tagged `[lite-sketch]` TypeError BEFORE any write. The
+  `ni/dd.quantilesInto.q4` lane reads **0** scavenges over 1.6M quantiles (N8 gate `<= 2`), against
+  the `Q-CTRL[ni/dd.quantile]` control of 24 (one 16 B return box per `quantile` call). The 0-alloc
+  p50/p90/p99/p999 render M2 (`Hud.js`) needed.
+- **The zero-box `addFrom` / `addHashedFrom` family (F5, F6)** -- five new methods:
+  `HyperLogLog.addFrom(buf, i)` / `addHashedFrom(buf, i)`, `CountMinSketch.addFrom(buf, i)` /
+  `addHashedFrom(buf, i)`, and `SpaceSaving.addFrom(buf, i)`. Each reads the key (and count, or the
+  two uint32 lanes) out of a caller-owned typed array UNBOXED, so a key or count `>= 2^31` stays at
+  **0 library bytes/op** where the plain `add` / `addHashed` boxes the non-Smi argument (~16 B
+  HeapNumber) at a non-inlined call boundary -- the family analog of `DDSketch.addFrom` (1.1.0).
+  `addFrom` takes a `Float64Array` (key = `buf[i]`; for CountMinSketch / SpaceSaving count =
+  `buf[i+1]`); `addHashedFrom` takes a `Uint32Array` or `Int32Array` (HyperLogLog `[hi, lo]`;
+  CountMinSketch three slots `[hi, lo, count]`, an `Int32Array` capping count at `2^31-1`).
+  Validation, throws, and the byte-identical no-op on reject match `add` / `addHashed` exactly -- a
+  non-uint32 / non-int32 lane read (for example through a `Proxy`) throws `addHashed`'s lane error;
+  `SpaceSaving.addFrom` snapshots both slots into an instance scratch before use (D1), so a `Proxy` /
+  `SharedArrayBuffer` view cannot change a value between reads. Every `addFrom` / `addHashedFrom` lane
+  reads **0-2 young-gen scavenges at 1.6M ops** (N1 gate `<= 2`) in Node, default and no-inline, fresh
+  and warm, across 6 key classes x counts `{1, 2^30}` AND a variable count `>= 2^31` (v31), and
+  **0 B/op** in Chrome 154 (the `npm run chrome` N6 gate). There is deliberately no
+  `SpaceSaving.addHashed(From)` -- it stores key
+  identities.
+- **`DD_ALPHA_MIN`** -- a named export (`1e-6`), the smallest `alpha` the `DDSketch`
+  constructor accepts (`DD_ALPHA_MIN <= alpha < 1`).
+- **`CountMinSketch.saturated`** -- a sticky `boolean` getter (F14/S4), `true` once any counter
+  clamped at `2^32-1`. While `false` the estimate is strictly one-sided; `merge` carries it from
+  either side, and `clear()` resets it.
+- **`npm run lanes`** -- a child-process scavenge/deopt lane harness
+  (`test/lanes.mjs` + `test/lanes/lane.mjs`), part of `npm run verify`. One child
+  per lane under `--max-semi-space-size=4` (default and no-inline) gates every `add` /
+  `addFrom` / `addHashedFrom` / `Into` lane at `<= 2` scavenges (N1 / N2 / N8), the
+  `--trace-deopt` audit shape at `<= 3` `not int32` deopts (N5), the `N3c[cap120/cms.cmax]`
+  inline-cap lane, and the new `N4-CTRL[df/ring]` one-box ring control at `>= 8` (a
+  PACKED-ring `ring[i & 63] = F[i & 1023] * 1.5`, one 16 B HeapNumber/op; the teeth that
+  bind the `<= 2` threshold). `--lib <path>` runs the lanes against another build for a
+  revert-check.
+- **`npm run chrome`** -- a headless-Chrome B/op gate (`test/chrome/run.mjs` +
+  `test/chrome/page.html`), appended LAST to `npm run verify` (N6). It measures `usedJSHeapSize`
+  per op over 3 windows of 200k (gate on the min) in df and ni modes against a local Chrome
+  (`--enable-precise-memory-info`, `--js-flags=--expose-gc --min/max-semi-space-size=64`):
+  `addFrom` / `addHashedFrom` / `Into` lanes gate at `<= 0.5 B/op`, plain `add` at
+  `<= 12*k + 0.5 B/op` (k = the fresh per-op non-Smi argument boxes in that mode under Chrome's
+  31-bit Smis: 0 when `add` inlines in df or the argument is a hoisted constant), and the
+  one-box ring control at `>= 8 B/op`. Measured (Chrome 154, 98 lanes, 39 s): every `addFrom` /
+  `addHashedFrom` / `Into` lane 0.00-0.02 B/op in df and ni, plain `add` with one fresh non-Smi argument
+  box 12.00 (the caller's own box, limit 12.5), the control 12.00 / 12.00. Against the published 1.1.2
+  it exits 1: 58 lanes ABSENT, HLL add small df 9.01, SS add c30 ni 172.39.
+  It fails closed (`GATE chrome: UNVERIFIED` + exit 1) when Chrome is absent, unlaunchable, or has
+  no precise memory; Chrome's `nc` mode is NOT gated (the never-optimized caller boxes its own
+  argument, a 12 B/op driver floor, not the library's).
+- **`npm run revert-check`** -- a release revert-check (`test/revert.mjs`), NOT in `verify`
+  (it EXPECTS failures; `~40 s` against 1.1.2). It runs FIVE families against `git show <ref>:<file>`
+  of the published 1.1.2 (default `1a2673e`) in an `os.tmpdir()` scratch, asserting the teeth are real:
+  **perf** (its `maxScavenges 64 -> 2` edit) and **torture** (its `SCAV_BOX 48 -> 0` edit) FAIL on 1.1.2
+  (an unedited run PASSes, so the FAIL is the threshold's); **lanes `--lib`** marks `N1` / `AHF` / `N8`
+  ABSENT and `N2-HLL`, `N5` df/ni, `N3` ni and `N3` nc (hll / ss / n31) FAIL, with every `CTRL` PASS and
+  `N4-CTRL >= 8`; **chrome `--lib`** marks `addFrom` / `addHashedFrom` / `Into` ABSENT and the named
+  `add` lanes FAIL, `CTRL` PASS; **parity** is `ok` on every section except three documented 1.1.2
+  differences (H2.5 CMS 1x1 `saturated`, the DDSketch alpha message, H2.6 CMS `total` / `saturated`),
+  with N9 hash identity 0 diffs. `--ref 5fecd6e` (H2.7, green) must exit 1.
+
+### Changed
+
+- **The perf and torture GC budgets are lowered to one box per op (F9).** Every perf scenario and
+  both former `SCAV_BOX` lanes now read 0, so the old limits only hid a regression. `test/perf/
+  PerfGate.test.mjs` `maxScavenges` goes **64 -> 2** (the lanes' `<= 2` convention), with a new
+  `oneBoxCtl` must-allocate control that TRIPS at `maxScavenges 2` and does NOT trip at 64 (so putting
+  64 back turns the suite red). `test/torture.mjs` **deletes `SCAV_BOX` (48)** and folds the `scAh` /
+  `scCh` `addHashedFrom` lanes into the `SCAV_CLEAN` (0) conjunction, and adds a one-box `SCAV-CTRL`
+  step that must read `>= 1` (it reads **30**; a Smi-only step prints VACUOUS and FAILs). The lanes'
+  `N4-CTRL[df/ring]` one-box control reads **24** (min of 3; gated at `>= 8`). No budget is raised;
+  `maxOldGen 0`, `maxArrayBuffersKB 0`, `grows 0` and `SCAV_ADD_INLINE 2` are unchanged.
+- **The allocation docs now say "0 library B/op", not an unqualified "0 B/op" (D7).** A per-method
+  hot path allocates **0 library bytes**; a non-Smi argument (a key or count `>= 2^31` on Node,
+  `>= 2^30` in Chrome, or a fractional `DDSketch` value) still boxes ~16 B (12 B in Chrome) at a call
+  V8 does not inline -- which the `addFrom` / `addHashedFrom` family reads UNBOXED. The term is defined
+  once per doc (README, llms.txt, `Sketch.d.ts`); the `addFrom` / `addHashedFrom` / `Into` lines keep
+  "0 B/op" (they are the unboxed path). Enforced by `test/docs.test.js`.
+- **`npm run verify` now needs a local Chrome.** The N6 `npm run chrome` gate is appended to `verify`;
+  without a launchable Chrome (`CHROME_BIN`, the default macOS path, or `google-chrome` / `chromium` on
+  PATH) it prints `GATE chrome: UNVERIFIED` and exits 1 (fail closed -- there is no skip env var).
+- **An option bag built on a custom prototype is now rejected (F18).** `CountMinSketch` / `DDSketch`
+  / `SpaceSaving` previously accepted ANY object as the options bag and read its keys through the
+  prototype chain; they now require a PLAIN bag (own string keys, on a `null` prototype, THIS realm's
+  `Object.prototype`, or another root prototype that carries NO own known key). A `Map` / `Date` /
+  `RegExp` / array / class instance / `Object.create(proto)` (including `Object.create(defaults)`), an
+  object with an own ACCESSOR, or an object with an own Symbol key is now rejected with the plain-object
+  `[lite-sketch]` TypeError. A bag whose prototype is a null-proto object carrying a known key (e.g.
+  `Object.create({ __proto__: null, seed: 5 })`), or a cross-realm `Object.prototype` polluted with a
+  known key, is also rejected -- the inherited value would be silently dropped, so it fails closed. (A
+  polluted THIS-realm `Object.prototype` is still ignored: a literal `{}` bag yields the default.) (No
+  suite consumer passes a custom-prototype bag; every in-repo call site passes a literal.)
+- **A `Proxy`-wrapped instance is now rejected by `merge`.** `new Proxy(realSketch, {})` passed
+  `instanceof` and merged on all four members; the `#brand` check returns `false` for it (private
+  names are not forwarded through a `Proxy`), so it now throws the tagged `[lite-sketch]` TypeError.
+- **A bare prototype forgery passed to `merge` now throws the `TypeError`, not the `RangeError`.** A
+  `Object.create(X.prototype)` used to reach the shape-mismatch `RangeError` (m / d,w,seed / gamma /
+  capacity); the brand check rejects it first, so it now throws the brand `TypeError` ("expects a
+  <Member>"). Existing tests that used a bare forgery to reach the `RangeError` were rewritten to a
+  real mismatched instance.
+- **A query no longer returns `-0` (F18).** `SpaceSaving` `forEach` / `topK` / `heavyHitters` /
+  `topKInto` keys and `DDSketch` `min` / `max` now read `+0` for a stored `-0` (`Object.is` can no
+  longer tell them apart); storage is unchanged.
+- **`SpaceSaving.forEach` under mutation no longer visits ghosts.** The loop bound is the live
+  `size`, not a hoisted snapshot, so a sketch cleared / merged inside the callback no longer walks
+  stale slots (mutating inside `forEach` remains unsupported; entries may be skipped or revisited).
+- **`HyperLogLog.add` costs about +1.5 ns/op.** It is now a typeof wrapper over `_addAt`, so it makes
+  one real (non-inlined) call where the 1.1.2 body ran the mix + register update inline (~4.7-6.7 ->
+  ~6.2-7.3 ns/op at load ~6). Zero-GC on a full-range key is worth the nanosecond, and
+  `DDSketch.addFrom` set the precedent; no gate checks throughput, and no README / llms.txt /
+  CHANGELOG line cites ns/op.
+- **`DDSketch` now throws `[lite-sketch]` for `alpha < 1e-6`** (the new `DD_ALPHA_MIN` floor).
+  Such an alpha was accepted before -- slowly, and with an unbounded hang below about `1e-10`.
+- **A STRICT `DDSketch` now throws `[lite-sketch]` when merging a COLLAPSED `other`.** Its
+  low-end mass has already folded, so a fixed-range sketch cannot absorb it without breaking
+  its range guarantee. The rejection is a byte-identical no-op.
+- **DDSketch and SpaceSaving `count` > `2^32-1` now throws** (S5), matching CountMinSketch. A
+  finite count above `2^32-1` was accepted before; the `_badCount` message of both is now
+  "count must be an integer in [1, 4294967295]".
+- **A running total past `2^53-1` now throws on `add` / `addFrom` / `merge` of all three counted
+  members** (CountMinSketch, DDSketch, SpaceSaving) -- the exact aggregate was silently going
+  inexact before (S5).
+- **`CountMinSketch.withAccuracy` and `SpaceSaving.withError` now throw instead of clamping** when
+  the request is unattainable (`w > 2^25`, `d > 32`, or `k > 2^24`) (S6). The clamp UP of `d` to
+  `>= 1` stays, since it only strengthens the guarantee.
+- **Non-primitive throw arguments now print `[object]` / `[function]`** (F20). A rejected arg that
+  is an object or function is described structurally instead of coerced with `String(x)`, so no
+  user `toString` / `valueOf` runs during a rejection; primitive messages are byte-identical.
+- **A doubly-invalid `DDSketch.add` (negative value + over-cap count) now names the count** -- the
+  count check runs before the negative-value check (but a non-finite value is still caught first, so
+  `add(NaN, 2**32)` names the value).
+
 ### Fixed
 
+- **Doc truth: the collapse / allocation / strict overclaims are corrected (F19).** The `DDSketch`
+  collapse claim no longer promises the upper quantiles stay within `alpha` ("tail-accurate
+  p50/p90/p99 -- the ones you page on"): once `collapsed`, a quantile is within `alpha` only if its
+  rank lies above the mass folded into the floor bucket, and which quantiles survive depends on the
+  value span vs `maxBins`, not on `q` (a probe of 1001 x 147 then 999 log-spaced values in
+  `[1e3, 1e6]` at `maxBins 64` reads `quantile(0.5) = quantile(0.9) = 282199`, true `147` / `~251600`).
+  Strict `range` is restated as rejecting a value whose BUCKET KEY leaves the range's key span (at
+  `alpha 0.01`, `range [1, 100]` accepts `0.99` and `101`: `key(0.99)=key(1)=0`, `key(101)=key(100)=231`).
+  The README allocation table now names the real per-member scratch slots (`_buf`, `_hist`, `_idx`,
+  `_base`, `_cnt`) and drops the stale "module-scope slots" wording (`add` hand-inlines the murmur).
+  A new `test/docs.test.js` gate (part of `npm test`) enforces all of this: every "0 B/op" line is
+  qualified (`library` / `unboxed` / `net` or a `xxxFrom` / `xxxInto` method token), the two collapse
+  phrases are gone, and the README states its test count.
 - **Option bags are validated by own-property, not by `in` against an `Object.prototype`-rooted set
   (F18).** `CountMinSketch` / `DDSketch` / `SpaceSaving` tested `key in KNOWN_OPTS` where `KNOWN_OPTS`
   inherited `Object.prototype`, so `{ toString: 1 }`, `{ constructor: 1 }`, `{ hasOwnProperty: 1 }`
@@ -62,9 +228,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CountMinSketch.estimate` of a non-Smi key **1-or-24 (bimodal) -> 0**. `CountMinSketch.add` with a
   CONSTANT count `2^32-1` and non-Smi keys reads **24 -> 1** at a 120-byte inline cap (the shipped
   `N3c[cap120/cms.cmax]` lane); in the default tier it reads 0-1 on both builds.
-  In Chrome 154 (no-inline), `HyperLogLog.add` **60-72 -> 0 B/op**, `CountMinSketch.add` with count
-  `2^30` **60-72 -> 0 B/op**, `CountMinSketch.estimate` **120-132 -> 0 B/op**, `SpaceSaving.add` with
-  count `2^30` **36-48 -> 0.2 B/op**; every `addFrom` reads 0. State is **bit-identical** to b4e378f
+  In Chrome 154 (no-inline, the `npm run chrome` N6 gate), `HyperLogLog.add` **60-72 -> 0 B/op**,
+  `CountMinSketch.add` with count `2^30` **60-72 -> 0 B/op**, `CountMinSketch.estimate`
+  **120-132 -> 0 B/op**, `SpaceSaving.add` with count `2^30` **36-48 -> 0.2 B/op**; every `addFrom`
+  reads 0. State is **bit-identical** to b4e378f
   (H2.5) over the shipped `test/parity.mjs` H2.6 section (732,028 checks), negative keys included. A
   key or count `>= 2^31` passed to `add`
   itself still costs the CALLER's own argument box at a non-inlined call (~24 scavenges at 1.6M ops);
@@ -80,17 +247,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ops** to **24** (the caller's own argument box; 1.1.2 read 195); the never-optimized caller lane
   drops **49 -> 25**. Small keys with a constant count `2^30` go **24 -> 0** (default and
   no-inline). A variable count `>= 2^31` on the bump path goes **49 -> 25** (the caller's count
-  box). Default-tier non-Smi keys stay at the caller's box until `addFrom` lands (1.2.0). State is
-  **bit-identical** (proven over 636,951 parity checks against the pre-H2.5 build (de7ecaf, which
-  already carries F12)).
+  box). Default-tier non-Smi keys stay at the caller's box, which `SpaceSaving.addFrom` (this
+  release) removes. State is **bit-identical** (proven over 636,951 parity checks against the
+  pre-H2.5 build (de7ecaf, which already carries F12)).
 - **`CountMinSketch.add` / `addHashed` no longer box a variable count inside the update (F4).**
   `_applyCons` / `_applyPlain` took `(base, count)`, so a non-constant `count >= 2^31` boxed a
   `HeapNumber` crossing the call in the default tier. The base now lives in a per-instance
   `Int32Array(1)` slot and the count in a `Float64Array(1)` slot, the helpers are argument-free,
   and the per-row fmix is hand-inlined (bit-identical math). Default-tier add / addHashed with a
   variable `count >= 2^31` drops from **24-25 scavenges at 1.6M ops** to **0-1** (conservative and
-  plain). `estimate` is unchanged (its per-row fmix inline is deferred to 1.2.0). State is
-  **bit-identical**.
+  plain). `estimate` is unchanged here; its own per-row fmix inline is completed by the
+  `_estimateAt` hand-inline (F5, below). State is **bit-identical**.
 - **Negative keys no longer collide with their `2^32`-shifted twins (F12).** The key's sign was
   folded into **bit 0** of the high word (`hiw ^ neg`), a magnitude bit, so `-k` aliased a real
   positive key: `add(-1); add(2**32+1)` counted **1** distinct (now **2**); 20000 distinct
@@ -102,29 +269,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   compared by value in the probe) but every `-k` / twin pair shared a home slot; they now probe
   to distinct homes.
 - **`HyperLogLog` / `CountMinSketch` `add` and `CountMinSketch.estimate` no longer box the hash
-  words for `|key| >= 2^31` (F2, Node part).** The key is split into int32 words (`lo = a | 0`,
-  `hiw = (a / 2^32) | 0`) that stay Smis across `_m3round`, so the library adds **0** boxes. With
-  all inlining disabled the no-inline lane drops from **49 scavenges at 1.6M ops** (`~2 boxes/op`;
-  `-2^31` keys **73**) to **24** (`~1 box/op`, the caller's own argument box at the non-inlined call
-  boundary), which stays until `addFrom` lands (1.2.0). The default-tier `-2^31` HLL lane drops from
-  **48 to 24 or less** (0-3 when V8 inlines `add` into the caller). Positive-key output is
-  bit-identical.
-  The register suffix was computed as `(h << p) >>> 0`, a uint32 that is `>= 2^31` about
-  half the time. Maglev assumed it was an int32, so that half deopted (`not int32`) and
-  recompiled in a loop (hundreds of deopts per run), and the deopted tiers boxed every
-  uint32 / double temporary -- about 0.5 box per op even on small keys (12-13 young-gen
-  scavenges at 1.6M ops; Chrome ~14 B/op). The suffix is now `h << p` (a signed int32):
-  `Math.clz32` reads the same 32 bits and `!== 0` has the same truth value, so the
-  deopt loop is gone and `add` is 0 scavenges / 0 B/op for **Smi-range keys**
-  (`|key| < 2^31` on Node, whose Smis are 32-bit; Chrome's Smis are 31-bit). A key
-  `>= 2^31` still costs boxes from two separate causes, both fixed later in 1.2.0:
-  the caller boxes the argument itself at a non-inlined call (~24 scavenges at 1.6M
-  ops; only `addFrom` removes it), and the library boxes `lo = a >>> 0` into
-  `_m3round` (the other ~25 of the 49 seen with no inlining; removed in 1.2.0 by the
-  int32 word split below, which keeps `lo` / `hiw` as Smis across `_m3round` -- the
-  murmur hand-inline itself is deferred to a later 1.2.0 step). Output is **bit-identical** --
-  the `_reg[]` registers and `count()` match the prior release exactly at p = 4, 12, 18
-  over 600k mixed (positive, negative, `> 2^32`) keys plus the `addHashed` lanes.
+  words for `|key| >= 2^31` (F2).** The key is split into int32 words (`lo = a | 0`,
+  `hiw = (a / 2^32) | 0`) that stay Smis across the hand-inlined murmur, so the LIBRARY adds **0**
+  boxes. With all inlining disabled the no-inline lane drops from **49 scavenges at 1.6M ops**
+  (`~2 boxes/op`; `-2^31` keys **73**) to **24** (`~1 box/op`, the caller's own argument box at the
+  non-inlined call boundary) -- which the `addFrom` / `addHashedFrom` family (this release) removes,
+  reading the key UNBOXED (N1 lane `<= 2`). The default-tier `-2^31` HLL lane drops from **48 to 24
+  or less** (0-3 when V8 inlines `add` into the caller). Output is **bit-identical** -- the `_reg[]`
+  registers and `count()` match the prior release exactly at p = 4, 12, 18 over 600k mixed (positive,
+  negative, `> 2^32`) keys plus the `addHashed` lanes.
+- **`HyperLogLog.add`'s register suffix no longer triggers a Maglev deopt loop (F1).** The suffix
+  was computed as `(h << p) >>> 0`, a uint32 that is `>= 2^31` about half the time. Maglev assumed
+  it was an int32, so that half deopted (`not int32`) and recompiled in a loop (hundreds of deopts
+  per run), and the deopted tiers boxed every uint32 / double temporary -- about 0.5 box per op even
+  on small keys (12-13 young-gen scavenges at 1.6M ops; Chrome ~14 B/op, N6). The suffix is now
+  `h << p` (a signed int32): `Math.clz32` reads the same 32 bits and `!== 0` has the same truth
+  value, so the deopt loop is gone and `add` is 0 scavenges / 0 library B/op for **Smi-range keys**
+  (`|key| < 2^31` on Node, whose Smis are 32-bit; Chrome's Smis are 31-bit). The `--trace-deopt`
+  lanes now gate the `not int32` audit shape at `<= 3` (N5). Output is **bit-identical**.
 - **`DDSketch` constructor no longer hangs for a small `alpha`.** The max-key closed form
   added `ln((gamma+1)/2)` instead of subtracting `ln 2`, overshooting the key ceiling by
   about `0.3466/alpha`; a decrement loop then walked that back one key at a time -- ~2.4 ms at
@@ -172,113 +334,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `TypeError`, a throwing `toString` replaced the tag, and a re-entrant `toString` mutated the
   receiver during a "byte-identical" rejection (`reg[0]` `0 -> 53`). A rejection is now tagged and
   byte-identical in all four members and every constructor, running no user code.
-
-### Added
-
-- **`SpaceSaving.topKInto(outKeys, outCounts, outErrors, n?)` -- a 0-alloc top-N render (F7).**
-  Writes the top-`n` monitored entries best-first into three caller-owned `Float64Array`s in EXACTLY
-  `topK(n)`'s order (count DESCENDING, ties by ASCENDING slot), via an in-place bounded min-heap of
-  slot ids and an in-place heapsort -- allocation-free where `topK(n)` allocates ~160 B/entry. `n`
-  follows `topK`'s rule (a non-integer / negative `n` is treated as `size`, never throws); the count
-  written `w = min(n, size, the three lengths)` is returned; a too-short out receives its own length;
-  each key is normalized (a stored -0 reads +0). An out that is not a `Float64Array`, two of the
-  three overlapping in memory, or two backed by DIFFERENT `SharedArrayBuffer` objects (aliasing
-  cannot be verified), throws a tagged `[lite-sketch]` TypeError BEFORE any write (a wrong
-  array type would silently truncate a key `>= 2^32`); disjoint views over one buffer are allowed.
-  Monomorphic, no boxing: the `ni/ss.topKInto.n16|n64/big` lanes read **0** young-gen scavenges over
-  1.6M entries (N8 gate `<= 2`). The lite-hud M3 render (keys `>= 2^32`, counts past `2^31`).
-- **`DDSketch.quantilesInto(qs, out)` -- a 0-alloc multi-quantile render (F8).** Estimates several
-  quantiles at once: for each `j`, `out[j]` receives `quantile(qs[j])` BIT-FOR-BIT (quantile's walk is
-  duplicated per `q`, so no double crosses a call boundary), and the count written
-  `min(qs.length, out.length)` is returned. A bad `q` value (NaN / outside `[0, 1]` / empty sketch)
-  writes NaN and NEVER throws, exactly like `quantile`; in-place `qs === out` is allowed (each index
-  is read before it is written). A `qs` / `out` that is not a `Float64Array`, two distinct views
-  that PARTIALLY overlap, or two backed by DIFFERENT `SharedArrayBuffer` objects (aliasing cannot be
-  verified), throws a tagged `[lite-sketch]` TypeError BEFORE any write. The
-  `ni/dd.quantilesInto.q4` lane reads **0** scavenges over 1.6M quantiles (N8 gate `<= 2`), against
-  the `Q-CTRL[ni/dd.quantile]` control of 24 (one 16 B return box per `quantile` call). The 0-alloc
-  p50/p90/p99/p999 render M2 (`Hud.js`) needed.
-- **The zero-box `addFrom` / `addHashedFrom` family (F5, F6)** -- five new methods:
-  `HyperLogLog.addFrom(buf, i)` / `addHashedFrom(buf, i)`, `CountMinSketch.addFrom(buf, i)` /
-  `addHashedFrom(buf, i)`, and `SpaceSaving.addFrom(buf, i)`. Each reads the key (and count, or the
-  two uint32 lanes) out of a caller-owned typed array UNBOXED, so a key or count `>= 2^31` stays at
-  **0 library bytes/op** where the plain `add` / `addHashed` boxes the non-Smi argument (~16 B
-  HeapNumber) at a non-inlined call boundary -- the family analog of `DDSketch.addFrom` (1.1.0).
-  `addFrom` takes a `Float64Array` (key = `buf[i]`; for CountMinSketch / SpaceSaving count =
-  `buf[i+1]`); `addHashedFrom` takes a `Uint32Array` or `Int32Array` (HyperLogLog `[hi, lo]`;
-  CountMinSketch three slots `[hi, lo, count]`, an `Int32Array` capping count at `2^31-1`).
-  Validation, throws, and the byte-identical no-op on reject match `add` / `addHashed` exactly -- a
-  non-uint32 / non-int32 lane read (for example through a `Proxy`) throws `addHashed`'s lane error;
-  `SpaceSaving.addFrom` snapshots both slots into an instance scratch before use (D1), so a `Proxy` /
-  `SharedArrayBuffer` view cannot change a value between reads. Every `addFrom` / `addHashedFrom` lane
-  reads **0-2 young-gen scavenges at 1.6M ops** (N1 gate `<= 2`) in Node, default and no-inline, fresh
-  and warm, across 6 key classes x counts `{1, 2^30}` AND a variable count `>= 2^31` (v31), and
-  **0 B/op** in Chrome 154. There is deliberately no `SpaceSaving.addHashed(From)` -- it stores key
-  identities.
-- **`DD_ALPHA_MIN`** -- a named export (`1e-6`), the smallest `alpha` the `DDSketch`
-  constructor accepts (`DD_ALPHA_MIN <= alpha < 1`).
-- **`CountMinSketch.saturated`** -- a sticky `boolean` getter (F14/S4), `true` once any counter
-  clamped at `2^32-1`. While `false` the estimate is strictly one-sided; `merge` carries it from
-  either side, and `clear()` resets it.
-- **`npm run lanes`** -- a child-process scavenge/deopt lane harness
-  (`test/lanes.mjs` + `test/lanes/lane.mjs`), now part of `npm run verify`. One child
-  per lane under `--max-semi-space-size=4` (default and no-inline) gates HyperLogLog
-  `add` at `<= 2` scavenges, the `--trace-deopt` audit shape at `<= 3` `not int32`
-  deopts, and a no-op teeth control at `>= 12`. `--lib <path>` runs the lanes against
-  another build for a revert-check.
-
-### Changed
-
-- **An option bag built on a custom prototype is now rejected (F18).** `CountMinSketch` / `DDSketch`
-  / `SpaceSaving` previously accepted ANY object as the options bag and read its keys through the
-  prototype chain; they now require a PLAIN bag (own string keys, on a `null` prototype, THIS realm's
-  `Object.prototype`, or another root prototype that carries NO own known key). A `Map` / `Date` /
-  `RegExp` / array / class instance / `Object.create(proto)` (including `Object.create(defaults)`), an
-  object with an own ACCESSOR, or an object with an own Symbol key is now rejected with the plain-object
-  `[lite-sketch]` TypeError. A bag whose prototype is a null-proto object carrying a known key (e.g.
-  `Object.create({ __proto__: null, seed: 5 })`), or a cross-realm `Object.prototype` polluted with a
-  known key, is also rejected -- the inherited value would be silently dropped, so it fails closed. (A
-  polluted THIS-realm `Object.prototype` is still ignored: a literal `{}` bag yields the default.) (No
-  suite consumer passes a custom-prototype bag; every in-repo call site passes a literal.)
-- **A `Proxy`-wrapped instance is now rejected by `merge`.** `new Proxy(realSketch, {})` passed
-  `instanceof` and merged on all four members; the `#brand` check returns `false` for it (private
-  names are not forwarded through a `Proxy`), so it now throws the tagged `[lite-sketch]` TypeError.
-- **A bare prototype forgery passed to `merge` now throws the `TypeError`, not the `RangeError`.** A
-  `Object.create(X.prototype)` used to reach the shape-mismatch `RangeError` (m / d,w,seed / gamma /
-  capacity); the brand check rejects it first, so it now throws the brand `TypeError` ("expects a
-  <Member>"). Existing tests that used a bare forgery to reach the `RangeError` were rewritten to a
-  real mismatched instance.
-- **A query no longer returns `-0` (F18).** `SpaceSaving` `forEach` / `topK` / `heavyHitters` /
-  `topKInto` keys and `DDSketch` `min` / `max` now read `+0` for a stored `-0` (`Object.is` can no
-  longer tell them apart); storage is unchanged.
-- **`SpaceSaving.forEach` under mutation no longer visits ghosts.** The loop bound is the live
-  `size`, not a hoisted snapshot, so a sketch cleared / merged inside the callback no longer walks
-  stale slots (mutating inside `forEach` remains unsupported; entries may be skipped or revisited).
-- **`HyperLogLog.add` costs about +1.5 ns/op.** It is now a typeof wrapper over `_addAt`, so it makes
-  one real (non-inlined) call where the 1.1.2 body ran the mix + register update inline (~4.7-6.7 ->
-  ~6.2-7.3 ns/op at load ~6). Zero-GC on a full-range key is worth the nanosecond, and
-  `DDSketch.addFrom` set the precedent; no gate checks throughput, and no README / llms.txt /
-  CHANGELOG line cites ns/op.
-- **`DDSketch` now throws `[lite-sketch]` for `alpha < 1e-6`** (the new `DD_ALPHA_MIN` floor).
-  Such an alpha was accepted before -- slowly, and with an unbounded hang below about `1e-10`.
-- **A STRICT `DDSketch` now throws `[lite-sketch]` when merging a COLLAPSED `other`.** Its
-  low-end mass has already folded, so a fixed-range sketch cannot absorb it without breaking
-  its range guarantee. The rejection is a byte-identical no-op.
-- **DDSketch and SpaceSaving `count` > `2^32-1` now throws** (S5), matching CountMinSketch. A
-  finite count above `2^32-1` was accepted before; the `_badCount` message of both is now
-  "count must be an integer in [1, 4294967295]".
-- **A running total past `2^53-1` now throws on `add` / `addFrom` / `merge` of all three counted
-  members** (CountMinSketch, DDSketch, SpaceSaving) -- the exact aggregate was silently going
-  inexact before (S5).
-- **`CountMinSketch.withAccuracy` and `SpaceSaving.withError` now throw instead of clamping** when
-  the request is unattainable (`w > 2^25`, `d > 32`, or `k > 2^24`) (S6). The clamp UP of `d` to
-  `>= 1` stays, since it only strengthens the guarantee.
-- **Non-primitive throw arguments now print `[object]` / `[function]`** (F20). A rejected arg that
-  is an object or function is described structurally instead of coerced with `String(x)`, so no
-  user `toString` / `valueOf` runs during a rejection; primitive messages are byte-identical.
-- **A doubly-invalid `DDSketch.add` (negative value + over-cap count) now names the count** -- the
-  count check runs before the negative-value check (but a non-finite value is still caught first, so
-  `add(NaN, 2**32)` names the value).
 
 ## [1.1.2] - 2026-09-23
 

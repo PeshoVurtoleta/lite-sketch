@@ -17,6 +17,12 @@
 //     reworded reason FAILs (VACUOUS) instead of passing at 0.
 //   * CTRL (teeth) -- a no-op add fed 2^31+ keys in no-inline mode must read >= 12,
 //     proving the lane sees one 16 B box per op. The local precursor of N4.
+//   * N4-CTRL[df/ring] (H2.8) -- the `ring` laneType: a library-INDEPENDENT one-box
+//     control (the perf2 / PerfGate oneBoxCtl shape -- a fractional double from a
+//     Float64Array stored into a PACKED Array(64), one 16 B HeapNumber per op), df, min
+//     of 3 >= 8. It promotes the CTRL precursor to a gated lane and records the scavenge
+//     count PerfGate's maxScavenges-2 gate can only pass/fail, not PRINT. It passes
+//     identically under `--lib` (the revert-check relies on this).
 //   * N3c[cap120/...] -- the cmax WRAPPER-SIZE teeth lane (H2.6, F5). It pins
 //     `--max-inlined-bytecode-size=120` (via scavJob's inlineCap), a value BETWEEN the H2.6 add
 //     wrapper (74 B) and HEAD's add (378 B): so the box is controlled by add's BODY SIZE -- the
@@ -65,9 +71,14 @@ function runDeopt(noInline) {
 
 const results = [];
 let fails = 0;
+// H2.8: the revert-check asserts teeth BY NAME, so collect the failed / absent gate
+// names (a gate valued exactly 'ABSENT' is a missing method; any other !ok is a FAIL).
+// Printed as two parseable lines below the GATE line. Additive -- gating is unchanged.
+const failedGates = [];
+const absentGates = [];
 function gate(name, value, ok) {
     results.push(name + '=' + value);
-    if (!ok) fails++;
+    if (!ok) { fails++; if (value === 'ABSENT') absentGates.push(name); else failedGates.push(name); }
     return ok;
 }
 
@@ -97,6 +108,23 @@ for (const noInline of [false, true]) {
 {
     const v = runScav('noop', 'b31', 'fresh', true);
     gate('CTRL[b31/ni]', v, v >= 12);
+}
+
+// ---- N4-CTRL (H2.8): a library-INDEPENDENT one-box ring, df, min of 3 >= 8 -----
+// The `ring` laneType stores one ~16 B HeapNumber per op into a PACKED Array(64) (the perf2 /
+// PerfGate oneBoxCtl shape). This records the scavenge count PerfGate's maxScavenges-2 gate can
+// only pass/fail, not PRINT. 8 = 2/3 of the low mode (12) and 4x the <= 2 lane gate. It touches no
+// module, so it reads the same under --lib -- the revert-check keeps N4-CTRL PASSing on 1.1.2.
+function runRing() {
+    const out = execFileSync(process.execPath, [...BASE, LANE, 'ring', ...LIBFLAGS], { encoding: 'utf8' });
+    const v = JSON.parse(out.trim().split('\n').pop()).scav;
+    if (!Number.isInteger(v) || v < 0) throw new Error('ring lane returned ' + v);
+    return v;
+}
+{
+    const rr = [runRing(), runRing(), runRing()];
+    const mn = Math.min(...rr);
+    gate('N4-CTRL[df/ring]', 'min=' + mn + '[' + rr.join(',') + ']', mn >= 8);
 }
 
 // ---- N3 (H2.4 hash-word boxes) + N3c (H2.5 count boxes, F3/F4) ---------------
@@ -433,4 +461,6 @@ n8Gate('FE-CTRL[ni/ss.forEach/big]', (mn) => mn >= 12);
 const ok = fails === 0;
 console.log('GATE lanes' + (libArg ? ' (lib=' + libArg + ')' : '') + ': ' + results.join(' ') +
     ' | ' + (ok ? 'ok' : 'FAIL (' + fails + ')'));
+console.log('LANES-FAILED=' + failedGates.join(','));
+console.log('LANES-ABSENT=' + absentGates.join(','));
 if (!ok) process.exitCode = 1;

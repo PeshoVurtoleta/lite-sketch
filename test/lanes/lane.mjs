@@ -4,11 +4,13 @@
 // `--expose-gc --max-semi-space-size=4` plus, in no-inline mode,
 // `--max-inlined-bytecode-size=0`; the deopt lane is additionally spawned under
 // `--trace-deopt`. A lane either counts minor GCs (scavenges) over 8N = 1.6M ops
-// after a forced gc(), or runs the audit-shape deopt driver (whose `--trace-deopt`
-// output the parent greps). Keys are read from a prefilled Float64Array -- NEVER
-// from a closure int -- so a key >= 2^31 crosses the add boundary as a double, the
-// exact shape F1 fixes. `--lib <absolute path>` runs a lane against another module
-// (the revert-check). Prints one JSON line the parent parses. ASCII-only.
+// after a forced gc(), runs the audit-shape deopt driver (whose `--trace-deopt`
+// output the parent greps), or runs the `ring` one-box control (N4-CTRL -- a
+// library-INDEPENDENT HeapNumber-per-op ring). Keys are read from a prefilled
+// Float64Array -- NEVER from a closure int -- so a key >= 2^31 crosses the add
+// boundary as a double, the exact shape F1 fixes. `--lib <absolute path>` runs a lane
+// against another module (the revert-check); the `ring` lane ignores it, by design, so
+// it reads the same there. Prints one JSON line the parent parses. ASCII-only.
 import { PerformanceObserver, constants } from 'node:perf_hooks';
 
 const argv = process.argv.slice(2);
@@ -323,6 +325,22 @@ async function main() {
             sink = (sink + c.r[0]) | 0;
         }
         if (sink === 0x7fffffff) process.stderr.write('');   // defeat DCE without emitting trace noise
+        return;
+    }
+    if (laneType === 'ring') {
+        // N4-CTRL: a library-INDEPENDENT one-box control (the perf2 / PerfGate oneBoxCtl shape).
+        // Read a FRACTIONAL double from a Float64Array, multiply, and store the result into a
+        // PACKED `new Array(64).fill(null)` ring -- one ~16 B HeapNumber per op. Over 8N with a
+        // 4 MB semi-space this reads ~12-25 scavenges (low mode 12). It touches no module under
+        // test, so it is identical with or without `--lib`; it records the scavenge number
+        // PerfGate's maxScavenges-2 gate can only pass/fail, not PRINT. Prints one JSON line.
+        const F = new Float64Array(SIZE);
+        for (let i = 0; i < SIZE; i++) F[i] = i + 0.5;
+        const ring = new Array(64).fill(null);   // PACKED_ELEMENTS: each store boxes a HeapNumber
+        let sink = 0;
+        const step = (i) => { ring[i & 63] = F[i & MASK] * 1.5; sink = (sink + ring.length) | 0; };
+        const scav = await countScav(step, false);
+        console.log(JSON.stringify({ scav, sink: sink & 1 }));
         return;
     }
     console.error('lane.mjs: unknown lane type ' + JSON.stringify(laneType));

@@ -5,14 +5,10 @@ and the `../LiteFilter` cadence (reference member + one per release, complete at
 `RESEARCH.md` for the identity, the accuracy witness, the roster rationale, and the open
 questions. ASCII-only (`->`, `<=`, `x`).
 
-> **NEXT (2026-10-04): H2 -- v1.2.0** (section 7; audit record in RESEARCH.md section 13; S1-S7 SETTLED). The 1.1.2
-> final sweep found allocation the gates admit:
-> - HyperLogLog `add` sits in a Maglev deopt loop, at ~0.5 box/op even on small keys.
-> - SpaceSaving passes keys and counts through helper arguments, up to ~8 boxes/op.
-> - Chrome's 31-bit Smis box half of all hash words.
-> - `maxScavenges: 64` / `SCAV_BOX = 48` admit 1.6-2.7 boxes/op.
-> It also found 2 High fail-closed bugs: a DDSketch tiny-alpha constructor hang, and `merge` dropping
-> `collapsed`. lite-hud M3 waits for this release.
+> **NEXT (2026-10-05): `/release 1.2.0`** (maintainer). H2 (section 7) is BUILT & GREEN: H2.1-H2.7 are
+> committed and H2.8 (7.9) is in the working tree. `npm run verify` (now with the headless-Chrome lane) and
+> `npm run revert-check` (every new gate FAILs on 1.1.2) both pass. After the release, lite-hud M3
+> (../LiteHud/ROADMAP.md 8.2) can re-run its boxing probe on 1.2.0; the 7.9 Result has the numbers.
 
 Status: COMPLETE at 1.0.0 -- the four-member API is STABLE (HyperLogLog -> CountMinSketch ->
 DDSketch -> SpaceSaving). Each milestone was a full pipeline session (planner -> settle -> coder
@@ -29,9 +25,9 @@ lite-o1. New work moves to post-1.0 members (below) and the sibling packages (li
 | **M3** | **DDSketch** (quantiles) | 0.3.0 | dense log-bins -> HARD relative error `<= alpha`; collapsing-lowest default + strict opt-in; positive+zero | SHIPPED (ADR 0004) |
 | **M4** | **SpaceSaving** (heavy hitters / top-k) | 0.4.0 | k counters -> overestimate `<= min-counter`; no false negatives above N/k; dual ctor + merge | SHIPPED (ADR 0005) |
 | -- | **1.0.0** -- API declared STABLE at four members | 1.0.0 | reference + 3, the lite-filter cadence; pre-freeze fix: HyperLogLog seed-checked merge + seed getter (parity with CMS/SpaceSaving) | SHIPPED |
-| **H1** | **Post-1.0 hardening: fail closed on the last edge + additive DDSketch surface** | 1.1.0 | HLL/CMS reject +-Infinity + non-integer keys; DDSketch `strict` / indexable-bound getters + `addFrom` zero-box entry (N7); per-member witness negative controls; scavenge-floor lane. MINOR (adds `addFrom` + 5 getters -- new backward-compatible API, not a patch) | BUILT & GREEN 2026-09-23 (F1/F2/N1/N4/N5/N6/N7; test 182/182, torture 0 B/op + N7 addFrom=0, witness + N4 controls ok, perf 9/9; trinity 1.1.0); awaiting publish |
-| **H2** | **Zero-box PATH + `addFrom` family + fail-closed fixes** (final-sweep audit of 1.1.2, 2026-10-04) | 1.2.0 | HLL deopt-loop fix; SpaceSaving / CMS argument-free helpers; `addFrom(buf, i)` on HLL / CMS / SpaceSaving; DDSketch tiny-alpha hang + collapsed-merge fix; negative-key hash fix; calibrated gates incl. a Chrome lane. Unblocks lite-hud M3 | PLANNED (section 7) |
-| -- | 1.2 additive (post-H1) | 1.2.0 | `SpaceSaving.topKInto` 0-alloc sorted top-k (now H2 F11); serialize/deserialize across all four members | serialize: backlog (section 6) |
+| **H1** | **Post-1.0 hardening: fail closed on the last edge + additive DDSketch surface** | 1.1.0 | HLL/CMS reject +-Infinity + non-integer keys; DDSketch `strict` / indexable-bound getters + `addFrom` zero-box entry (N7); per-member witness negative controls; scavenge-floor lane. MINOR (adds `addFrom` + 5 getters -- new backward-compatible API, not a patch) | BUILT & GREEN 2026-09-23 (F1/F2/N1/N4/N5/N6/N7; test 182/182, torture 0 B/op + N7 addFrom=0, witness + N4 controls ok, perf 9/9; trinity 1.1.0); SHIPPED 1.1.0 (1.1.1-1.1.2 were packaging) |
+| **H2** | **Zero-box PATH + `addFrom` family + fail-closed fixes** (final-sweep audit of 1.1.2, 2026-10-04) | 1.2.0 | HLL deopt-loop fix; SpaceSaving / CMS argument-free helpers; `addFrom(buf, i)` on HLL / CMS / SpaceSaving; DDSketch tiny-alpha hang + collapsed-merge fix; negative-key hash fix; calibrated gates incl. a Chrome lane. Unblocks lite-hud M3 | BUILT & GREEN 2026-10-05 (H2.1-H2.8, section 7); awaiting /release 1.2.0 |
+| -- | 1.2 additive (post-H1) | 1.2.0 | `SpaceSaving.topKInto` 0-alloc sorted top-k (shipped in H2 as F7); serialize/deserialize across all four members | serialize: backlog (section 6) |
 | M5+ | KMV/MinHash, CountSketch, HeavyKeeper, SlidingHLL | post-1.0 | one per release (RESEARCH.md Tier 2) | backlog |
 
 ## 0. Preflight -- new-package scaffold (do once, with M0/M1)
@@ -229,7 +225,7 @@ GATES
 
 ---
 
-## 7. H2 -- v1.2.0: zero-box path + addFrom family + fail-closed fixes (final-sweep audit of 1.1.2, 2026-10-04)  [PLANNED]
+## 7. H2 -- v1.2.0: zero-box path + addFrom family + fail-closed fixes (final-sweep audit of 1.1.2, 2026-10-04)  [BUILT & GREEN, awaiting /release 1.2.0]
 
 Baseline at audit (1a2673e): `npm test` 182/182, perf gate 9/9, torture `ok`. Two parallel read-only
 audits covered (a) allocation + gate honesty and (b) fail-closed + correctness + doc truth. The
@@ -293,7 +289,7 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | F6 | A12 (L) the `addHashed` contract (uint32 lanes, :337/:649): any lane >= 2^31 boxes at the boundary (HLL addHashed 30, CMS 4). | `addHashedFrom(Uint32Array\|Int32Array, i)`, or accept int32 lanes. | An addHashedFrom lane at 0. H2.6 delta (q1 pre-measured, pending qa): shipped `addHashedFrom` on HLL (2-slot [hi, lo]) and CMS (3-slot [hi, lo, count], D2; an Int32Array caps count at 2^31-1); AHF lanes 0-2 at 1.6M ops (gate <= 2). |
 | F7 | A9 (M) `SpaceSaving.forEach` passes key / count / error as callback arguments: 3130 B/call at k=64 (no-inline, 2^31 keys and counts). | `topKInto(outKeys, outCounts, outErrors, n)` (the old 1.2 backlog N2) or `snapshotInto`. Document `forEach`'s per-entry boxes. | A topKInto lane at 0. H2.7 delta (done): shipped `SpaceSaving.topKInto(outKeys, outCounts, outErrors, n?)` (D4) -- an in-place bounded min-heap of slot ids in `outKeys`, EXACTLY `topK(n)`'s order (count DESC, ties by ascending slot), 0 alloc; the `ni/ss.topKInto.n16\|n64/big` N8 lanes read 0 scavenges (gate <= 2), and the `FE-CTRL[ni/ss.forEach/big]` control stays the documented 73. `forEach`'s ~49 B/entry (non-Smi, non-inlined fn) is documented in d.ts / llms / README. |
 | F8 | A10 (M, doc) `SpaceSaving.merge` allocates fresh O(k) state per call (a Map, 2 objects per key, an array, 3 closures): 18.0 KB/call at k=64, 282.5 KB at k=1024. llms.txt:283 says "bounded cold scratch". A11 (L): HLL `count` (16.8 B/call default, 111 no-inline) and DD `quantile` (5 / 16 B) box their returns. | Fix the merge wording (or reuse a preallocated scratch). Document the returned-double boxes, and add `countInto` / `quantileInto` if a consumer needs a 0 B/op render. | The docs state the bytes, or the Into lanes are at 0. H2.7 delta (done): shipped `DDSketch.quantilesInto(qs, out)` (D5) -- `quantile`'s walk duplicated per q, read / write via the Float64Arrays so no double crosses a call; the `ni/dd.quantilesInto.q4` N8 lane reads 0 scavenges (gate <= 2) against the `Q-CTRL[ni/dd.quantile]` control of 24. No `countInto` / `estimateInto` (HLL count is a Smi; both return boxes are docs only). The merge / topK / heavyHitters bytes (~300 / ~160 / ~135 B/entry, approx per alloc.mjs) and the quantile / estimate 16 B return box are stated in d.ts / llms / README; the llms "bounded cold scratch" wording now carries the ~300 B/entry figure. |
-| F9 | A6 + A7 (H, harness) the perf gate's `maxScavenges: 64` (PerfGate.test.mjs:226) admits ~2.7 boxes/op, and its only mustFail allocates ~528 B/op. The torture `SCAV_BOX = 48` (torture.mjs:303) admits 1.6 boxes/op and pins F1 as "acceptable". The comments at torture.mjs:288-299 and PerfGate:215-225 misattribute the floor. torture.mjs:335-341 says the add-box teeth "live in lite-hud", but they reproduce here. | Lower `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. Add the N4 one-box mustFail. Fix the comments. | N4 trips. All lanes pass at the new thresholds after F1-F5/N7. |
+| F9 | A6 + A7 (H, harness) the perf gate's `maxScavenges: 64` (PerfGate.test.mjs:226) admits ~2.7 boxes/op, and its only mustFail allocates ~528 B/op. The torture `SCAV_BOX = 48` (torture.mjs:303) admits 1.6 boxes/op and pins F1 as "acceptable". The comments at torture.mjs:288-299 and PerfGate:215-225 misattribute the floor. torture.mjs:335-341 says the add-box teeth "live in lite-hud", but they reproduce here. | Lower `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. Add the N4 one-box mustFail. Fix the comments. | N4 trips. All lanes pass at the new thresholds after F1-F5/N7. H2.8 delta (done): `maxScavenges` 64 -> 2 and `SCAV_BOX` deleted (scAh / scCh at SCAV_CLEAN 0); comments state the true causes (7.9 D3). |
 
 **Fail-closed + correctness fixes (F)**
 
@@ -308,7 +304,7 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | F16 | B-A7 (M) `withAccuracy` / `withError` silently clamp to a weaker guarantee (:570-576, :1513): `withAccuracy(1e-12,1e-20)` returns epsilon 8.1e-8, and `withError(1e-9)` returns capacity 2^24 / epsilon 5.96e-8. README:167/270 and llms.txt:71 say "k = ceil(1/epsilon)". | Throw when the request is unattainable (w > 2^25, d > 32, k > 2^24) (S6). | `withAccuracy(1e-12,0.01)` and `withError(1e-9)` throw. `withError(2**-24)` succeeds. |
 | F17 | B-A8 (L) `minIndexable` / `maxIndexable` (:976-977) are not the EXACT accepted bounds (off by ulps, up to ~4e-13 relative). Across 3000 alphas, 2428 reject `nextUp(min)` and 2465 accept `nextUp(max)`. A consumer pre-check (lite-hud M2's band) can pass a value that `add` throws on. | Find the exact acceptance edges in the ctor with a bit-level search using `add`'s own key expression. | Over a 3000-alpha sweep: add(nextUp(min)) accepted, add(min) rejected, add(max) accepted, add(nextUp(max)) rejected. |
 | F18 | B-A9 / A10 / A11 (L) the option check uses `in` against a frozen object that inherits Object.prototype (:521, :906, :1446): `{constructor:1}` / `{toString:1}` are accepted, `{__proto__:{seed:5}}` sets the seed, and Map / Date are accepted as bags. `SpaceSaving.forEach` uses a stale loop bound under mutation (:1620-1624: `clear()` at the first entry visits 4 ghosts, `merge()` mid-walk visits key 1 twice). -0 is stored as-is (SS key, DD min). | Use own-property checks and read only own values. Use the live `_size` bound and document "no mutation in forEach". Normalize with `key + 0`. | `{toString:1}` throws in all three classes. `clear()` mid-walk visits 1 entry. `Object.is(topK()[0].key, 0)`. H2.7 delta (done): shipped the plain-bag rule (D2) via `_optScan` / `_optOwn` + null-proto KNOWN sets -- own string DATA keys only, no inherited read, no getter run, a revoked / throwing-trap Proxy (bag or DD `range`) rejected tagged; `forEach`'s live `this._size` bound (no ghosts; `clear()` in the first callback now visits 1); and `+ 0` at the OUTPUTS (SS forEach / topK / heavyHitters / topKInto, DD min / max getters). Docs updated in d.ts / llms / README / ADR 0003-0005; CHANGELOG Fixed + Changed. |
-| F19 | D1-D4 (L) docs. README:137 overclaims "p50/p90/p99 within alpha" under collapse (probe: p50 6187 vs 147), and says strict throws by value when it really works by bucket key (`range [1,100]` accepts 0.99 and 101). The README:322-330 allocation table describes module-scope slots the code never writes, and omits `_hist` / `_idx`. The README Testing section has no count (182). RESEARCH.md:9 says "Not yet coded", ROADMAP H1 says "awaiting publish", and the lockfile version is 0.1.0. The unqualified "0 B/op" lines (README:30/64/100/167/188/213/215/272/275/318-334, llms.txt:32/42/65/70/299, Sketch.d.ts:68/141/147/306/315) need "0 library bytes/op; a non-Smi argument boxes at a non-inlined boundary; use addFrom". | Text fixes. | Grep: no unqualified 0 B/op line, and the count is stated. |
+| F19 | D1-D4 (L) docs. README:137 overclaims "p50/p90/p99 within alpha" under collapse (probe: p50 6187 vs 147), and says strict throws by value when it really works by bucket key (`range [1,100]` accepts 0.99 and 101). The README:322-330 allocation table describes module-scope slots the code never writes, and omits `_hist` / `_idx`. The README Testing section has no count (182). RESEARCH.md:9 says "Not yet coded", ROADMAP H1 says "awaiting publish", and the lockfile version is 0.1.0. The unqualified "0 B/op" lines (README:30/64/100/167/188/213/215/272/275/318-334, llms.txt:32/42/65/70/299, Sketch.d.ts:68/141/147/306/315) need "0 library bytes/op; a non-Smi argument boxes at a non-inlined boundary; use addFrom". | Text fixes. | Grep: no unqualified 0 B/op line, and the count is stated. H2.8 delta (done): "0 library B/op" (7.9 D7), collapse bounded by folded mass + strict by bucket key (D8), allocation table, README test count; gated by test/docs.test.js. RESEARCH.md:9 was already fixed; the lockfile item is moot (package-lock.json is gitignored). |
 | F20 | Found by H2.1 qa, confirmed on HEAD (M): all 33 cold throwers build their message with `String(x)`, which runs caller code. Three consequences: (1) `add(Object.create(null))` on any member, and `new DDSketch(Object.create(null))`, throw an UNTAGGED `TypeError: Cannot convert object to primitive value`; (2) a `toString` that throws replaces the tagged error; (3) a `toString` that calls `h.addHashed(0,0)` changes the receiver during a rejection that must be byte-identical (reg[0] 0 -> 53, and the throw is still tagged). | One cold `_describe(x)` shared by every thrower: `typeof` first, primitives formatted directly (`String` is safe for number / string / boolean / bigint / symbol / undefined, plus null), and `'[object]'` / `'[function]'` for anything else, so no user code ever runs. Replace every `String(x)` in a throw path. | A null-proto object and a throwing / mutating `toString` give a TAGGED throw with byte-identical state in all four members and every ctor. Remove the `todo` in test/HyperLogLog.test.js (case 6) and make it a real test. |
 | F21 | Found by H2.2 qa, confirmed (L): every `merge` brand-checks with `instanceof`, which a forged `Object.create(X.prototype)` passes. DDSketch: a forged other with a matching `_gamma` merges silently and leaves `count` / `sum` = NaN on strict and non-strict sketches. CMS: a forged other throws an UNTAGGED TypeError. Present in 1.1.2. | A real brand check in every `merge`: a private-field brand (`#brand in other`) or a module-scope WeakSet filled by the ctor, so a forgery throws through the tagged `_badMerge` before any read. | A forged prototype instance throws a tagged error with byte-identical state in all four members. H2.7 delta (done): shipped a class-private `#brand` on all four members (D1); `merge` and `_badMerge` test `typeof other === 'object' && other !== null && #brand in other` as the FIRST statement, before any read of `other`. A field copy and a `new Proxy(real, {})` now throw the tagged TypeError (a bare forgery gets the TypeError, not the shape RangeError -- CHANGELOG Changed); the DD `_gamma`-only NaN merge is closed; subclasses still merge. Docs in d.ts / llms / README / ADR 0002-0005; CHANGELOG Fixed + Changed. |
 
@@ -319,9 +315,9 @@ The audit's prototype of F1-F5 (`Sketch.fix.js` in the session scratchpad) measu
 | N1 | Float64Array-fed scaling lanes in a child process with `--max-semi-space-size=4`, default AND `--max-inlined-bytecode-size=0`. Each of the 4 addFrom x 6 key classes (small, 2^30+, 2^31+, 2^32-1, -2^31, 2^53-1) x counts {1, 2^30} x fresh/warm must read <= 2 at 8N. | HLL / CMS / SS (no addFrom). DD passes. H2.6 delta (pending qa): the gate ships (240 addFrom lanes + AHF + N1e); q1 pre-measured min 0-2 (gate <= 2); FAILs `=ABSENT` on HEAD via `--lib`. |
 | N2 | `add` lanes with Smi-range arguments (small and 2^30+ keys, counts 1 and 2^30), default + no-inline: <= 2. | HLL small 12-13; SS count 2^30 24 |
 | N3 | Library-only delta: `add` with keys >= 2^31 minus a no-op baseline receiving the same arguments must be <= 2. | SS 192 vs 24, CMS 49/73 vs 24, HLL 72-104 vs 24 |
-| N4 | A calibrated one-box mustFail (Float64Array -> fractional value -> ring store) must read >= 12 at 8N. It ships with `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. | HLL add-stream 6, HLL addHashed 30, SS evict 12 (harness, fixed by N7) |
+| N4 | A calibrated one-box mustFail (Float64Array -> fractional value -> ring store) must read >= 12 at 8N. It ships with `maxScavenges` 64 -> 2 and `SCAV_BOX` 48 -> 0. | HLL add-stream 6, HLL addHashed 30, SS evict 12 (harness, fixed by N7) -- H2.8 delta (done): one box per op in three homes -- PerfGate `oneBoxCtl` (trips at 2, not at 64), torture SCAV-CTRL (30), lanes `N4-CTRL[df/ring]` >= 8 (24); ">= 12 at 8N" became "trips at 2; lanes min >= 8" (the perf low mode is exactly 12). |
 | N5 | Deopt-loop gate: a `--trace-deopt` child shows <= 3 `add` deopts per lane. | HLL 416-461 |
-| N6 | Headless Chrome lane (`--enable-precise-memory-info` + gc(), default and no-inline): addFrom 0, and `add` <= 12 B per non-Smi argument. Node cannot replace this lane: it never sees 31-bit-Smi boxes. | HLL 77, CMS 113, SS 170 B/op |
+| N6 | Headless Chrome lane (`--enable-precise-memory-info` + gc(), default and no-inline): addFrom 0, and `add` <= 12 B per non-Smi argument. Node cannot replace this lane: it never sees 31-bit-Smi boxes. | HLL 77, CMS 113, SS 170 B/op -- H2.8 delta (done): `npm run chrome` (test/chrome/, last in verify, fails closed UNVERIFIED without Chrome); add limits use k = fresh per-op non-Smi boxes per mode. |
 | N7 | Driver rule: drivers pass `add` only Smi-range values; full-range keys go only through `addFrom`. | the SS evict / HLL addHashed drivers pass `v >>> 0` -- H2.6 delta (pending qa): torture `ahStep` / `chStep` and PerfGate `addHashedStream` move to `addHashedFrom`, and the PerfGate SS evict driver to `addFrom`; the F9 thresholds stay untouched (H2.8). |
 | N8 | Query lanes: SS.forEach with entries >= 2^31 and a non-inlined callback; the Into APIs at 0. | forEach 3130 B/call -- H2.7 delta (done): the `query` lane type ships; `N8[df\|ni/ss.topKInto.n16\|n64/big]` and `N8[df\|ni/dd.quantilesInto.q4]` read 0 (gate <= 2), the `ss.forEach/small` regression guard 0 (gate <= 2), and the controls `Q-CTRL[ni/dd.quantile]` 24 and `FE-CTRL[ni/ss.forEach/big]` 73 (gate >= 12); the 6 Into gates FAIL `=ABSENT` on HEAD via `--lib`. |
 | N9 | Parity against `git show HEAD:Sketch.js` (the audit's `parity.mjs` shape): bit-identical estimates across all members, edges, and merges. | n/a (new) |
@@ -397,7 +393,7 @@ grows until H2.8, which owns the 1.2.0 trinity. The order follows the dependenci
 | H2.5 (done) | F3 + F4: argument-free SpaceSaving and CMS helpers, N3 count lanes. SS home's F2 hand-inline landed here (`_homeAt`) | SS / CMS internals |
 | H2.6 (done) | F5 + F6: the `addFrom` / `addHashedFrom` family, N1, N7, plus the F2 murmur hand-inline inside `_addAt` (moved from H2.4) and the CMS `estimate` per-row fmix inline (moved from H2.5) | public API (additive) |
 | H2.7 (done) | F7, F8, F18, F21: `topKInto` + `quantilesInto`, merge / query cost docs, option bags, forEach, -0, the merge brand check, N8 | cold paths |
-| **H2.8** | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
+| H2.8 (done) | F9 + N4 + N6 (Chrome lane), F19 docs, the 1.2.0 trinity, /release | gates + docs |
 
 ### 7.2 H2.1 spec -- F1 + the lane harness  [DONE, committed 980e4fe]
 
@@ -1578,7 +1574,7 @@ Reviewer focus:
 RISK: the N1 SS lanes read 0-2 against <= 2. If all three reps read 3, classify them with chunk.mjs /
 `--trace-turbo-inlining` (fresh-window tier-up); never raise the limit.
 
-### 7.8 H2.7 spec -- topKInto + quantilesInto (F7, F8), option bags / forEach / -0 (F18), the merge brand (F21) + N8  [DONE 2026-10-05, awaiting maintainer commit]
+### 7.8 H2.7 spec -- topKInto + quantilesInto (F7, F8), option bags / forEach / -0 (F18), the merge brand (F21) + N8  [DONE, committed 5fecd6e]
 
 Result: the reviewer REJECTED twice, APPROVED, then APPROVED a post-qa fix; qa found g1-g8 PASS.
 - **Rejection 1:**
@@ -1893,3 +1889,354 @@ Reviewer focus:
 RISK: D2 rejects option bags built on a custom prototype (`Object.create(defaults)`) that 1.1.2 accepted. That is
 intended, under CHANGELOG Changed. Orchestrator grep (2026-10-05): no suite consumer (LiteHud included) passes a
 custom-prototype bag; every in-repo call site passes a literal.
+
+### 7.9 H2.8 spec -- calibrated gates (F9 + N4), the Chrome lane (N6), doc truth (F19), release readiness  [DONE 2026-10-05, awaiting maintainer commit + /release 1.2.0]
+
+Result: the reviewer REJECTED twice, then APPROVED; qa found h1-h7 PASS. No Sketch.js code byte changed (a
+comment-stripping diff is identical; parity 0 diffs vs HEAD; witness sha1 2ed81a8b).
+- **Rejection 1 (6 blockers):**
+  - revert.mjs only checked "exit 1 + ABSENT" for the lanes and chrome families, so dead N2 / N3 / N5 gates or a
+    dead Chrome add limit would have passed; parity read only the N9 line.
+  - The docs gate's lockfile rule threw on a fresh clone (package-lock.json is gitignored) and was tautological
+    after `npm install`: D9 DROPPED, rule removed.
+  - The qualifier regex took English "from" / "into" / "network" as qualifiers; the revert-check docs named a
+    docs family that does not exist and the wrong runtime.
+  - Nits taken: Chrome add limits now use k = FRESH per-op non-Smi boxes per mode (every limit lowered: df add
+    lanes 0.5, ni c30 b30 12.5 was 24.5); v31 now accumulates; NaN / negative windows are discarded and a lane
+    with no valid window FAILs; REF is validated before `git show`.
+- **Rejection 2:** revert.mjs still dropped missing named gates, did not pin family counts, accepted a VACUOUS
+  N5 and an INVALID Chrome lane as the expected FAIL. Now: exact counts, N5 must read > 3 and not VACUOUS, each
+  Chrome mustFail must print a min strictly above its limit.
+- **Parity vs 1.1.2:** parity.mjs legitimately exits 1 against 1a2673e. Three sections differ by documented
+  behavior changes and are allowlisted, each matched on its diff tag: H2.5 F3/F4 (CMS 1x1 `saturated`, H2.3
+  F14), the messages section (the DD alpha range `[1e-6, 1)`, H2.2 S2), and H2.6 F5/F6 (CMS 4x1024 total /
+  saturated, H2.3 F14/F15). Every other section must read ok, and N9 hash identity 0 diffs.
+- **Numbers:**
+  - Perf 10/10 x3: every scenario 0 at N and 8N; mustFailAlloc 53 / 427; oneBoxCtl 1/12-25 (trips at 2); with
+    `maxScavenges: 64` the suite FAILs (oneBoxCtl not caught).
+  - Torture ok x4: all 13 measureAllocs lanes 0 B/op, scAh / scCh 0 at SCAV_CLEAN, SCAV-CTRL 30 (a Smi-only
+    control reads 0 -> VACUOUS FAIL), major 0, maxMs 0.00.
+  - Lanes exit 0 (46 s): N4-CTRL[df/ring] 24 / 24 / 24; no H2.1-H2.7 gate or limit changed.
+  - Chrome (154, 38 s, 98 lanes): addFrom / AHF <= 0.03, Into 0.00, k=0 add 0.00, k=1 add 12.00 (limit 12.5),
+    CTRL 12.00 / 12.00. `--lib` 1.1.2: exit 1, fail 87, absent 58, HLL add small df 9.01, SS add c30 ni
+    172.39 / 267.52. No Chrome, a bogus binary, an import-throwing / syntax-error lib -> UNVERIFIED exit 1; no
+    precise memory -> CTRL 0.00 FAIL.
+  - 366 tests (0 todo); `npm run verify` exit 0 in 193 s; pack 7 files; VERSION '1.1.2'.
+- **Exit evidence -- `npm run revert-check` vs 1a2673e (1.1.2), exit 0 in 39 s:**
+
+  | family | observed on 1.1.2 | verdict |
+  | --- | --- | --- |
+  | lanes --lib | exit 1; 254 ABSENT (240 N1, 8 AHF, 6 Into); 36 FAIL (N2-HLL 8, N5 2 [df 1296, ni 2267], N3[ni] 16, N3[nc/hll] 4, N3[nc/ss] 4, N3[nc/*/n31] 2); N4-CTRL 24; every CTRL intact | PASS |
+  | chrome --lib | exit 1; 5 named add lanes FAIL with min above the limit; 14 named from / AHF / Into ABSENT; CTRL PASS | PASS |
+  | perf (64 -> 2) | edited exit 1, unedited exit 0 | PASS |
+  | torture (48 -> 0) | edited exit 1, unedited exit 0 | PASS |
+  | parity | N9 0 diffs; 3 allowlisted sections differ on their tags; no other FAIL | PASS |
+
+  `--ref 5fecd6e` (H2.7, green) exits 1 (FAIL 1/5) in 300 s. So "N1-N5 FAIL on 1.1.2, and N4 trips" holds, and
+  N3[nc/{cms,cmsest}/{b31,u32,safe}] read 0-1 on 1.1.2 and are not asserted.
+- **lite-hud (D10, not edited here):** its 8.2 probe shape on the tree's addFrom reads 0 -> 0 on every lane, df
+  and ni (1.1.2 add: SS 18 / 67 / 215, HLL 10-13 / 64, CMS 24 / 49), and the Chrome `hud` key-class lanes
+  (ch*2^32 + tag) read <= 0.03 B/op. Forward to a lite-hud session (LiteHud/ROADMAP.md 8.2).
+- **For `/release 1.2.0`:** content rewrites (not number swaps) at Sketch.js:9 ("v1.1.2 ships ... 1.1.1-1.1.2 =
+  packaging metadata only"), RESEARCH.md:9 ("SHIPPED (1.0.0 -> 1.1.2)") and llms.txt:17 ("v1.1.2 ships the
+  STABLE FOUR-member API"). Number swaps: package.json, Sketch.js VERSION, llms.txt:3 / :105, README:293, and
+  the four "frozen 1.1.2 string" VERSION tests. Do NOT swap the deliberate 1.1.2-baseline mentions (README:375,
+  llms.txt:465 / :470, RESEARCH.md:10 / :355 / :358, ADR 0004:87, test/lanes.mjs:117, test/HyperLogLog.test.js
+  :443, ROADMAP). package-lock.json is gitignored, so `git grep` will not list it.
+- **Known gaps (recorded, not fixed):**
+  - revert.mjs's parity row prints fixed text ("3 allowlisted diffs on tag") even when those sections read ok,
+    and an allowlisted section stops at its first diff, so a later divergence inside it is hidden.
+  - A Chrome page fault other than an import error (a missing class, a throwing step) fails closed only after
+    the 120 s launch timeout.
+  - Chrome gates the min of 3 windows, so one outlier window passes (seen once: df SS addFrom c30 hud
+    [13.52, 0.00, 0.00]).
+  - test:perf pins only `--max-semi-space-size=4`; with `--min-semi-space-size=4` too, oneBoxCtl reads 6 at 8N
+    (the likely cause of the 12 / 25 bimodality). It trips at 2 either way.
+  - A VACUOUS torture control also prints "scavenge floor exceeded" with every value at 0.
+  - The docs gate does not catch "0 bytes per op" / "zero B/op", treats "library" anywhere on a line as a
+    qualifier, does not scan the CHANGELOG, and checks only the FORMAT of the README test count.
+  - The comment-only Sketch.js check, the operand-level bytecode identity and the mutant matrices are scratch
+    runs (h28/qa28, h27/review27), not committed gates.
+
+Why now:
+- This is the last H2 session. The 7.1 order puts limit-lowering last, once every lane can pass. Today every perf
+  scenario and both former SCAV_BOX lanes read 0, so the limits of 64 / 48 only hide a regression.
+- N6 exists only in scratch. Exit says "incl. Chrome", and no committed gate covers that.
+- The docs still make unqualified "0 B/op" claims, which a non-Smi argument breaks.
+- The docs still promise p50/p90/p99 within alpha under collapse.
+- CLAUDE.md says "Before /release, revert-check the new gates". So far only per-session scratch runs have done that.
+
+Pre-measured (HEAD 5fecd6e, Node 26.8.2, Chrome 154; scratchpad `h28/facts.md`, perfrun / perf2 / probe82 / chrome/):
+- **F9:**
+  - Every perf scenario reads 0 scavenges at N and 8N (2 runs). mustFailAlloc reads 53 / 427.
+  - perf2 (maxScavenges 2 + the N4 prototype) passes 7/7, three times.
+  - Torture scAh / scCh read 0.
+- **N4 prototype:** `ring[i & 63] = F[i & 1023] * 1.5`, with `ring = new Array(64).fill(null)`. That is
+  PACKED_ELEMENTS, so each store is one 16 B HeapNumber. At 8N it reads 25 / 12 / 12: bimodal, cause not
+  attributed. It trips 2 on every run.
+- **N6, B/op (1.1.2 -> tree):**
+  - df: HLL add 17.8 / 9.0 / 9.0 -> 0.02-0.03; CMS add c30 6.0 -> 0; SS add c30 18.1 -> 0.25-0.27; addFrom 0.04.
+  - ni: HLL add ~77 -> 0-0.03; CMS add c30 ~126 -> 0-0.04; CMS est ~120 -> 0-0.02; SS add c30 ~173 -> 0.18-0.21;
+    addFrom 0-0.04.
+  - nc: the tree reads 12.0 on every lane. The never-optimized caller boxes its own read, so this is a driver
+    floor.
+  - The scratch key classes small / b30 / neg are all Smi in Chrome except one key. The committed lane adds real
+    non-Smi classes.
+- **lite-hud 8.2 probe (probe82):** the tree's addFrom reads 0 -> 0 on every lane, df and ni. 1.1.2 add reads up
+  to 67 df / 215 ni.
+- **F19:**
+  - RESEARCH.md:9 already reads "SHIPPED (1.0.0 -> 1.1.2)", so that F19 item is stale.
+  - The lockfile top-level and `packages[""]` versions are both 0.1.0.
+  - The README states no test count; the actual count is 358.
+
+Planner decisions:
+- **D1 (F9):**
+  - PerfGate `maxScavenges` goes 64 -> 2. That is the lanes' `<= 2` convention; every scenario reads 0.
+  - Torture `SCAV_BOX` is DELETED, and scAh / scCh join the SCAV_CLEAN (0) conjunction. That is 48 -> 0 with no
+    dead constant left behind.
+  - Nothing is raised. maxOldGen 0, maxArrayBuffersKB 0, grows 0 and SCAV_ADD_INLINE 2 stay as they are.
+- **D2 (N4): one box per op, in three homes.**
+  - **PerfGate mustFail `oneBoxCtl`** (the perf2 shape, verbatim). This is the tooth that binds the threshold: at
+    the old 64 it does NOT trip (12-25 < 64), so putting 64 back turns the suite red.
+  - **Lanes `N4-CTRL[df/ring]`:** a new laneType `ring` with the same shape, df mode, gated min of 3 >= 8. That is
+    2/3 of the low mode and 4x the gate. It records the number PerfGate cannot print (H2.6 gap f8). It is
+    library-independent, so it passes under `--lib`.
+  - **Torture `SCAV-CTRL`:** `scavLane` on a one-box step must read >= 1, i.e. it must trip SCAV_CLEAN. A reading
+    of 0 prints VACUOUS and FAILs. If qa sees < 2 in any of 5 runs, the step stores two boxes and the comment says
+    so.
+  - The roadmap's ">= 12" becomes "trips at 2; lanes min >= 8", because the low mode is exactly 12.
+- **D3 (comments):** every "floor" comment must state the true causes, both of them fixed:
+  - (1) H2.1 F1: the Maglev deopt loop on `(h << p) >>> 0`.
+  - (2) H2.6 F5 / F6 + N7: the DRIVER passed keys and uint32 lanes >= 2^31 as arguments to non-inlined add /
+    addHashed (the caller's own box).
+  - Sites:
+    - PerfGate :4-7 and :219-231.
+    - torture :356-385, :388, :481 and :525-527.
+    - torture :426-427, which says the add-box teeth live in lite-hud. They reproduce here: CTRL 24, N3, N1, N6.
+    - lanes.mjs :18-19 ("the local precursor of N4").
+- **D4 (N6 harness):** `test/chrome/run.mjs` + `test/chrome/page.html`, run by `npm run chrome`, appended LAST to
+  `verify`.
+  - **Finding Chrome:** `CHROME_BIN`, else `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, else
+    `google-chrome` / `chromium` on PATH.
+  - **Fail closed:** absent, unlaunchable, a timeout (120 s per launch), no `gc`, or no precise memory each print
+    `GATE chrome: UNVERIFIED (<reason>)` and exit 1. There is no skip env var.
+  - **Launch flags:** `--headless=new --disable-gpu --no-first-run --no-default-browser-check`;
+    `--user-data-dir=<mkdtemp in os.tmpdir()>`, removed afterwards; `--enable-precise-memory-info`;
+    `--js-flags=--expose-gc --min-semi-space-size=64 --max-semi-space-size=64 [--max-inlined-bytecode-size=0]`.
+  - **Server:** binds 127.0.0.1:0. `/lib.js` serves `--lib <path>`, or the repo's Sketch.js. The page POSTs its
+    results back.
+  - **Modes:** df and ni. nc is not gated: the tree reads 12.0 on every lane, including addFrom, and that box is the
+    driver's. The harness header documents this.
+  - **Measure:** each lane warms 3 x 200k, then runs 3 windows of 200k. Each window is `gc(); gc();` then the
+    `usedJSHeapSize` delta divided by units. Gate on the MIN of the 3; print every window. A missing method is
+    ABSENT, which FAILs.
+  - **Key classes** (Chrome Smis are 31-bit): small `i`; b30 `2^30 + i`; n31 `-(2^31) - i`; safe `2^53 - 1 - i`;
+    hud `ch*2^32 + tag`.
+  - **Counts:** c1; c30 = 2^30; v31 = `(a*1000 + 0.5) | 0`, accumulating past 2^31 (probe82's microseconds).
+  - **Lanes:** 49 per mode, each run in df and ni.
+
+    | lane | limit |
+    | --- | --- |
+    | HLL addFrom x 5 kc; CMS / SS addFrom x 5 kc x {c30, v31}; HLL / CMS addHashedFrom (lanes >= 2^31); DD addFrom (fractional) | <= 0.5 B/op |
+    | add: HLL {small, b30, n31, safe}; CMS / SS {c1, c30} x {small, b30}; CMS / SS estimate {small, b30}; DD add {int, frac} | <= 12*k + 0.5 B/op (k = the lane's non-Smi args in Chrome) |
+    | `ss.topKInto` n16 big, `dd.quantilesInto` q4 | <= 1 B/call |
+    | `CTRL[df\|ni/box]`: one fresh HeapNumber into a PACKED ring per op | >= 8 B/op (nominal 12, a pointer-compressed HeapNumber) |
+
+  - **Budget:** <= 60 s wall; qa records it. The harness prints one GATE line and exits 1 on any FAIL / ABSENT /
+    UNVERIFIED.
+- **D5 (release revert-check):** `test/revert.mjs`, run by `npm run revert-check`. It is NOT in verify, because it
+  expects FAILs and takes ~3 min.
+  - **Inputs:** `--ref <sha>`, default `1a2673e` (1.1.2).
+  - **Git:** `git show <ref>:<file>` only. All writes go to a mkdtemp under `os.tmpdir()`, with `node_modules`
+    symlinked in. It never writes the tree.
+  - **Expectations per family:**
+    - **lanes `--lib`:** exit 1.
+      - FAIL: every N1 / AHF / N8-Into gate (ABSENT), N2-HLL, N5 df + ni, N3 ni / nc.
+      - PASS: every CTRL / NC-CTRL / CV-CTRL / AH-CTRL / Q-CTRL / FE-CTRL / N4-CTRL.
+    - **chrome `--lib`:** exit 1.
+      - ABSENT: HLL / CMS / SS addFrom, AHF, Into.
+      - FAIL: HLL add df small; CMS / SS add c30 ni.
+      - PASS: CTRL.
+    - **perf (the F9 teeth):** take the ref's PerfGate.test.mjs and replace `maxScavenges: 64` with `2`. Assert
+      exactly one replacement.
+      - Run against the ref's Sketch.js, it FAILs HLL add-stream / addHashed / SS evict (audit readings 6 / 30 / 12).
+      - Unedited, it PASSes. So the FAIL comes from the threshold, not the harness.
+    - **torture:** take the ref's torture.mjs and replace `SCAV_BOX = 48` with `0`. Assert exactly one replacement.
+      - It FAILs (HLL add reads 4; the addHashed lanes read > 0).
+      - Unedited, it PASSes.
+    - **parity:** `test/parity.mjs` against the ref, the way H2.7 ran it against e805ac8. The identity sections show
+      0 diffs; only the checked DOC-DIFF classes (F12 ...) differ.
+  - **Output:** prints `family | expected | observed | verdict`, and exits 0 only if every expectation holds.
+  - **Must-fail control:** `--ref 5fecd6e` (H2.7, whose gates are green) must exit 1.
+- **D6 (scratch -> committed):**
+  - Promote the `--lib` revert-check, as D5.
+  - Do NOT promote the operand-level bytecode identity (`bcdiff.mjs`) or the mutant matrix:
+    - H2.8 changes no code byte, and a comment-only-diff check proves that more strongly than a bytecode diff.
+    - `--print-bytecode` parsing is fragile across Node versions.
+    - Inline status already has behavioral guards: SCAV_ADD_INLINE and N3c cap120.
+  - Both are recorded as a known gap.
+- **D7 (F19 wording):** the term is "0 library B/op".
+  - It is defined once per doc: README :64 and :327, the llms.txt Exports head, and the d.ts header.
+  - Definition: "the library allocates nothing; a non-Smi argument (a key or count >= 2^31 on Node, >= 2^30 in
+    Chrome, or a fractional DDSketch value) boxes ~16 B (12 B in Chrome) at a call V8 does not inline -- the
+    addFrom / addHashedFrom family reads it unboxed".
+  - Per-method lines say "0 library B/op". The addFrom and Into lines keep "0 B/op".
+- **D8 (collapse / strict):** bound the collapse claim by the collapsed mass, not by q.
+  - Collapse: "Once `collapsed`, a quantile is within alpha only if its rank lies above the mass folded into the
+    floor bucket; below that it reads the floor representative. Which q survive depends on the value span vs
+    `maxBins` (the window spans ~gamma^maxBins), not on q. Probe: 1001 x 147 then 999 log-spaced values in
+    [1e3, 1e6] at maxBins 64 -> p50 and p90 both read 282199 (true 147 / ~251600)."
+  - Strict: "rejects a value whose BUCKET KEY falls outside the range's key span; at alpha 0.01, `range: [1, 100]`
+    accepts 0.99 and 101 (they share the edge buckets)". Hand-checked: key(0.99) = key(1) = 0, and
+    key(101) = key(100) = 231.
+- **D9 (lockfile) -- DROPPED during review:** package-lock.json is gitignored and untracked, so a docs-gate rule
+  on it threw on a fresh clone and was tautological after `npm install`. The original text: set package-lock's top-level and `packages[""]` `version` from 0.1.0 to 1.1.2.
+  - This is a SYNC to the current version, not a bump. It lets /release's `git grep 1.1.2` find the lockfile and
+    move it with the trinity.
+  - VERSION, package.json and the llms version stay 1.1.2.
+- **D10 (lite-hud):** H2.8 does NOT touch ../LiteHud.
+  - The probe82 result and the N6 `hud` lanes go into this 7.9 Result.
+  - The orchestrator forwards them to a lite-hud session (LiteHud/ROADMAP 8.2, :417-453).
+
+Hot body vs cold path:
+- 0 hot bytes change, and no cold code changes either.
+- Sketch.js changes are COMMENTS only:
+  - the header :2-8 (the "v1.1.2" version token stays for /release);
+  - the "HOT, 0 B/op" jsdoc on add / addHashed / estimate / estimateHashed / errorOf, DD add, and the DD indexable
+    getters (:254 :312 :399 :589 :758 :846 :963 :1020 :1187 :1460 :1466 :1475 :1482 :1925 :2077 :2195 :2209).
+- The addFrom / Into / `@private` comments stay.
+- If a doc claim can only be made true by changing code, the coder STOPS and reports. None is expected.
+
+Zero-box: no hot path is touched. The new controls box on purpose and live only in harness files.
+
+Parity:
+- `git diff HEAD -- Sketch.js` touches only lines inside `/** */` or `//` comments; qa checks this mechanically.
+- parity.mjs shows 0 diffs vs HEAD.
+- witness sha1 stays 2ed81a8b.
+
+Teeth:
+- Every new or lowered gate FAILs on 1.1.2 (D5), or carries a live control: N4 in 3 homes, plus the chrome CTRL.
+- The docs gate FAILs on HEAD's docs.
+
+Doc sites: README, llms.txt, Sketch.d.ts, ADR 0001 / 0004 amendments, CHANGELOG [Unreleased], RESEARCH.md, ROADMAP.
+Never VERSION.
+
+Out of scope:
+- The version trinity, the CHANGELOG head rename and pack (all /release).
+- ../LiteHud.
+- Any Sketch.js code.
+- Promoting bcdiff or the mutant matrix.
+- Gating Chrome nc.
+- serialize.
+
+**Tasks** (coder A runs T1 -> T2 -> T3. Coder B runs T4 -> T5; both edit package.json, so B does them in order.
+Coder C runs T6 -> T7 in parallel with A / B. T8 comes last, after qa's numbers.)
+- **T1 (A, test/perf/PerfGate.test.mjs):**
+  - Set `maxScavenges: 2`.
+  - Add `oneBoxCtl` to `mustFail`.
+  - Rewrite the comments at :4-7 and :219-231 (D3).
+- **T2 (A, test/torture.mjs):**
+  - Delete SCAV_BOX and move scAh / scCh into the SCAV_CLEAN conjunction.
+  - Add `ctlStep` + `scCtl` with a VACUOUS line, plus the SCAV print and `!ok` diagnostics.
+  - Rewrite the comments (D3).
+- **T3 (A, test/lanes/lane.mjs + test/lanes.mjs):**
+  - Add laneType `ring` and the gate `N4-CTRL[df/ring]` (min of 3 >= 8).
+  - The header :8-27 lists N4.
+- **T4 (B, test/chrome/run.mjs + page.html; package.json `chrome` + verify):** D4. The header documents the modes,
+  the nc exclusion, the flags and `CHROME_BIN`. ASCII-only.
+- **T5 (B, test/revert.mjs; package.json `revert-check`):** D5. Families run sequentially; no unhandled rejection.
+- **T6 (C, docs, D7 / D8; re-grep every line first):**
+  - **README**, lines to edit: :30 :64 :100 :137 (also collapse + strict) :150 :167 :180 :188 :189 :215 :216 :219
+    :220 :244 :278 :327 :341 :343 :345 :351 :357 :371.
+  - **README allocation table:**
+    - :331 `add(key)`: the key goes into the `_buf` Float64Array(1) scratch; `_addAt` hand-inlines the murmur into
+      int32 locals; no module slot is written.
+    - :332 `addHashed`: "0 library; a lane >= 2^31 boxes at a non-inlined call -> addHashedFrom".
+    - :335 `count()`: add "+ the preallocated `_hist` Int32Array(q+2)".
+    - :339 ctor: `Uint8Array(2^p)` + `_hist` + `_buf`.
+    - :341: the CMS constructor allocates `Uint32Array(d*w)` + `_idx` Int32Array(d) + `_base` Int32Array(1) + `_cnt`
+      Float64Array(1) + `_buf` Float64Array(2).
+    - :349: the module lane slots belong to `mix64` / `hashHi` / `hashLo` only.
+  - **README Testing (:365-373):** state "<N> tests", taken from the `npm test` summary. List the full lane set,
+    chrome, revert-check and parity.
+  - **llms.txt:** :32 :45 :65 :70-71 :81 :114 :186 :280 :372 :435 :446.
+  - **Sketch.d.ts:**
+    - "0 B/op" lines: :50 :70 :73 :115 :168 :171 :180 :183 :270 :273 :282 :387.
+    - Collapse / strict lines: :208 :225-226 :264-268 :310.
+  - **Sketch.js:** the comments listed under "Hot body vs cold path".
+  - **ADRs:** a dated H2.8 amendment in 0001 / 0004, and in any other ADR that repeats the claims (grep `0 B/op`,
+    `p50/p90/p99`, `module-scope`).
+  - **RESEARCH.md :11-12:** past tense.
+  - **Lockfile:** D9.
+- **T6g (C, test/docs.test.js, part of `npm test`).** It scans README / llms.txt / Sketch.d.ts / Sketch.js and
+  asserts:
+  - every line matching `/\b0 (?:B|bytes)\/op\b|\*\*0 bytes\*\*/i` also contains `library`, `From`, `Into`,
+    `unboxed` or `net`;
+  - no line matches `/tail-accurate p50|\(p50\/p90\/p99 -- the ones you page on\)/`;
+  - the README Testing section matches `/\b\d{3} tests\b/`;
+  - the lockfile's `version` and `packages[""].version` equal package.json's `version`.
+- **T7 (C, CHANGELOG [Unreleased]):**
+  - Reorder the sections to Added / Changed / Fixed.
+  - Split F1 out of the F2 bullet (:112-127) into its own Fixed bullet.
+  - Rewrite the in-progress phrases at :83 :92 :108-109 :120-125 ("fixed later in 1.2.0", "deferred to a later
+    1.2.0 step", "until addFrom lands (1.2.0)") to the final state.
+  - **Added:**
+    - Refresh the `npm run lanes` entry (:223-228) to the full gate set.
+    - Add `npm run chrome`, with the N6 numbers, and `npm run revert-check`.
+    - Make the Chrome claims cite N6.
+  - **Changed:**
+    - F9: 64 -> 2, SCAV_BOX removed, the N4 control reads 12-25.
+    - The "0 library B/op" wording.
+    - verify now needs a local Chrome.
+  - **Fixed (docs):** the collapse / p90 overclaim, strict-by-bucket-key, the allocation table, the lockfile.
+  - Every number cites a gate. Add no version heading.
+- **T8 (orchestrator / C, ROADMAP):**
+  - :8-15, the NEXT block.
+  - :32 H1 -> SHIPPED (1.1.0; 1.1.1-1.1.2 were packaging).
+  - :33 H2 -> "BUILT & GREEN, awaiting /release 1.2.0".
+  - :34 "(now H2 F11)" -> F7.
+  - The section 7 heading, the F9 / F19 / N4 / N6 row deltas and the 7.1 row.
+  - The 7.9 Result: the D5 table, the Exit evidence, and the D10 note.
+
+**Assertions (qa; 3 runs unless stated)**
+- **h1 (F9 / N4, perf):** `npm run test:perf` passes 10/10 (the old 9/9 + oneBoxCtl).
+  - Every scenario reads <= 2 (0 expected), and oneBoxCtl trips.
+  - Mutant: with `maxScavenges` back at 64, the suite FAILs because oneBoxCtl no longer trips.
+- **h2 (torture, GC budget + retention):** `npm run torture` prints `ok` on all 3 runs.
+  - HLL / CMS addHashedFrom read 0 at clean 0. SCAV-CTRL reads >= 1; record the value.
+  - gc major 0; maxMs <= 4.00.
+  - `tracker.size()` returns to 0 over every build-fill-clear cycle (leak=size 0/0).
+  - abGrowth <= 0; every measureAllocs lane reads 0 B/op.
+  - Mutant: a Smi-only ctlStep gives VACUOUS -> FAIL.
+- **h3 (lanes):** `npm run lanes` exits 0. N4-CTRL[df/ring] min >= 8; record the reps. Every H2.1-H2.7 gate is
+  unchanged.
+- **h4 (N6):** `npm run chrome` exits 0 in <= 60 s.
+  - addFrom / AHF min <= 0.5 B/op; Into <= 1 B/call; add <= 12k + 0.5; CTRL df / ni >= 8.
+  - `--lib` on a 1.1.2 copy exits 1, with ABSENT gates, HLL add small df >= 9, and SS add c30 ni >= 100.
+  - `CHROME_BIN=/nonexistent`, with no Chrome on PATH, prints UNVERIFIED and exits 1.
+  - Without `--enable-precise-memory-info`, CTRL < 8 -> FAIL.
+- **h5 (revert):** `npm run revert-check` exits 0. Its table goes into the 7.9 Result as the Exit evidence: "N1-N5
+  FAIL on 1.1.2, N4 trips". With `--ref 5fecd6e` it exits 1.
+- **h6 (docs / parity):**
+  - docs.test.js passes on the tree.
+  - Over HEAD's README / llms / d.ts / Sketch.js / lockfile it FAILs: >= 30 unqualified lines, and the lockfile at
+    0.1.0.
+  - The Sketch.js diff is comment-only; parity exits 0 with 0 diffs; witness sha1 2ed81a8b.
+  - ASCII-only; no stray tool-call tags.
+- **h7:** `npm run verify` is green.
+  - 358 + the docs tests, 0 todo; the README count equals the `npm test` summary.
+  - test:types green; VERSION '1.1.2'; pack 7 files.
+
+Reviewer focus:
+- Is any limit raised? The only changes are 64 -> 2 and 48 -> gone.
+- Can any control pass vacuously: a dead `gc`, no precise memory, a Smi store?
+- Can an absent Chrome ever print ok?
+- Does revert.mjs use only `git show`, and write only under os.tmpdir()?
+- Does every doc number cite a gate?
+- Is the Sketch.js diff comment-only?
+- Is any in-progress narrative left in the CHANGELOG?
+
+RISK: `verify` now needs a local Chrome. It fails closed (UNVERIFIED) without one, and a Chrome auto-update can move
+the B/op numbers. Both are intended (fail closed); the /release machine has Chrome 154. `/release 1.2.0` must also
+rewrite two content sites, not just swap a number: Sketch.js:8 ("v1.1.2 ships ...") and RESEARCH.md:9
+("(1.0.0 -> 1.1.2)").

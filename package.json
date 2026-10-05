@@ -30,9 +30,11 @@
     "witness": "node test/witness.mjs",
     "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
     "lanes": "node test/lanes.mjs",
+    "chrome": "node test/chrome/run.mjs",
+    "revert-check": "node test/revert.mjs",
     "demo": "node --expose-gc --test demo/Demo.test.mjs",
     "demo:serve": "node demo/serve.mjs",
-    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run test:perf && npm run lanes"
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run test:perf && npm run lanes && npm run chrome"
   },
   "keywords": [
     "sketch",

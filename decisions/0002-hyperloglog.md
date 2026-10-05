@@ -92,3 +92,10 @@ byte-identical no-op; subclasses still merge (`super()` installs the brand; engi
 
 No sparse representation (deferred); no crypto hashing; no serialization format in
 the zero-GC core. Count-Min / DDSketch / SpaceSaving are M2-M4.
+
+## Amendment 2026-10-05 (H2.8): "0 library B/op" (D7)
+
+Point 2 above ("Hot `add` is 0 B/op") is restated as "**0 library B/op**": the library allocates
+nothing on `add` (the murmur hand-inlines into int32 locals, F2 / F5), but a key `>= 2^31` on Node
+(`>= 2^30` in Chrome) boxes ~16 B at a call V8 does not inline, which `addFrom` / `addHashedFrom`
+read UNBOXED. Gated by the chrome N6 lane and `test/docs.test.js`.

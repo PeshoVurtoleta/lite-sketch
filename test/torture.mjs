@@ -353,39 +353,39 @@ async function main() {
     const abDelta = abAfter - abBefore;
     const abOk = abDelta <= 0;
 
-    // ---- phase 2d: per-method SCAVENGE lane (N6) --------------------------------
+    // ---- phase 2d: per-method SCAVENGE lane -------------------------------------
     // measureAllocs (phase 2a) reports net bytes/op and CANNOT see TRANSIENT young-gen
-    // churn (the lite-hud M1 finding); the perf gate discloses a maxScavenges floor as a
-    // V8 uint32-lane-boxing artifact. This lane makes that floor VISIBLE and GATED per
-    // method: force a full GC, then count minor GCs (scavenges) over a hot loop.
+    // churn (the lite-hud M1 finding). This lane makes that churn VISIBLE and GATED per
+    // method: force a full GC, then count minor GCs (scavenges) over a hot loop. Every
+    // library lane is driven to EXACTLY 0 (SCAV_CLEAN); the SCAV-CTRL control below boxes
+    // one HeapNumber per op and MUST read >= 1, so a clean 0 is a real result and not a
+    // blind instrument.
     //
-    // Result (isolated + written reasons, measured stable over SCAV_HOT=2e6):
-    //   * The SEVEN int32-clean lanes -- HLL add, CMS add cons/plain, CMS estimate, DD add,
-    //     SS evict, SS bump -- are driven to EXACTLY 0 scavenges: their hot bodies keep every
-    //     hash word an int32 SMI (base = (h ^ g) | 0, and HLL's register suffix is now the
-    //     signed int32 `h << p`), so nothing boxes.
-    //   * The two addHashed lanes now drive addHashedFrom (F6, H2.6): the caller stages the uint32
-    //     hi/lo lanes (and a count-1 slot for CMS) in a Uint32Array and passes (buf, i), so a lane
-    //     >= 2^31 is read UNBOXED inside the library -- the boxed-double caller artifact the old
-    //     addHashed(hi, lo) driver disclosed is GONE. HyperLogLog addHashedFrom and CountMinSketch
-    //     addHashedFrom now read ~0 scavenges, so all nine lanes sit at the clean floor. NOTE: plain
-    //     addHashed(hi, lo) is no longer driven by torture at all -- both the alloc B/op and the SCAV
-    //     labels below read addHashedFrom; addHashed's own byte-for-byte behavior is covered by the
-    //     node:test suite and test/parity.mjs.
-    //     HLL ADD used to sit on a boxed-double floor too (~4 over 2e6 in an earlier driver). That
-    //     was NOT the suffix widening but a Maglev DEOPT LOOP on `hiSuf = (h << p) >>> 0` ("not
-    //     int32"): Maglev assumed the uint32 suffix was an int32, the >= 2^31 half deopted and
-    //     recompiled, and the deopted tiers boxed every uint32 / double temporary (the audit's
-    //     non-inlined closure shape shows hundreds of such deopts -- see test/lanes.mjs N5). H2.1
-    //     changed it to `h << p` (clz32 reads the same 32 bits and `!== 0` is unchanged), the deopt
-    //     loop is gone, and HLL add is now 0 -- so scAdd moved from SCAV_BOX to SCAV_CLEAN below.
-    //     SCAV_BOX (48) is RETAINED unchanged as disclosed headroom for the two addHashed lanes
-    //     (now ~0 under addHashedFrom); it is astronomically under a real per-op allocator (the
-    //     perf gate's mustFail control shows thousands) and is recalibrated in H2.8. A regression
-    //     trips the clean lanes immediately.
+    // All thirteen library lanes read 0, because the two causes of the old nonzero floor are
+    // both fixed:
+    //   (1) H2.1 F1: HLL add used to sit on a boxed-double floor (~4 over 2e6) -- NOT a suffix
+    //       widening but a Maglev DEOPT LOOP on `hiSuf = (h << p) >>> 0` ("not int32"): Maglev
+    //       assumed the uint32 suffix was an int32, the >= 2^31 half deopted and recompiled, and
+    //       the deopted tiers boxed every uint32 / double temporary (the audit's non-inlined closure
+    //       shape shows hundreds of such deopts -- see test/lanes.mjs N5). H2.1 changed it to
+    //       `h << p` (clz32 reads the same 32 bits, `!== 0` unchanged); the deopt loop is gone and
+    //       HLL add is now 0 -- so scAdd reads the clean floor.
+    //   (2) H2.6 F5 / F6 + N7: the two addHashed lanes used to ride a uint32-lane floor because the
+    //       DRIVER passed hi / lo lanes >= 2^31 as ARGUMENTS to a not-yet-inlined addHashed (the
+    //       caller's own box, not the library's). They now drive addHashedFrom: the caller stages
+    //       the uint32 lanes (and a count-1 slot for CMS) in a Uint32Array and passes (buf, i), read
+    //       UNBOXED inside the library -- so scAh / scCh now sit at the clean floor and join the
+    //       SCAV_CLEAN conjunction (the old SCAV_BOX floor is deleted, no dead constant left behind).
+    //       NOTE: plain addHashed(hi, lo) is no longer driven by torture at all -- both the alloc
+    //       B/op and the SCAV labels read addHashedFrom; addHashed's own byte-for-byte behavior is
+    //       covered by the node:test suite and test/parity.mjs.
+    //   The int32-clean library lanes (HLL add, CMS add cons / plain, CMS estimate, DD add, SS evict /
+    //   bump, the Into renders) keep every hash word an int32 SMI (base = (h ^ g) | 0, HLL's register
+    //   suffix the signed int32 `h << p`) and read from / write to caller-owned typed arrays, so
+    //   nothing boxes. A regression trips the clean lanes immediately, and the SCAV-CTRL control
+    //   proves the lane can still see a box.
     const SCAV_HOT = 2000000;
-    const SCAV_CLEAN = 0;    // int32-clean lanes: exactly 0 (transient churn isolated away)
-    const SCAV_BOX = 48;     // uint32 >= 2^31 boxed-double lanes: pinned floor (see above)
+    const SCAV_CLEAN = 0;    // every library lane: exactly 0 (transient churn isolated away)
     const SCAV_ADD_INLINE = 2;  // N7 teeth: DDSketch.add(fractional) stays inlined (bytecode < V8 cap); the pre-fix 483-byte shape read 15
     async function scavLane(step) {
         for (let i = 0; i < 50000; i++) step();       // JIT warm
@@ -424,7 +424,9 @@ async function main() {
     // (Number.isFinite + a single count/total branch) to bring add back to 448 bytes. So this lane
     // FAILs the moment add deopts out of the inline budget again.
     // (The cross-module box at a real non-inlined CONSUMER boundary -- lite-hud M2 measured add=43
-    // vs a 24 baseline, addFrom=24 -- is gated in lite-hud M2's own suite, per LiteHud/ROADMAP 6.1.)
+    // vs a 24 baseline, addFrom=24 -- is gated in lite-hud M2's own suite, per LiteHud/ROADMAP 6.1.
+    // The add-box teeth also reproduce in THIS suite: the SCAV-CTRL one-box control below, plus the
+    // lanes CTRL (one box per op, reads 24), N3, N1 and the N6 chrome B/op lane.)
     const ddFrac = new DDSketch(0.01);
     for (let k = 1; k <= 100000; k++) ddFrac.add(k);   // warm the window
     const ddFracBuf = new Float64Array(1);
@@ -444,14 +446,34 @@ async function main() {
     const scDdAdd = await scavLane(ddFracAddStep);
     SINK = (SINK + ddFracSink) | 0;
 
+    // ---- SCAV-CTRL: the one-box control that MUST trip the scavenge gate ----------
+    // Run the SAME scavLane on a step that boxes one ~16 B HeapNumber per op (read a FRACTIONAL
+    // double from a Float64Array, multiply, store into a PACKED ring -- the perf2 / N4 shape). It
+    // MUST read >= 1: a reading of 0 means the instrument is blind (gc not firing, or escape
+    // analysis elided the box), so every SCAV_CLEAN 0 above would be VACUOUS -- the gate FAILs,
+    // never passes. Measured >> 1 over SCAV_HOT=2e6.
+    const ctlF = new Float64Array(1024);
+    for (let i = 0; i < 1024; i++) ctlF[i] = i + 0.5;
+    const ctlRing = new Array(64).fill(null);   // PACKED_ELEMENTS: each store is one HeapNumber
+    let ctlI = 0, ctlSink = 0;
+    const ctlStep = () => {
+        ctlRing[ctlI & 63] = ctlF[ctlI & 1023] * 1.5;   // one box per op
+        ctlI = (ctlI + 1) | 0;
+        ctlSink = (ctlSink + ctlRing.length) | 0;
+    };
+    const scCtl = await scavLane(ctlStep);
+    const scCtlOk = scCtl >= 1;   // VACUOUS guard: the control MUST trip the scavenge counter
+    SINK = (SINK + ctlSink) | 0;
+
     const scavOk =
-        scAh <= SCAV_BOX && scCh <= SCAV_BOX &&                                 // addHashed caller-boxed lanes (F6)
-        scAdd <= SCAV_CLEAN && scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&
+        scAdd <= SCAV_CLEAN && scAh <= SCAV_CLEAN && scCc <= SCAV_CLEAN && scCp <= SCAV_CLEAN &&
+        scCh <= SCAV_CLEAN && scCe <= SCAV_CLEAN &&  // scAh / scCh: addHashedFrom reads lanes UNBOXED (F6), now 0
         scDd <= SCAV_CLEAN && scSsE <= SCAV_CLEAN && scSsB <= SCAV_CLEAN &&
         scTk <= SCAV_CLEAN && scQs <= SCAV_CLEAN &&  // H2.7: topKInto / quantilesInto at the clean floor
         scSq <= SCAV_CLEAN && scSt <= SCAV_CLEAN &&  // H2.7: SAB-first mixed outs probe plain first -> no per-call throw
         scDdFrom <= SCAV_CLEAN &&  // N7: addFrom on FRACTIONAL input stays at the clean floor (the delta-0 proof)
-        scDdAdd <= SCAV_ADD_INLINE;  // N7: add(value) stays INLINED (bytecode < V8 cap); teeth: the pre-fix 483-byte shape read 15
+        scDdAdd <= SCAV_ADD_INLINE &&  // N7: add(value) stays INLINED (bytecode < V8 cap); teeth: the pre-fix 483-byte shape read 15
+        scCtlOk;  // SCAV-CTRL: the one-box control MUST trip (>= 1), else every clean 0 above is vacuous
 
     // ---- verdict + GATE line ----
     const cmsAllocOk = ccOk && cpOk && chOk && ceOk;
@@ -478,13 +500,16 @@ async function main() {
         ' (tracked=' + trackedMid + '/' + cmsTrackedMid + '/' + ddTrackedMid + '/' + ssTrackedMid +
         ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
     console.log(
-        'SCAV/2e6 (minor GCs per hot method; clean floor=' + SCAV_CLEAN + ' box floor=' + SCAV_BOX + '): ' +
+        'SCAV/2e6 (minor GCs per hot method; clean floor=' + SCAV_CLEAN + '): ' +
         'HLL add=' + scAdd + ' HLL addHashedFrom=' + scAh + ' | ' +
         'CMS add cons=' + scCc + ' plain=' + scCp + ' addHashedFrom=' + scCh + ' estimate=' + scCe + ' | ' +
         'DD add=' + scDd + ' | SS evict=' + scSsE + ' bump=' + scSsB +
         ' | SS topKInto=' + scTk + ' DD quantilesInto=' + scQs +
         ' | SAB-first quantilesInto=' + scSq + ' topKInto=' + scSt +
         ' | ' + (scavOk ? 'ok' : 'FAIL'));
+    console.log(
+        'SCAV-CTRL (one-box control, MUST trip the scavenge gate): scCtl=' + scCtl +
+        (scCtlOk ? ' (ok, >= 1 -- the lane can see a box)' : ' VACUOUS (0: the scavenge instrument is blind -- gate FAILs)'));
     console.log(
         'N7 DDSketch fractional lane (add(value) boxes at a non-inlined boundary; addFrom reads unboxed): ' +
         'addFrom=' + scDdFrom + ' (gated <=' + SCAV_CLEAN + ') add(value)=' + scDdAdd +
@@ -522,9 +547,12 @@ async function main() {
         if (scSt > SCAV_CLEAN) console.error('  scavenge SS topKInto SAB-first=' + scSt + ' (clean<=' + SCAV_CLEAN + ')');
         if (!report.ok) console.error('  gc ' + JSON.stringify(report.violations));
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
-        if (!scavOk) console.error('  scavenge floor exceeded (clean<=' + SCAV_CLEAN + ' box<=' + SCAV_BOX +
+        if (!scCtlOk) console.error('  VACUOUS: SCAV-CTRL one-box control read ' + scCtl +
+            ' (expected >= 1; the scavenge gate cannot see a box -- every clean 0 is meaningless)');
+        if (!scavOk) console.error('  scavenge floor exceeded (clean<=' + SCAV_CLEAN +
             '): HLL add=' + scAdd + ' addHashedFrom=' + scAh + ' CMS cons=' + scCc + ' plain=' + scCp +
-            ' addHashedFrom=' + scCh + ' estimate=' + scCe + ' DD=' + scDd + ' SS evict=' + scSsE + ' bump=' + scSsB);
+            ' addHashedFrom=' + scCh + ' estimate=' + scCe + ' DD=' + scDd + ' SS evict=' + scSsE + ' bump=' + scSsB +
+            ' SCAV-CTRL=' + scCtl);
         process.exitCode = 1;
     }
 }
