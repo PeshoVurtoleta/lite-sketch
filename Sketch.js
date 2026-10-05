@@ -6,7 +6,7 @@
  * ZERO bytes on every hot op (the lite-o1 zero-GC discipline; a non-Smi argument boxes at
  * the caller, which the addFrom / addHashedFrom family reads UNBOXED).
  *
- * v1.1.2 ships the STABLE FOUR-member API (frozen at 1.0.0; 1.1.0 added DDSketch addFrom + getters; 1.1.1-1.1.2 = packaging metadata only) -- HyperLogLog (cardinality / distinct-count over an
+ * v1.2.0 ships the STABLE FOUR-member API (frozen at 1.0.0; 1.1.0 added DDSketch addFrom + getters; 1.1.1-1.1.2 = packaging metadata only; 1.2.0 added the addFrom / addHashedFrom family, topKInto, quantilesInto, saturated and DD_ALPHA_MIN) -- HyperLogLog (cardinality / distinct-count over an
  * unbounded stream in fixed space, via a dense Uint8Array register bank),
  * CountMinSketch (point-query frequency estimation over a Uint32Array counter
  * matrix), both over the canonical two-lane 64-bit non-crypto hash, DDSketch
@@ -22,7 +22,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.1.2';
+export const VERSION = '1.2.0';
 
 // ===========================================================================
 // The canonical two-lane 64-bit hash (ADR 0001 -- LOCKED)

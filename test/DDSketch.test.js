@@ -110,8 +110,8 @@ function assertWithinAlpha(measured, trueVal, alpha, label) {
         ' exceeds alpha*true=' + bound);
 }
 
-test('VERSION is the frozen 1.1.2 string', () => {
-    assert.equal(VERSION, '1.1.2');
+test('VERSION is the frozen 1.2.0 string', () => {
+    assert.equal(VERSION, '1.2.0');
 });
 
 // ===========================================================================

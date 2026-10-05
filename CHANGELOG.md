@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-05
+
+H2 -- the close-out of the 2026-10-04 final-sweep audit of 1.1.2 (allocation, gate honesty,
+fail-closed, doc truth). A MINOR release: it ADDS backward-compatible API (`addFrom` on
+HyperLogLog / CountMinSketch / SpaceSaving, `addHashedFrom` on HyperLogLog / CountMinSketch,
+`SpaceSaving.topKInto`, `DDSketch.quantilesInto`, `CountMinSketch.saturated`, the
+`DD_ALPHA_MIN` export). No member added and no API removed. The Changed section lists the
+inputs that 1.1.2 accepted and 1.2.0 rejects; the negative-key hash change (F12) moves
+`mix64` / `hashHi` / `hashLo` lanes for negative keys only.
+
 ### Added
 
 - **`SpaceSaving.topKInto(outKeys, outCounts, outErrors, n?)` -- a 0-alloc top-N render (F7).**

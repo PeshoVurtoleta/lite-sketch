@@ -6,7 +6,7 @@ identity, the analytical anchor, the benchmark, the roster, the honesty hook, th
 sibling boundaries, a reference member, the central design call, the demo, the path,
 the open questions. ASCII-only (`->`, `<=`, `x`, "approx" -- never Unicode).
 
-Status: SHIPPED (1.0.0 -> 1.1.2). Originally PROPOSED / user-approved 2026-09-22, greenlit 2026-09-23.
+Status: SHIPPED (1.0.0 -> 1.2.0). Originally PROPOSED / user-approved 2026-09-22, greenlit 2026-09-23.
 The audits are in sections 12 (1.0.0) and 13 (1.1.2, 2026-10-04).
 This document + ROADMAP.md were the pre-code research pass, read and settled before
 the first member session; every member in section 4's Tier 1 has since shipped.
